@@ -1,0 +1,72 @@
+{
+  "version": "1.0",
+  "nodes": [
+    {
+      "id": "sensor_pre",
+      "name": "Sensor Pre",
+      "c_dev": 12.0,
+      "c_host": 3.0,
+      "fixed_dev": true
+    },
+    {
+      "id": "backbone_a",
+      "name": "Backbone A",
+      "c_dev": 48.0,
+      "c_host": 9.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "backbone_b",
+      "name": "Backbone B",
+      "c_dev": 42.0,
+      "c_host": 8.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "fusion",
+      "name": "Fusion",
+      "c_dev": 30.0,
+      "c_host": 6.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "control_head",
+      "name": "Control Head",
+      "c_dev": 16.0,
+      "c_host": 4.0,
+      "fixed_dev": true
+    }
+  ],
+  "edges": [
+    {
+      "source": "sensor_pre",
+      "target": "backbone_a",
+      "size": 2.0
+    },
+    {
+      "source": "sensor_pre",
+      "target": "backbone_b",
+      "size": 1.0
+    },
+    {
+      "source": "backbone_a",
+      "target": "fusion",
+      "size": 4.0
+    },
+    {
+      "source": "backbone_b",
+      "target": "fusion",
+      "size": 4.0
+    },
+    {
+      "source": "fusion",
+      "target": "control_head",
+      "size": 0.5
+    }
+  ],
+  "environment": {
+    "bandwidth": 50.0,
+    "latency": 5.0,
+    "weight_latency": 0.7
+  }
+}
