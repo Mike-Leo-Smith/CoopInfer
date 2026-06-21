@@ -10,8 +10,8 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "PyQt6>=6.6",
+    "PyQt6-WebEngine>=6.6",
     "networkx>=3.0",
-    "matplotlib>=3.7",
 ]
 
 [project.optional-dependencies]

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import html
 import sys
 from typing import Dict, List, Optional, Tuple
 
 import networkx as nx
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.figure import Figure
-from PyQt6.QtCore import QEvent, QObject, Qt
+from PyQt6.QtCore import Qt
+from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -18,9 +18,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QScrollArea,
     QSlider,
-    QSizePolicy,
     QSplitter,
     QComboBox,
     QSpinBox,
@@ -44,9 +42,6 @@ class MainWindow(QMainWindow):
         self.graph = nx.DiGraph()
         self.solver_result: Optional[SolverResult] = None
         self._loading_tables = False
-        self._syncing_timeline_pan = False
-        self._timeline_total_ms = 0.0
-        self._timeline_window_ms = 0.0
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_left_panel())
@@ -58,11 +53,6 @@ class MainWindow(QMainWindow):
         self._seed_example()
         self.graph = self._graph_from_tables()
         self._draw_graph()
-
-    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if watched is self.timeline_scroll.viewport() and event.type() == QEvent.Type.Resize:
-            self._resize_timeline_to_viewport()
-        return super().eventFilter(watched, event)
 
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
@@ -183,10 +173,8 @@ class MainWindow(QMainWindow):
 
         graph_group = QGroupBox("拓扑视图")
         graph_layout = QVBoxLayout(graph_group)
-        self.figure = Figure(figsize=(7, 5), tight_layout=True)
-        self.canvas = FigureCanvasQTAgg(self.figure)
-        self.ax = self.figure.add_subplot(111)
-        graph_layout.addWidget(self.canvas)
+        self.graph_view = QWebEngineView()
+        graph_layout.addWidget(self.graph_view)
         layout.addWidget(graph_group, stretch=4)
 
         metrics_group = QGroupBox("性能看板")
@@ -203,50 +191,9 @@ class MainWindow(QMainWindow):
 
         timeline_group = QGroupBox("时序图 (Solved Schedule)")
         timeline_layout = QVBoxLayout(timeline_group)
-        timeline_controls = QHBoxLayout()
-        timeline_controls.addWidget(QLabel("Scale"))
-        self.timeline_scale_slider = QSlider(Qt.Orientation.Horizontal)
-        self.timeline_scale_slider.setRange(100, 500)
-        self.timeline_scale_slider.setSingleStep(25)
-        self.timeline_scale_slider.setPageStep(50)
-        self.timeline_scale_slider.setValue(100)
-        self.timeline_scale_label = QLabel("100%")
-        self.timeline_scale_slider.valueChanged.connect(self._set_timeline_scale)
-        timeline_controls.addWidget(self.timeline_scale_slider)
-        timeline_controls.addWidget(self.timeline_scale_label)
-        timeline_layout.addLayout(timeline_controls)
-
-        pan_controls = QHBoxLayout()
-        pan_controls.addWidget(QLabel("Pan (time)"))
-        self.timeline_pan_slider = QSlider(Qt.Orientation.Horizontal)
-        self.timeline_pan_slider.setRange(0, 0)
-        self.timeline_pan_slider.setEnabled(False)
-        self.timeline_pan_label = QLabel("0")
-        self.timeline_pan_slider.valueChanged.connect(self._pan_timeline)
-        pan_controls.addWidget(self.timeline_pan_slider)
-        pan_controls.addWidget(self.timeline_pan_label)
-        timeline_layout.addLayout(pan_controls)
-
-        self.timeline_figure = Figure(figsize=(7, 3.0))
-        self.timeline_figure.subplots_adjust(left=0.12, right=0.98, top=0.9, bottom=0.18)
-        self.timeline_canvas = FigureCanvasQTAgg(self.timeline_figure)
-        self.timeline_canvas.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
-        self.timeline_ax = self.timeline_figure.add_subplot(111)
-        self.timeline_content = QWidget()
-        self.timeline_content_layout = QHBoxLayout(self.timeline_content)
-        self.timeline_content_layout.setContentsMargins(0, 0, 0, 0)
-        self.timeline_content_layout.addWidget(self.timeline_canvas)
-        self.timeline_scroll = QScrollArea()
-        self.timeline_scroll.setWidgetResizable(False)
-        self.timeline_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.timeline_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.timeline_scroll.setWidget(self.timeline_content)
-        self.timeline_scroll.viewport().installEventFilter(self)
-        timeline_layout.addWidget(self.timeline_scroll)
+        self.timeline_view = QWebEngineView()
+        timeline_layout.addWidget(self.timeline_view)
         layout.addWidget(timeline_group, stretch=3)
-        self._set_timeline_scale(self.timeline_scale_slider.value(), redraw=False)
         self._clear_timeline()
         return panel
 
@@ -529,143 +476,83 @@ class MainWindow(QMainWindow):
         return nodes, edges
 
     def _draw_graph(self) -> None:
-        self.ax.clear()
-        self.ax.set_axis_off()
         if self.graph.number_of_nodes() == 0:
-            self.canvas.draw()
+            self.graph_view.setHtml(self._placeholder_html("No graph to display"))
             return
 
         graph = self.graph.copy()
-        pos = self._layered_layout(graph)
-
-        node_colors = [
-            "#2563eb" if int(attrs.get("x", 0)) == 0 else "#16a34a"
-            for _, attrs in graph.nodes(data=True)
-        ]
-        line_widths = [
-            3.0 if attrs.get("fixed_dev", False) else 1.2 for _, attrs in graph.nodes(data=True)
-        ]
-        edge_colors = []
-        edge_styles = []
-        for source, target in graph.edges:
-            cross_device = int(graph.nodes[source].get("x", 0)) != int(graph.nodes[target].get("x", 0))
-            edge_colors.append("#dc2626" if cross_device else "#6b7280")
-            edge_styles.append("dashed" if cross_device else "solid")
-
-        nx.draw_networkx_nodes(
-            graph,
-            pos,
-            ax=self.ax,
-            node_color=node_colors,
-            edgecolors="#111827",
-            linewidths=line_widths,
-            node_size=950,
-        )
-        for edge, color, style in zip(graph.edges, edge_colors, edge_styles):
-            nx.draw_networkx_edges(
-                graph,
-                pos,
-                edgelist=[edge],
-                ax=self.ax,
-                edge_color=color,
-                style=style,
-                arrows=True,
-                arrowsize=22,
-                min_source_margin=18,
-                min_target_margin=26,
-                width=1.8,
-                connectionstyle="arc3,rad=0.08",
+        raw_pos = self._layered_layout(graph)
+        x_values = [xy[0] for xy in raw_pos.values()]
+        y_values = [xy[1] for xy in raw_pos.values()]
+        min_x = min(x_values)
+        max_y = max(y_values)
+        x_gap_px = 230.0
+        y_gap_px = 135.0
+        left_pad = 120.0
+        top_pad = 95.0
+        right_pad = 180.0
+        bottom_pad = 110.0
+        pos = {
+            node: (
+                left_pad + (xy[0] - min_x) / 2.9 * x_gap_px,
+                top_pad + (max_y - xy[1]) / 1.65 * y_gap_px,
             )
-        id_labels = {node: str(node) for node in graph.nodes}
-        nx.draw_networkx_labels(
-            graph,
-            pos,
-            labels=id_labels,
-            ax=self.ax,
-            font_color="white",
-            font_weight="bold",
-            font_size=9,
-        )
-
-        compute_labels = {}
-        for node, attrs in graph.nodes(data=True):
-            x_value = int(attrs.get("x", 0))
-            compute = float(attrs["c_dev"]) if x_value == 0 else float(attrs["c_host"])
-            place = "Dev" if x_value == 0 else "Host"
-            compute_labels[node] = f"{place}: {compute:g} ms"
-
-        name_dy = 0.42
-        compute_dy = 0.42
-
-        name_pos = {node: (xy[0], xy[1] + name_dy) for node, xy in pos.items()}
-        compute_pos = {node: (xy[0], xy[1] - compute_dy) for node, xy in pos.items()}
-        for node, (x_coord, y_coord) in name_pos.items():
-            node_name = str(graph.nodes[node].get("name", node)) or str(node)
-            self.ax.annotate(
-                node_name,
-                xy=pos[node],
-                xytext=(x_coord, y_coord),
-                textcoords="data",
-                ha="center",
-                va="center",
-                fontsize=9,
-                fontweight="bold",
-                color="#0f172a",
-                zorder=20,
-                clip_on=False,
-                bbox={
-                    "boxstyle": "round,pad=0.34",
-                    "fc": "#ffffff",
-                    "ec": "#111827",
-                    "lw": 1.2,
-                    "alpha": 1.0,
-                },
-                arrowprops={
-                    "arrowstyle": "-",
-                    "color": "#111827",
-                    "lw": 0.7,
-                    "shrinkA": 10,
-                    "shrinkB": 10,
-                },
-            )
-        nx.draw_networkx_labels(
-            graph,
-            compute_pos,
-            labels=compute_labels,
-            ax=self.ax,
-            font_color="#1f2937",
-            font_size=8,
-            horizontalalignment="center",
-            bbox={"boxstyle": "round,pad=0.22", "fc": "#f8fafc", "ec": "#94a3b8", "alpha": 0.96},
-        )
-
+            for node, xy in raw_pos.items()
+        }
+        width = int(max(x for x, _ in pos.values()) + right_pad)
+        height = int(max(y for _, y in pos.values()) + bottom_pad)
         environment = self._environment_from_controls()
-        edge_labels = {}
+        rows = [
+            '<defs><marker id="arrow-gray" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="#6b7280"/></marker>',
+            '<marker id="arrow-red" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="#dc2626"/></marker></defs>',
+        ]
         for source, target, attrs in graph.edges(data=True):
+            sx, sy = pos[source]
+            tx, ty = pos[target]
             size_mb = float(attrs.get("size", 0.0))
             if int(graph.nodes[source].get("x", 0)) == int(graph.nodes[target].get("x", 0)):
-                edge_labels[(source, target)] = f"local\n0 ms"
+                color = "#6b7280"
+                dash = ""
+                marker = "arrow-gray"
+                label = "local / 0 ms"
             else:
+                color = "#dc2626"
+                dash = ' stroke-dasharray="7 5"'
+                marker = "arrow-red"
                 transfer_ms = edge_transfer_ms(size_mb, environment.bandwidth, environment.latency)
-                edge_labels[(source, target)] = f"{size_mb:g} MB\n{transfer_ms:.1f} ms"
-        nx.draw_networkx_edge_labels(
-            graph,
-            pos,
-            edge_labels=edge_labels,
-            ax=self.ax,
-            font_size=8,
-            font_color="#111827",
-            label_pos=0.5,
-            rotate=False,
-            bbox={"boxstyle": "round,pad=0.2", "fc": "#fefce8", "ec": "#a16207", "alpha": 0.96},
+                label = f"{size_mb:g} MB / {transfer_ms:.1f} ms"
+            dx = tx - sx
+            dy = ty - sy
+            dist = max(1.0, (dx * dx + dy * dy) ** 0.5)
+            radius = 24.0
+            start_x = sx + dx / dist * radius
+            start_y = sy + dy / dist * radius
+            end_x = tx - dx / dist * (radius + 5)
+            end_y = ty - dy / dist * (radius + 5)
+            mid_x = (start_x + end_x) / 2.0
+            mid_y = (start_y + end_y) / 2.0 - 10.0
+            rows.append(
+                f'<line class="edge" x1="{start_x:.1f}" y1="{start_y:.1f}" x2="{end_x:.1f}" y2="{end_y:.1f}" '
+                f'stroke="{color}"{dash} marker-end="url(#{marker})"><title>{html.escape(str(source))} → {html.escape(str(target))}: {html.escape(label)}</title></line>'
+                f'<text class="edge-label" x="{mid_x:.1f}" y="{mid_y:.1f}">{html.escape(label)}</text>'
+            )
+        for node, attrs in graph.nodes(data=True):
+            x_pos, y_pos = pos[node]
+            x_value = int(attrs.get("x", 0))
+            fill = "#2563eb" if x_value == 0 else "#16a34a"
+            place = "Dev" if x_value == 0 else "Host"
+            compute = float(attrs["c_dev"]) if x_value == 0 else float(attrs["c_host"])
+            stroke_width = 4 if attrs.get("fixed_dev", False) else 1.5
+            rows.append(
+                f'<g><title>{html.escape(str(node))} {html.escape(str(attrs.get("name", node)))} - {place}: {compute:g} ms</title>'
+                f'<text class="node-name" x="{x_pos:.1f}" y="{y_pos - 43:.1f}">{html.escape(str(attrs.get("name", node)))}</text>'
+                f'<circle cx="{x_pos:.1f}" cy="{y_pos:.1f}" r="24" fill="{fill}" stroke="#111827" stroke-width="{stroke_width}" />'
+                f'<text class="node-id" x="{x_pos:.1f}" y="{y_pos + 5:.1f}">{html.escape(str(node))}</text>'
+                f'<text class="compute" x="{x_pos:.1f}" y="{y_pos + 48:.1f}">{place}: {compute:g} ms</text></g>'
+            )
+        self.graph_view.setHtml(
+            self._svg_page("Topology", "\n".join(rows), width, height, scale_axis="xy")
         )
-        all_x = [xy[0] for xy in pos.values()] + [xy[0] for xy in name_pos.values()]
-        all_y = [xy[1] for xy in pos.values()] + [xy[1] for xy in name_pos.values()]
-        x_padding = 0.22 * max(1.0, max(all_x) - min(all_x))
-        y_padding = 0.28 * max(1.0, max(all_y) - min(all_y))
-        self.ax.set_xlim(min(all_x) - x_padding, max(all_x) + x_padding)
-        self.ax.set_ylim(min(all_y) - y_padding, max(all_y) + y_padding)
-        self.canvas.draw()
 
     def _layered_layout(self, graph: nx.DiGraph) -> Dict[str, Tuple[float, float]]:
         generations = [list(generation) for generation in nx.topological_generations(graph)]
@@ -699,265 +586,202 @@ class MainWindow(QMainWindow):
         self.mode_label.setText("求解模式: --")
 
     def _draw_timeline(self) -> None:
-        self._apply_timeline_canvas_size()
-        self.timeline_ax.clear()
         if self.solver_result is None:
             self._clear_timeline()
             return
+        self.timeline_view.setHtml(self._timeline_html())
 
+    def _clear_timeline(self) -> None:
+        self.timeline_view.setHtml(self._placeholder_html("Click Solve to render schedule timeline"))
+
+    def _timeline_html(self) -> str:
+        assert self.solver_result is not None
         metrics = self.solver_result.metrics
         assignment = self.solver_result.assignment
-        lane_by_x = {0: 4.0, 1: 0.0}
-        transfer_lane = 2.0
-        lane_name_by_y = {4.0: "Device", 2.0: "Transfer", 0.0: "Host"}
-        bar_height = 0.52
-        transfer_height = 0.28
-        label_counts = {0: 0, 1: 0}
+        environment = self._environment_from_controls()
 
-        ordered_nodes = sorted(metrics.start_times, key=lambda node: metrics.start_times[node])
-        for node in ordered_nodes:
+        total_ms = max(1.0, max(metrics.finish_times.values()) if metrics.finish_times else 1.0)
+        px_per_ms = 9.0
+        left_pad = 120.0
+        right_pad = 80.0
+        top_pad = 42.0
+        lane_height = 58.0
+        lane_y = {1: top_pad, "transfer": top_pad + lane_height, 0: top_pad + lane_height * 2}
+        width = int(left_pad + total_ms * px_per_ms + right_pad)
+        height = int(top_pad + lane_height * 3 + 50)
+
+        def esc(value: object) -> str:
+            return html.escape(str(value), quote=True)
+
+        def x_at(ms: float) -> float:
+            return left_pad + ms * px_per_ms
+
+        rows = []
+        for label, y_pos in [("Host", lane_y[1]), ("Transfer", lane_y["transfer"]), ("Device", lane_y[0])]:
+            rows.append(
+                f'<line class="lane" x1="0" y1="{y_pos}" x2="{width}" y2="{y_pos}" />'
+                f'<text class="lane-label" x="16" y="{y_pos + 5}">{label}</text>'
+            )
+
+        tick_step = self._timeline_tick_step(total_ms)
+        tick = 0.0
+        while tick <= total_ms + 1e-9:
+            x_pos = x_at(tick)
+            rows.append(
+                f'<line class="tick" x1="{x_pos:.1f}" y1="20" x2="{x_pos:.1f}" y2="{height - 26}" />'
+                f'<text class="tick-label" x="{x_pos:.1f}" y="{height - 8}">{tick:.0f} ms</text>'
+            )
+            tick += tick_step
+
+        for node in sorted(metrics.start_times, key=lambda n: metrics.start_times[n]):
             start = metrics.start_times[node]
             finish = metrics.finish_times[node]
-            duration = finish - start
+            duration = max(0.1, finish - start)
             x_value = int(assignment[node])
-            lane = lane_by_x[x_value]
+            y_center = lane_y[x_value]
+            x_pos = x_at(start)
+            bar_width = max(6.0, duration * px_per_ms)
             color = "#2563eb" if x_value == 0 else "#16a34a"
-            attrs = self.graph.nodes[node]
-            label_name = str(attrs.get("name", node))
-
-            self.timeline_ax.barh(
-                lane,
-                duration,
-                left=start,
-                height=bar_height,
-                color=color,
-                edgecolor="#111827",
-                linewidth=1.0,
-                alpha=0.92,
-                zorder=3,
-            )
-            self.timeline_ax.text(
-                start + duration / 2.0,
-                lane,
-                str(node),
-                ha="center",
-                va="center",
-                color="white",
-                fontsize=8,
-                fontweight="bold",
-                clip_on=True,
-                zorder=4,
-            )
-
-            index = label_counts[x_value]
-            label_counts[x_value] += 1
-            label_offset = 0.72 + (index % 2) * 0.48
-            label_y = lane + label_offset if x_value == 0 else lane - label_offset
-            va = "bottom" if x_value == 0 else "top"
-            label_text = f"{node} {label_name}\n{start:.1f}-{finish:.1f} ms ({duration:.1f})"
-            self.timeline_ax.text(
-                start + duration / 2.0,
-                label_y,
-                label_text,
-                ha="center",
-                va=va,
-                color="#111827",
-                fontsize=7,
-                clip_on=True,
-                zorder=6,
-                bbox={
-                    "boxstyle": "round,pad=0.18",
-                    "fc": "#ffffff",
-                    "ec": "#9ca3af",
-                    "alpha": 0.96,
-                },
-            )
-            self.timeline_ax.plot(
-                [start + duration / 2.0, start + duration / 2.0],
-                [lane + (bar_height / 2.0 if x_value == 0 else -bar_height / 2.0), label_y],
-                color="#9ca3af",
-                linewidth=0.7,
-                zorder=2,
+            node_name = esc(self.graph.nodes[node].get("name", node))
+            rows.append(
+                f'<g><title>{esc(node)} {node_name}: {start:.1f}-{finish:.1f} ms</title>'
+                f'<rect class="op" x="{x_pos:.1f}" y="{y_center - 16:.1f}" width="{bar_width:.1f}" '
+                f'height="32" rx="4" fill="{color}" />'
+                f'<text class="op-id" x="{x_pos + bar_width / 2:.1f}" y="{y_center + 5:.1f}">{esc(node)}</text>'
+                f'<text class="op-meta" x="{x_pos:.1f}" y="{y_center - 24:.1f}">{esc(node)} {node_name} '
+                f'{start:.1f}-{finish:.1f} ms</text></g>'
             )
 
         transfer_index = 0
-        environment = self._environment_from_controls()
         for source, target, attrs in self.graph.edges(data=True):
             if source not in metrics.finish_times or target not in metrics.start_times:
                 continue
             if int(assignment[source]) == int(assignment[target]):
                 continue
-            source_y = lane_by_x[int(assignment[source])]
-            target_y = lane_by_x[int(assignment[target])]
-            start_x = metrics.finish_times[source]
+            start = metrics.finish_times[source]
             transfer_ms = edge_transfer_ms(
                 float(attrs.get("size", 0.0)), environment.bandwidth, environment.latency
             )
-            end_x = start_x + transfer_ms
-            if metrics.start_times[target] < start_x:
-                continue
-            transfer_y = transfer_lane + ((transfer_index % 3) - 1) * 0.34
+            finish = start + transfer_ms
+            y_center = lane_y["transfer"] + ((transfer_index % 3) - 1) * 12
             transfer_index += 1
-            self.timeline_ax.barh(
-                transfer_y,
-                transfer_ms,
-                left=start_x,
-                height=transfer_height,
-                color="#f97316",
-                edgecolor="#9a3412",
-                linewidth=1.0,
-                alpha=0.95,
-                zorder=4,
-            )
-            self.timeline_ax.text(
-                start_x + transfer_ms / 2.0,
-                transfer_y,
-                f"{source}->{target}  {float(attrs.get('size', 0.0)):g} MB",
-                ha="center",
-                va="center",
-                fontsize=7,
-                color="#111827",
-                fontweight="bold",
-                clip_on=True,
-                zorder=5,
-            )
-            for x_coord, y0, y1 in (
-                (start_x, source_y, transfer_y),
-                (end_x, transfer_y, target_y),
-            ):
-                self.timeline_ax.plot(
-                    [x_coord, x_coord],
-                    [y0, y1],
-                    color="#9a3412",
-                    linewidth=1.0,
-                    alpha=0.9,
-                    zorder=2,
-                )
-            self.timeline_ax.text(
-                start_x + transfer_ms / 2.0,
-                transfer_y + 0.28,
-                f"{transfer_ms:.1f} ms",
-                ha="center",
-                va="bottom",
-                fontsize=7,
-                color="#7c2d12",
-                clip_on=True,
-                bbox={
-                    "boxstyle": "round,pad=0.12",
-                    "fc": "#fff7ed",
-                    "ec": "#f97316",
-                    "alpha": 0.9,
-                },
-                zorder=5,
+            x_pos = x_at(start)
+            bar_width = max(6.0, transfer_ms * px_per_ms)
+            source_y = lane_y[int(assignment[source])]
+            target_y = lane_y[int(assignment[target])]
+            end_x = x_at(finish)
+            rows.append(
+                f'<g><title>{esc(source)} → {esc(target)}: {float(attrs.get("size", 0.0)):g} MB, '
+                f'{transfer_ms:.1f} ms</title>'
+                f'<line class="dep" x1="{x_pos:.1f}" y1="{source_y:.1f}" x2="{x_pos:.1f}" y2="{y_center:.1f}" />'
+                f'<rect class="transfer" x="{x_pos:.1f}" y="{y_center - 10:.1f}" width="{bar_width:.1f}" '
+                f'height="20" rx="3" />'
+                f'<text class="transfer-label" x="{x_pos + bar_width / 2:.1f}" y="{y_center + 4:.1f}">'
+                f'{esc(source)}→{esc(target)} {float(attrs.get("size", 0.0)):g} MB</text>'
+                f'<line class="dep" x1="{end_x:.1f}" y1="{y_center:.1f}" x2="{end_x:.1f}" y2="{target_y:.1f}" />'
+                f'</g>'
             )
 
-        max_finish = max(metrics.finish_times.values()) if metrics.finish_times else 1.0
-        self._timeline_total_ms = max(1.0, max_finish)
-        self._update_timeline_pan_range()
-        self._apply_timeline_xlim()
-        self.timeline_ax.set_ylim(-1.75, 5.75)
-        self.timeline_ax.set_yticks([0.0, 2.0, 4.0])
-        self.timeline_ax.set_yticklabels(
-            [lane_name_by_y[0.0], lane_name_by_y[2.0], lane_name_by_y[4.0]]
+        svg = "\n".join(rows)
+        return self._svg_page(
+            "Timeline",
+            svg,
+            width,
+            height,
+            extra_info=f"<span>Total: {total_ms:.1f} ms</span>",
         )
-        self.timeline_ax.set_xlabel("Time (ms)")
-        self.timeline_ax.grid(axis="x", color="#e5e7eb", linestyle="-", linewidth=0.8)
-        self.timeline_ax.set_axisbelow(True)
-        self.timeline_ax.spines["top"].set_visible(False)
-        self.timeline_ax.spines["right"].set_visible(False)
-        self._clip_timeline_artists()
-        self.timeline_canvas.draw()
 
-    def _clear_timeline(self) -> None:
-        self._apply_timeline_canvas_size()
-        self.timeline_ax.clear()
-        self.timeline_ax.set_axis_off()
-        self._timeline_total_ms = 0.0
-        self._timeline_window_ms = 0.0
-        self.timeline_ax.text(
-            0.5,
-            0.5,
-            "Click Solve to render schedule timeline",
-            ha="center",
-            va="center",
-            transform=self.timeline_ax.transAxes,
-            color="#6b7280",
-            fontsize=10,
+    def _svg_page(
+        self,
+        title: str,
+        svg_body: str,
+        width: int,
+        height: int,
+        extra_info: str = "",
+        scale_axis: str = "x",
+    ) -> str:
+        scale_transform = (
+            "'scale(' + factor + ')'" if scale_axis == "xy" else "'scaleX(' + factor + ')'"
         )
-        self.timeline_canvas.draw()
-        self._update_timeline_pan_range()
+        scaled_height = f"({height} * factor)" if scale_axis == "xy" else str(height)
+        return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body {{ height: 100%; margin: 0; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+  body {{ display: flex; flex-direction: column; background: #ffffff; color: #111827; }}
+  .toolbar {{ flex: 0 0 auto; display: flex; align-items: center; gap: 10px; padding: 6px 10px; border-bottom: 1px solid #e5e7eb; background: #f9fafb; font-size: 12px; }}
+  .toolbar input {{ width: 180px; }}
+  #viewport {{ flex: 1 1 auto; overflow: auto; background: #ffffff; }}
+  #content {{ transform-origin: top left; width: {width}px; height: {height}px; }}
+  svg {{ display: block; width: {width}px; height: {height}px; }}
+  .edge {{ stroke-width: 2; fill: none; }}
+  .edge-label {{ fill: #111827; font-size: 11px; text-anchor: middle; paint-order: stroke; stroke: #ffffff; stroke-width: 4px; stroke-linejoin: round; }}
+  .node-id {{ fill: #ffffff; font-size: 12px; font-weight: 800; text-anchor: middle; pointer-events: none; }}
+  .node-name {{ fill: #0f172a; font-size: 12px; font-weight: 800; text-anchor: middle; paint-order: stroke; stroke: #ffffff; stroke-width: 5px; stroke-linejoin: round; }}
+  .compute {{ fill: #374151; font-size: 11px; text-anchor: middle; paint-order: stroke; stroke: #ffffff; stroke-width: 4px; stroke-linejoin: round; }}
+  .lane {{ stroke: #d1d5db; stroke-width: 1; }}
+  .lane-label {{ font-size: 12px; font-weight: 700; fill: #374151; }}
+  .tick {{ stroke: #eef2f7; stroke-width: 1; }}
+  .tick-label {{ font-size: 10px; fill: #6b7280; text-anchor: middle; }}
+  .op {{ stroke: #111827; stroke-width: 1; }}
+  .op-id {{ fill: #ffffff; font-size: 11px; font-weight: 700; text-anchor: middle; pointer-events: none; }}
+  .op-meta {{ fill: #111827; font-size: 10px; paint-order: stroke; stroke: #ffffff; stroke-width: 3px; stroke-linejoin: round; }}
+  .transfer {{ fill: #f97316; stroke: #9a3412; stroke-width: 1; }}
+  .transfer-label {{ fill: #111827; font-size: 10px; font-weight: 700; text-anchor: middle; pointer-events: none; }}
+  .dep {{ stroke: #9a3412; stroke-width: 1; opacity: 0.75; }}
+</style>
+</head>
+<body>
+  <div class="toolbar">
+    <strong>{html.escape(title)}</strong>
+    <label for="scale">Scale</label>
+    <input id="scale" type="range" min="100" max="500" step="25" value="100">
+    <span id="scaleText">100%</span>
+    {extra_info}
+  </div>
+  <div id="viewport">
+    <div id="content">
+      <svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">{svg_body}</svg>
+    </div>
+  </div>
+<script>
+  const scale = document.getElementById('scale');
+  const scaleText = document.getElementById('scaleText');
+  const content = document.getElementById('content');
+  function applyScale() {{
+    const factor = Number(scale.value) / 100;
+    scaleText.textContent = scale.value + '%';
+    content.style.transform = {scale_transform};
+    content.style.width = ({width} * factor) + 'px';
+    content.style.height = {scaled_height} + 'px';
+  }}
+  scale.addEventListener('input', applyScale);
+  applyScale();
+</script>
+</body>
+</html>"""
 
-    def _set_timeline_scale(self, value: int, redraw: bool = True) -> None:
-        self.timeline_scale_label.setText(f"{value}%")
-        self._apply_timeline_canvas_size()
-        self._update_timeline_pan_range()
-        if redraw:
-            if self.solver_result is None:
-                self._clear_timeline()
-            else:
-                self._draw_timeline()
+    def _placeholder_html(self, message: str) -> str:
+        return f"""
+        <!doctype html>
+        <html><head><meta charset="utf-8">
+        <style>
+          html, body {{ height: 100%; margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+          body {{ display: grid; place-items: center; color: #6b7280; background: #ffffff; }}
+        </style></head>
+        <body>{html.escape(message)}</body></html>
+        """
 
-    def _apply_timeline_canvas_size(self) -> None:
-        viewport_width = max(1, self.timeline_scroll.viewport().width())
-        viewport_height = max(1, self.timeline_scroll.viewport().height())
-        width = viewport_width
-        height = viewport_height
-        self.timeline_canvas.setMinimumSize(width, height)
-        self.timeline_canvas.setFixedSize(width, height)
-        self.timeline_content.setMinimumSize(width, height)
-        self.timeline_content.setFixedSize(width, height)
-        dpi = self.timeline_figure.get_dpi()
-        self.timeline_figure.set_size_inches(width / dpi, height / dpi, forward=False)
-
-    def _resize_timeline_to_viewport(self) -> None:
-        self._apply_timeline_canvas_size()
-        self._update_timeline_pan_range()
-        if self.solver_result is None:
-            self._clear_timeline()
-        else:
-            self._draw_timeline()
-
-    def _update_timeline_pan_range(self) -> None:
-        scale = self.timeline_scale_slider.value() / 100.0
-        self._timeline_window_ms = self._timeline_total_ms / max(1.0, scale)
-        max_offset = max(0.0, self._timeline_total_ms - self._timeline_window_ms)
-        max_pan = int(round(max_offset * 10.0))
-        self._syncing_timeline_pan = True
-        try:
-            self.timeline_pan_slider.setRange(0, max_pan)
-            self.timeline_pan_slider.setEnabled(max_pan > 0)
-            self.timeline_pan_slider.setValue(min(self.timeline_pan_slider.value(), max_pan))
-            self.timeline_pan_label.setText(f"{self.timeline_pan_slider.value() / 10.0:.1f} ms")
-        finally:
-            self._syncing_timeline_pan = False
-
-    def _pan_timeline(self, value: int) -> None:
-        if self._syncing_timeline_pan:
-            return
-        self.timeline_pan_label.setText(f"{value / 10.0:.1f} ms")
-        self._apply_timeline_xlim()
-        self._clip_timeline_artists()
-        self.timeline_canvas.draw()
-
-    def _apply_timeline_xlim(self) -> None:
-        if self._timeline_total_ms <= 0:
-            return
-        offset = self.timeline_pan_slider.value() / 10.0
-        window = self._timeline_window_ms or self._timeline_total_ms
-        left = min(max(0.0, offset), max(0.0, self._timeline_total_ms - window))
-        right = min(self._timeline_total_ms, left + window)
-        if right <= left:
-            right = left + 1.0
-        self.timeline_ax.set_xlim(left, right)
-
-    def _clip_timeline_artists(self) -> None:
-        for artist in self.timeline_ax.get_children():
-            if artist is self.timeline_ax.patch:
-                continue
-            if hasattr(artist, "set_clip_on"):
-                artist.set_clip_on(True)
-            if hasattr(artist, "set_clip_path"):
-                artist.set_clip_path(self.timeline_ax.patch)
+    def _timeline_tick_step(self, total_ms: float) -> float:
+        if total_ms <= 50:
+            return 5.0
+        if total_ms <= 150:
+            return 10.0
+        if total_ms <= 500:
+            return 50.0
+        return 100.0
 
 
 def main() -> None:
