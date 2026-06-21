@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple
 import networkx as nx
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QEvent, QObject, Qt
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -58,6 +58,11 @@ class MainWindow(QMainWindow):
         self._seed_example()
         self.graph = self._graph_from_tables()
         self._draw_graph()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self.timeline_scroll.viewport() and event.type() == QEvent.Type.Resize:
+            self._resize_timeline_to_viewport()
+        return super().eventFilter(watched, event)
 
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
@@ -226,7 +231,7 @@ class MainWindow(QMainWindow):
         self.timeline_figure.subplots_adjust(left=0.12, right=0.98, top=0.9, bottom=0.18)
         self.timeline_canvas = FigureCanvasQTAgg(self.timeline_figure)
         self.timeline_canvas.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
         self.timeline_ax = self.timeline_figure.add_subplot(111)
         self.timeline_content = QWidget()
@@ -238,6 +243,7 @@ class MainWindow(QMainWindow):
         self.timeline_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.timeline_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.timeline_scroll.setWidget(self.timeline_content)
+        self.timeline_scroll.viewport().installEventFilter(self)
         timeline_layout.addWidget(self.timeline_scroll)
         layout.addWidget(timeline_group, stretch=3)
         self._set_timeline_scale(self.timeline_scale_slider.value(), redraw=False)
@@ -894,14 +900,22 @@ class MainWindow(QMainWindow):
     def _apply_timeline_canvas_size(self) -> None:
         viewport_width = max(1, self.timeline_scroll.viewport().width())
         viewport_height = max(1, self.timeline_scroll.viewport().height())
-        width = max(760, viewport_width)
-        height = max(300, viewport_height)
+        width = viewport_width
+        height = viewport_height
         self.timeline_canvas.setMinimumSize(width, height)
         self.timeline_canvas.setFixedSize(width, height)
         self.timeline_content.setMinimumSize(width, height)
         self.timeline_content.setFixedSize(width, height)
         dpi = self.timeline_figure.get_dpi()
         self.timeline_figure.set_size_inches(width / dpi, height / dpi, forward=False)
+
+    def _resize_timeline_to_viewport(self) -> None:
+        self._apply_timeline_canvas_size()
+        self._update_timeline_pan_range()
+        if self.solver_result is None:
+            self._clear_timeline()
+        else:
+            self._draw_timeline()
 
     def _update_timeline_pan_range(self) -> None:
         scale = self.timeline_scale_slider.value() / 100.0
