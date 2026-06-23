@@ -640,8 +640,8 @@ class MainWindow(QMainWindow):
         while tick <= total_ms + 1e-9:
             x_pos = x_at(tick)
             rows.append(
-                f'<line class="tick" x1="{x_pos:.1f}" y1="20" x2="{x_pos:.1f}" y2="{height - 26}" />'
-                f'<text class="tick-label" x="{x_pos:.1f}" y="{height - 8}">{tick:.0f} ms</text>'
+                f'<line class="tick" data-ms="{tick:.6f}" x1="{x_pos:.1f}" y1="20" x2="{x_pos:.1f}" y2="{height - 26}" />'
+                f'<text class="tick-label" data-ms="{tick:.6f}" x="{x_pos:.1f}" y="{height - 8}">{tick:.0f} ms</text>'
             )
             tick += tick_step
 
@@ -657,10 +657,10 @@ class MainWindow(QMainWindow):
             node_name = esc(self.graph.nodes[node].get("name", node))
             rows.append(
                 f'<g><title>{esc(node)} {node_name}: {start:.1f}-{finish:.1f} ms</title>'
-                f'<rect class="op" x="{x_pos:.1f}" y="{y_center - 16:.1f}" width="{bar_width:.1f}" '
+                f'<rect class="op" data-start="{start:.6f}" data-duration="{duration:.6f}" x="{x_pos:.1f}" y="{y_center - 16:.1f}" width="{bar_width:.1f}" '
                 f'height="32" rx="4" fill="{color}" />'
-                f'<text class="op-id" x="{x_pos + bar_width / 2:.1f}" y="{y_center + 5:.1f}">{esc(node)}</text>'
-                f'<text class="op-meta" x="{x_pos:.1f}" y="{y_center - 24:.1f}">{esc(node)} {node_name} '
+                f'<text class="op-id" data-start="{start:.6f}" data-duration="{duration:.6f}" data-anchor="center" x="{x_pos + bar_width / 2:.1f}" y="{y_center + 5:.1f}">{esc(node)}</text>'
+                f'<text class="op-meta" data-start="{start:.6f}" data-anchor="start" x="{x_pos:.1f}" y="{y_center - 24:.1f}">{esc(node)} {node_name} '
                 f'{start:.1f}-{finish:.1f} ms</text></g>'
             )
 
@@ -685,12 +685,12 @@ class MainWindow(QMainWindow):
             rows.append(
                 f'<g><title>{esc(source)} → {esc(target)}: {float(attrs.get("size", 0.0)):g} MB, '
                 f'{transfer_ms:.1f} ms</title>'
-                f'<line class="dep" x1="{x_pos:.1f}" y1="{source_y:.1f}" x2="{x_pos:.1f}" y2="{y_center:.1f}" />'
-                f'<rect class="transfer" x="{x_pos:.1f}" y="{y_center - 10:.1f}" width="{bar_width:.1f}" '
+                f'<line class="dep" data-ms="{start:.6f}" x1="{x_pos:.1f}" y1="{source_y:.1f}" x2="{x_pos:.1f}" y2="{y_center:.1f}" />'
+                f'<rect class="transfer" data-start="{start:.6f}" data-duration="{transfer_ms:.6f}" x="{x_pos:.1f}" y="{y_center - 10:.1f}" width="{bar_width:.1f}" '
                 f'height="20" rx="3" />'
-                f'<text class="transfer-label" x="{x_pos + bar_width / 2:.1f}" y="{y_center + 4:.1f}">'
+                f'<text class="transfer-label" data-start="{start:.6f}" data-duration="{transfer_ms:.6f}" data-anchor="center" x="{x_pos + bar_width / 2:.1f}" y="{y_center + 4:.1f}">'
                 f'{esc(source)}→{esc(target)} {float(attrs.get("size", 0.0)):g} MB</text>'
-                f'<line class="dep" x1="{end_x:.1f}" y1="{y_center:.1f}" x2="{end_x:.1f}" y2="{target_y:.1f}" />'
+                f'<line class="dep" data-ms="{finish:.6f}" x1="{end_x:.1f}" y1="{y_center:.1f}" x2="{end_x:.1f}" y2="{target_y:.1f}" />'
                 f'</g>'
             )
 
@@ -701,6 +701,11 @@ class MainWindow(QMainWindow):
             width,
             height,
             extra_info=f"<span>Total: {total_ms:.1f} ms</span>",
+            scale_axis="timeline",
+            timeline_left_pad=left_pad,
+            timeline_px_per_ms=px_per_ms,
+            timeline_right_pad=right_pad,
+            timeline_total_ms=total_ms,
         )
 
     def _svg_page(
@@ -711,11 +716,63 @@ class MainWindow(QMainWindow):
         height: int,
         extra_info: str = "",
         scale_axis: str = "x",
+        timeline_left_pad: float = 0.0,
+        timeline_px_per_ms: float = 1.0,
+        timeline_right_pad: float = 0.0,
+        timeline_total_ms: float = 0.0,
     ) -> str:
-        scale_transform = (
-            "'scale(' + factor + ')'" if scale_axis == "xy" else "'scaleX(' + factor + ')'"
-        )
-        scaled_height = f"({height} * factor)" if scale_axis == "xy" else str(height)
+        if scale_axis == "timeline":
+            scale_script = f"""
+    const leftPad = {timeline_left_pad};
+    const basePxPerMs = {timeline_px_per_ms};
+    const rightPad = {timeline_right_pad};
+    const totalMs = {timeline_total_ms};
+    const pxPerMs = basePxPerMs * factor;
+    const scaledWidth = Math.max({width}, leftPad + totalMs * pxPerMs + rightPad);
+    content.style.transform = 'none';
+    content.style.width = scaledWidth + 'px';
+    content.style.height = {height} + 'px';
+    const svg = document.querySelector('svg');
+    svg.setAttribute('width', scaledWidth);
+    svg.setAttribute('viewBox', '0 0 ' + scaledWidth + ' {height}');
+    svg.style.width = scaledWidth + 'px';
+    svg.style.height = '{height}px';
+    document.querySelectorAll('.lane').forEach((line) => line.setAttribute('x2', scaledWidth));
+    document.querySelectorAll('[data-ms]').forEach((el) => {{
+      const x = leftPad + Number(el.dataset.ms) * pxPerMs;
+      if (el.tagName === 'line') {{
+        el.setAttribute('x1', x);
+        el.setAttribute('x2', x);
+      }} else {{
+        el.setAttribute('x', x);
+      }}
+    }});
+    document.querySelectorAll('[data-start]').forEach((el) => {{
+      const start = Number(el.dataset.start);
+      const duration = Number(el.dataset.duration || 0);
+      const x = leftPad + start * pxPerMs;
+      const width = Math.max(6, duration * pxPerMs);
+      const anchor = el.dataset.anchor || 'start';
+      if (el.tagName === 'rect') {{
+        el.setAttribute('x', x);
+        el.setAttribute('width', width);
+      }} else if (anchor === 'center') {{
+        el.setAttribute('x', x + width / 2);
+      }} else {{
+        el.setAttribute('x', x);
+      }}
+    }});
+"""
+        else:
+            scale_transform = (
+                "'scale(' + factor + ')'" if scale_axis == "xy" else "'scaleX(' + factor + ')'"
+            )
+            scaled_height = f"({height} * factor)" if scale_axis == "xy" else str(height)
+            scale_script = f"""
+    content.style.transform = {scale_transform};
+    content.style.width = ({width} * factor) + 'px';
+    content.style.height = {scaled_height} + 'px';
+"""
         return f"""<!doctype html>
 <html>
 <head>
@@ -765,9 +822,7 @@ class MainWindow(QMainWindow):
   function applyScale() {{
     const factor = Number(scale.value) / 100;
     scaleText.textContent = scale.value + '%';
-    content.style.transform = {scale_transform};
-    content.style.width = ({width} * factor) + 'px';
-    content.style.height = {scaled_height} + 'px';
+{scale_script}
   }}
   scale.addEventListener('input', applyScale);
   applyScale();
