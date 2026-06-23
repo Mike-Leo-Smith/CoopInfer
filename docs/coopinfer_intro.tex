@@ -8,7 +8,7 @@
 \usepackage{amsmath}
 \usepackage{booktabs}
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta, positioning}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, decorations.pathreplacing}
 
 \title[CoopInfer]{CoopInfer: Host--Device Cooperative Inference Scheduling}
 \subtitle{A strategy-driven prototype for DAG partitioning and schedule visualization}
@@ -61,6 +61,33 @@
   \end{columns}
 \end{frame}
 
+\begin{frame}{Prototype Loop}
+  \centering
+  \begin{tikzpicture}[
+      block/.style={draw, rounded corners, minimum width=2.5cm, minimum height=1cm, align=center, font=\small},
+      arrow/.style={-{Latex[length=2.5mm]}, thick},
+      data/.style={draw, cylinder, shape border rotate=90, aspect=0.25, minimum height=1.1cm, minimum width=1.6cm, align=center, font=\small}
+    ]
+    \node[block, fill=blue!12] (edit) at (0,0) {GUI Editor\\Nodes, Edges, Env};
+    \node[data, fill=gray!12, right=1.8cm of edit] (json) {JSON\\State};
+    \node[block, fill=green!12, right=1.8cm of json] (graph) {NetworkX\\DAG};
+    \node[block, fill=orange!18, below=1.25cm of graph] (eval) {Evaluator\\Queues + Transfers};
+    \node[block, fill=purple!14, left=1.8cm of eval] (solver) {Solver\\Search over $x$};
+    \node[block, fill=red!10, left=1.8cm of solver] (viz) {SVG Views\\Topology + Timeline};
+
+    \draw[arrow] (edit) -- (json);
+    \draw[arrow] (json) -- (graph);
+    \draw[arrow] (graph) -- (eval);
+    \draw[arrow] (eval) -- node[below, font=\scriptsize] {loss, latency} (solver);
+    \draw[arrow] (solver) -- node[below, font=\scriptsize] {$x_{best}$} (viz);
+    \draw[arrow] (viz) -- node[left, font=\scriptsize] {inspect/refine} (edit);
+    \draw[arrow] (solver.north) -- node[right, font=\scriptsize] {candidate $x$} (graph.south);
+  \end{tikzpicture}
+  \vspace{0.8em}
+
+  The prototype keeps editing, solving, physical evaluation, and visualization in one reproducible workflow.
+\end{frame}
+
 \begin{frame}{Data Model}
   \begin{itemize}
     \item In memory, topology is stored in a \texttt{networkx.DiGraph}.
@@ -78,6 +105,39 @@
       \end{itemize}
     \item JSON load/save keeps experiments reproducible and shareable.
   \end{itemize}
+\end{frame}
+
+\begin{frame}{Queue-Aware Execution}
+  \centering
+  \begin{tikzpicture}[
+      x=0.075cm, y=0.9cm,
+      axis/.style={-{Latex[length=2mm]}, thick},
+      opdev/.style={draw=blue!70!black, fill=blue!65, text=white, rounded corners=2pt, minimum height=0.45cm, font=\scriptsize},
+      ophost/.style={draw=green!60!black, fill=green!65, text=white, rounded corners=2pt, minimum height=0.45cm, font=\scriptsize},
+      transfer/.style={draw=orange!80!black, fill=orange!55, rounded corners=2pt, minimum height=0.35cm, font=\scriptsize},
+      wait/.style={draw=gray!55, fill=gray!15, rounded corners=1pt, minimum height=0.28cm, font=\scriptsize}
+    ]
+    \draw[axis] (0,0) -- (130,0) node[right] {\scriptsize time};
+    \foreach \x/\t in {0/0,30/30,60/60,90/90,120/120}
+      \draw (\x,0.08) -- (\x,-0.08) node[below] {\scriptsize \t ms};
+
+    \node[left] at (0,2.3) {\small Host};
+    \node[left] at (0,1.2) {\small Network};
+    \node[left] at (0,0.35) {\small Device};
+
+    \node[opdev, minimum width=18*0.075cm] at (9,0.35) {$v_1$};
+    \node[transfer, minimum width=34*0.075cm] at (35,1.2) {$L+s/B$};
+    \node[wait, minimum width=24*0.075cm] at (36,2.3) {queue wait};
+    \node[ophost, minimum width=20*0.075cm] at (70,2.3) {$v_2$};
+    \node[opdev, minimum width=28*0.075cm] at (104,0.35) {$v_3$};
+
+    \draw[dashed, -{Latex[length=2mm]}] (18,0.6) -- (18,1.0);
+    \draw[dashed, -{Latex[length=2mm]}] (52,1.4) -- (52,2.05);
+    \draw[dashed, -{Latex[length=2mm]}] (80,2.05) -- (90,0.58);
+  \end{tikzpicture}
+  \vspace{0.8em}
+
+  A node starts only after all data is ready and its assigned worker queue is available.
 \end{frame}
 
 \begin{frame}{Evaluator: Data Dependency + Resource Queues}
@@ -104,6 +164,38 @@
     F_i = S_i + (1-x_i)c_i^{dev} + x_i c_i^{host}
   \]
   The E2E latency is $\tau=\max_i F_i$.
+\end{frame}
+
+\begin{frame}{Network Batching Illustration}
+  \centering
+  \begin{tikzpicture}[
+      x=0.07cm, y=0.95cm,
+      axis/.style={-{Latex[length=2mm]}, thick},
+      edgebar/.style={draw=orange!80!black, fill=orange!45, rounded corners=2pt, minimum height=0.38cm, font=\scriptsize},
+      batchbar/.style={draw=red!65!black, fill=red!35, rounded corners=2pt, minimum height=0.38cm, font=\scriptsize},
+      label/.style={font=\small}
+    ]
+    \draw[axis] (0,0) -- (145,0) node[right] {\scriptsize time};
+    \foreach \x/\t in {0/0,30/30,60/60,90/90,120/120}
+      \draw (\x,0.08) -- (\x,-0.08) node[below] {\scriptsize \t};
+
+    \node[label, left] at (0,2.1) {No batching};
+    \node[edgebar, minimum width=36*0.07cm] at (18,2.1) {$L+s_1/B$};
+    \node[edgebar, minimum width=36*0.07cm] at (54,2.1) {$L+s_2/B$};
+    \node[edgebar, minimum width=36*0.07cm] at (90,2.1) {$L+s_3/B$};
+    \draw[decorate, decoration={brace, amplitude=3pt}] (0,2.55) -- (108,2.55)
+      node[midway, above=3pt, font=\scriptsize] {three fixed latencies};
+
+    \node[label, left] at (0,0.95) {Batching};
+    \node[batchbar, minimum width=78*0.07cm] at (39,0.95) {$L+(s_1+s_2+s_3)/B$};
+    \draw[decorate, decoration={brace, amplitude=3pt}] (0,1.4) -- (78,1.4)
+      node[midway, above=3pt, font=\scriptsize] {one fixed latency, summed payload};
+
+    \node[font=\scriptsize, align=center] at (119,1.45) {same source\\outgoing transfers};
+  \end{tikzpicture}
+  \vspace{0.8em}
+
+  Batching reduces repeated fixed latency, but it does not allow network transfers to overlap.
 \end{frame}
 
 \begin{frame}{Network Model: Serialized Transfers and Batching}
@@ -200,6 +292,42 @@
       \end{itemize}
     \end{column}
   \end{columns}
+\end{frame}
+
+\begin{frame}{Topology and Timeline Reading Guide}
+  \centering
+  \begin{tikzpicture}[
+      node/.style={circle, draw=black, minimum size=0.82cm, font=\bfseries\scriptsize},
+      arrow/.style={-{Latex[length=2.4mm]}, thick},
+      lane/.style={draw=gray!35},
+      op/.style={rounded corners=2pt, minimum height=0.32cm, font=\scriptsize},
+      x=1cm, y=1cm
+    ]
+    \node[node, fill=blue!65, text=white] (a) at (0,2.9) {v1};
+    \node[node, fill=green!65, text=white] (b) at (1.8,3.35) {v2};
+    \node[node, fill=green!65, text=white] (c) at (1.8,2.45) {v3};
+    \node[node, fill=blue!65, text=white, line width=1.2pt] (d) at (3.6,2.9) {v4};
+    \draw[arrow, red, dashed] (a) -- node[above, font=\tiny] {2 MB} (b);
+    \draw[arrow, red, dashed] (a) -- node[below, font=\tiny] {1 MB} (c);
+    \draw[arrow, gray] (b) -- (d);
+    \draw[arrow, red, dashed] (c) -- (d);
+    \node[font=\scriptsize] at (1.8,1.75) {Topology: colors show placement; edge style shows communication};
+
+    \begin{scope}[shift={(5.2,2.0)}, x=0.045cm, y=0.7cm]
+      \draw[lane] (0,2.0) -- (135,2.0);
+      \draw[lane] (0,1.1) -- (135,1.1);
+      \draw[lane] (0,0.2) -- (135,0.2);
+      \node[left, font=\scriptsize] at (0,2.0) {Host};
+      \node[left, font=\scriptsize] at (0,1.1) {Net};
+      \node[left, font=\scriptsize] at (0,0.2) {Dev};
+      \node[op, fill=blue!65, text=white, minimum width=22*0.045cm] at (11,0.2) {v1};
+      \node[op, fill=orange!55, minimum width=52*0.045cm] at (48,1.1) {batch};
+      \node[op, fill=green!65, text=white, minimum width=22*0.045cm] at (85,2.0) {v2};
+      \node[op, fill=green!65, text=white, minimum width=18*0.045cm] at (105,2.0) {v3};
+      \node[op, fill=blue!65, text=white, minimum width=24*0.045cm] at (122,0.2) {v4};
+    \end{scope}
+    \node[font=\scriptsize] at (8.2,1.05) {Timeline: bars show actual evaluator start/finish times};
+  \end{tikzpicture}
 \end{frame}
 
 \begin{frame}{Example DAG}

@@ -6,7 +6,7 @@
 \usepackage{amsmath}
 \usepackage{booktabs}
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta, positioning}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, decorations.pathreplacing}
 
 \title[CoopInfer]{CoopInfer：边端协同推理调度原型}
 \subtitle{面向 DAG 切分、约束求解与时序可视化的桌面验证工具}
@@ -59,6 +59,33 @@
   \end{columns}
 \end{frame}
 
+\begin{frame}{原型闭环}
+  \centering
+  \begin{tikzpicture}[
+      block/.style={draw, rounded corners, minimum width=2.5cm, minimum height=1cm, align=center, font=\small},
+      arrow/.style={-{Latex[length=2.5mm]}, thick},
+      data/.style={draw, cylinder, shape border rotate=90, aspect=0.25, minimum height=1.1cm, minimum width=1.6cm, align=center, font=\small}
+    ]
+    \node[block, fill=blue!12] (edit) at (0,0) {GUI 编辑\\节点、边、环境};
+    \node[data, fill=gray!12, right=1.8cm of edit] (json) {JSON\\状态};
+    \node[block, fill=green!12, right=1.8cm of json] (graph) {NetworkX\\DAG};
+    \node[block, fill=orange!18, below=1.25cm of graph] (eval) {解析器\\队列 + 传输};
+    \node[block, fill=purple!14, left=1.8cm of eval] (solver) {求解器\\搜索 $x$};
+    \node[block, fill=red!10, left=1.8cm of solver] (viz) {SVG 视图\\拓扑 + 时序};
+
+    \draw[arrow] (edit) -- (json);
+    \draw[arrow] (json) -- (graph);
+    \draw[arrow] (graph) -- (eval);
+    \draw[arrow] (eval) -- node[below, font=\scriptsize] {loss, latency} (solver);
+    \draw[arrow] (solver) -- node[below, font=\scriptsize] {$x_{best}$} (viz);
+    \draw[arrow] (viz) -- node[left, font=\scriptsize] {检查/调整} (edit);
+    \draw[arrow] (solver.north) -- node[right, font=\scriptsize] {候选 $x$} (graph.south);
+  \end{tikzpicture}
+  \vspace{0.8em}
+
+  原型把编辑、求解、物理推演和可视化放在一个可复现实验闭环中。
+\end{frame}
+
 \begin{frame}{数据模型}
   \begin{itemize}
     \item 内存中使用 \texttt{networkx.DiGraph} 存储拓扑。
@@ -76,6 +103,39 @@
       \end{itemize}
     \item JSON 导入/导出保证实验可复现、可共享。
   \end{itemize}
+\end{frame}
+
+\begin{frame}{考虑队列的执行过程}
+  \centering
+  \begin{tikzpicture}[
+      x=0.075cm, y=0.9cm,
+      axis/.style={-{Latex[length=2mm]}, thick},
+      opdev/.style={draw=blue!70!black, fill=blue!65, text=white, rounded corners=2pt, minimum height=0.45cm, font=\scriptsize},
+      ophost/.style={draw=green!60!black, fill=green!65, text=white, rounded corners=2pt, minimum height=0.45cm, font=\scriptsize},
+      transfer/.style={draw=orange!80!black, fill=orange!55, rounded corners=2pt, minimum height=0.35cm, font=\scriptsize},
+      wait/.style={draw=gray!55, fill=gray!15, rounded corners=1pt, minimum height=0.28cm, font=\scriptsize}
+    ]
+    \draw[axis] (0,0) -- (130,0) node[right] {\scriptsize 时间};
+    \foreach \x/\t in {0/0,30/30,60/60,90/90,120/120}
+      \draw (\x,0.08) -- (\x,-0.08) node[below] {\scriptsize \t ms};
+
+    \node[left] at (0,2.3) {\small 边侧};
+    \node[left] at (0,1.2) {\small 网络};
+    \node[left] at (0,0.35) {\small 端侧};
+
+    \node[opdev, minimum width=18*0.075cm] at (9,0.35) {$v_1$};
+    \node[transfer, minimum width=34*0.075cm] at (35,1.2) {$L+s/B$};
+    \node[wait, minimum width=24*0.075cm] at (36,2.3) {排队等待};
+    \node[ophost, minimum width=20*0.075cm] at (70,2.3) {$v_2$};
+    \node[opdev, minimum width=28*0.075cm] at (104,0.35) {$v_3$};
+
+    \draw[dashed, -{Latex[length=2mm]}] (18,0.6) -- (18,1.0);
+    \draw[dashed, -{Latex[length=2mm]}] (52,1.4) -- (52,2.05);
+    \draw[dashed, -{Latex[length=2mm]}] (80,2.05) -- (90,0.58);
+  \end{tikzpicture}
+  \vspace{0.8em}
+
+  节点必须同时满足“数据已就绪”和“目标设备队列空闲”两个条件才能开始执行。
 \end{frame}
 
 \begin{frame}{内层解析器：数据依赖与资源排队}
@@ -102,6 +162,38 @@
     F_i = S_i + (1-x_i)c_i^{dev} + x_i c_i^{host}
   \]
   端到端闭环时延为 $\tau=\max_i F_i$。
+\end{frame}
+
+\begin{frame}{网络批处理示意}
+  \centering
+  \begin{tikzpicture}[
+      x=0.07cm, y=0.95cm,
+      axis/.style={-{Latex[length=2mm]}, thick},
+      edgebar/.style={draw=orange!80!black, fill=orange!45, rounded corners=2pt, minimum height=0.38cm, font=\scriptsize},
+      batchbar/.style={draw=red!65!black, fill=red!35, rounded corners=2pt, minimum height=0.38cm, font=\scriptsize},
+      label/.style={font=\small}
+    ]
+    \draw[axis] (0,0) -- (145,0) node[right] {\scriptsize 时间};
+    \foreach \x/\t in {0/0,30/30,60/60,90/90,120/120}
+      \draw (\x,0.08) -- (\x,-0.08) node[below] {\scriptsize \t};
+
+    \node[label, left] at (0,2.1) {未批处理};
+    \node[edgebar, minimum width=36*0.07cm] at (18,2.1) {$L+s_1/B$};
+    \node[edgebar, minimum width=36*0.07cm] at (54,2.1) {$L+s_2/B$};
+    \node[edgebar, minimum width=36*0.07cm] at (90,2.1) {$L+s_3/B$};
+    \draw[decorate, decoration={brace, amplitude=3pt}] (0,2.55) -- (108,2.55)
+      node[midway, above=3pt, font=\scriptsize] {三次固定时延};
+
+    \node[label, left] at (0,0.95) {批处理};
+    \node[batchbar, minimum width=78*0.07cm] at (39,0.95) {$L+(s_1+s_2+s_3)/B$};
+    \draw[decorate, decoration={brace, amplitude=3pt}] (0,1.4) -- (78,1.4)
+      node[midway, above=3pt, font=\scriptsize] {一次固定时延，数据量求和};
+
+    \node[font=\scriptsize, align=center] at (119,1.45) {同一源节点\\多条跨设备出边};
+  \end{tikzpicture}
+  \vspace{0.8em}
+
+  批处理减少重复固定时延，但不会让网络传输发生重叠。
 \end{frame}
 
 \begin{frame}{网络模型：串行传输与批处理}
@@ -198,6 +290,42 @@
       \end{itemize}
     \end{column}
   \end{columns}
+\end{frame}
+
+\begin{frame}{拓扑图与时序图读法}
+  \centering
+  \begin{tikzpicture}[
+      node/.style={circle, draw=black, minimum size=0.82cm, font=\bfseries\scriptsize},
+      arrow/.style={-{Latex[length=2.4mm]}, thick},
+      lane/.style={draw=gray!35},
+      op/.style={rounded corners=2pt, minimum height=0.32cm, font=\scriptsize},
+      x=1cm, y=1cm
+    ]
+    \node[node, fill=blue!65, text=white] (a) at (0,2.9) {v1};
+    \node[node, fill=green!65, text=white] (b) at (1.8,3.35) {v2};
+    \node[node, fill=green!65, text=white] (c) at (1.8,2.45) {v3};
+    \node[node, fill=blue!65, text=white, line width=1.2pt] (d) at (3.6,2.9) {v4};
+    \draw[arrow, red, dashed] (a) -- node[above, font=\tiny] {2 MB} (b);
+    \draw[arrow, red, dashed] (a) -- node[below, font=\tiny] {1 MB} (c);
+    \draw[arrow, gray] (b) -- (d);
+    \draw[arrow, red, dashed] (c) -- (d);
+    \node[font=\scriptsize] at (1.8,1.75) {拓扑图：颜色表示放置位置，边样式表示通信关系};
+
+    \begin{scope}[shift={(5.2,2.0)}, x=0.045cm, y=0.7cm]
+      \draw[lane] (0,2.0) -- (135,2.0);
+      \draw[lane] (0,1.1) -- (135,1.1);
+      \draw[lane] (0,0.2) -- (135,0.2);
+      \node[left, font=\scriptsize] at (0,2.0) {Host};
+      \node[left, font=\scriptsize] at (0,1.1) {Net};
+      \node[left, font=\scriptsize] at (0,0.2) {Dev};
+      \node[op, fill=blue!65, text=white, minimum width=22*0.045cm] at (11,0.2) {v1};
+      \node[op, fill=orange!55, minimum width=52*0.045cm] at (48,1.1) {batch};
+      \node[op, fill=green!65, text=white, minimum width=22*0.045cm] at (85,2.0) {v2};
+      \node[op, fill=green!65, text=white, minimum width=18*0.045cm] at (105,2.0) {v3};
+      \node[op, fill=blue!65, text=white, minimum width=24*0.045cm] at (122,0.2) {v4};
+    \end{scope}
+    \node[font=\scriptsize] at (8.2,1.05) {时序图：条形位置来自解析器计算出的开始/完成时间};
+  \end{tikzpicture}
 \end{frame}
 
 \begin{frame}{示例 DAG}
