@@ -123,6 +123,13 @@ class MainWindow(QMainWindow):
         self.latency_spin.setSuffix(" ms")
         self.latency_spin.setValue(5.0)
 
+        self.latency_limit_spin = QDoubleSpinBox()
+        self.latency_limit_spin.setRange(0.0, 1_000_000.0)
+        self.latency_limit_spin.setDecimals(3)
+        self.latency_limit_spin.setSuffix(" ms")
+        self.latency_limit_spin.setSpecialValueText("No limit")
+        self.latency_limit_spin.setValue(0.0)
+
         self.weight_slider = QSlider(Qt.Orientation.Horizontal)
         self.weight_slider.setRange(0, 100)
         self.weight_slider.setValue(70)
@@ -142,16 +149,18 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.bandwidth_spin, 0, 1)
         layout.addWidget(QLabel("Latency"), 1, 0)
         layout.addWidget(self.latency_spin, 1, 1)
-        layout.addWidget(QLabel("Weight w"), 2, 0)
-        layout.addWidget(self.weight_slider, 2, 1)
-        layout.addWidget(self.weight_label, 2, 2)
+        layout.addWidget(QLabel("E2E Limit"), 2, 0)
+        layout.addWidget(self.latency_limit_spin, 2, 1)
+        layout.addWidget(QLabel("Weight w"), 3, 0)
+        layout.addWidget(self.weight_slider, 3, 1)
+        layout.addWidget(self.weight_label, 3, 2)
         weight_hint = QLabel("0 = prefer device utilization, 1 = prefer low latency")
         weight_hint.setStyleSheet("color: #6b7280;")
-        layout.addWidget(weight_hint, 3, 1, 1, 2)
-        layout.addWidget(QLabel("Solver"), 4, 0)
-        layout.addWidget(self.algorithm_combo, 4, 1, 1, 2)
-        layout.addWidget(QLabel("Iterations"), 5, 0)
-        layout.addWidget(self.iterations_spin, 5, 1, 1, 2)
+        layout.addWidget(weight_hint, 4, 1, 1, 2)
+        layout.addWidget(QLabel("Solver"), 5, 0)
+        layout.addWidget(self.algorithm_combo, 5, 1, 1, 2)
+        layout.addWidget(QLabel("Iterations"), 6, 0)
+        layout.addWidget(self.iterations_spin, 6, 1, 1, 2)
         return group
 
     def _build_actions(self) -> QHBoxLayout:
@@ -253,6 +262,7 @@ class MainWindow(QMainWindow):
 
             self.bandwidth_spin.setValue(environment.bandwidth)
             self.latency_spin.setValue(environment.latency)
+            self.latency_limit_spin.setValue(environment.latency_limit)
             self.weight_slider.setValue(round(environment.weight_latency * 100))
         finally:
             self._loading_tables = False
@@ -362,6 +372,7 @@ class MainWindow(QMainWindow):
                 weight_latency=environment.weight_latency,
                 algorithm=self.algorithm_combo.currentText(),
                 heuristic_iterations=self.iterations_spin.value(),
+                latency_limit=environment.latency_limit,
             )
         except Exception as exc:
             QMessageBox.warning(self, "Solve failed", str(exc))
@@ -440,6 +451,7 @@ class MainWindow(QMainWindow):
             bandwidth=self.bandwidth_spin.value(),
             latency=self.latency_spin.value(),
             weight_latency=self.weight_slider.value() / 100.0,
+            latency_limit=self.latency_limit_spin.value(),
         )
 
     def _cell_text(self, table: QTableWidget, row: int, column: int) -> str:

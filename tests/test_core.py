@@ -88,6 +88,30 @@ def test_solver_keeps_fixed_nodes_on_device():
     assert set(result.assignment) == {"v1", "v2"}
 
 
+def test_solver_rejects_assignments_above_latency_limit():
+    graph = sample_graph()
+    result = solve(
+        graph,
+        bandwidth=50.0,
+        latency=5.0,
+        weight_latency=1.0,
+        latency_limit=35.0,
+    )
+
+    assert result.metrics.latency <= 35.0
+    assert result.assignment["v2"] == 0
+
+
+def test_solver_raises_when_no_assignment_satisfies_latency_limit():
+    graph = sample_graph()
+    try:
+        solve(graph, bandwidth=50.0, latency=5.0, weight_latency=1.0, latency_limit=20.0)
+    except ValueError as exc:
+        assert "No feasible assignment" in str(exc)
+    else:
+        raise AssertionError("Expected solve to reject all over-limit assignments")
+
+
 def test_solver_supports_explicit_random_and_annealing_modes():
     graph = sample_graph()
     random_result = solve(
@@ -116,16 +140,17 @@ def test_solver_supports_explicit_random_and_annealing_modes():
 def test_json_round_trip(tmp_path):
     graph = sample_graph()
     path = tmp_path / "config.json"
-    save_to_json(ProjectState(graph, Environment(50.0, 5.0, 0.7)), path)
+    save_to_json(ProjectState(graph, Environment(50.0, 5.0, 0.7, 120.0)), path)
 
     loaded = load_from_json(path)
-    assert loaded.environment == Environment(50.0, 5.0, 0.7)
+    assert loaded.environment == Environment(50.0, 5.0, 0.7, 120.0)
     assert set(loaded.graph.nodes) == {"v1", "v2"}
     assert loaded.graph.nodes["v1"]["name"] == "Input"
     assert loaded.graph.edges["v1", "v2"]["size"] == 1.0
 
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["version"] == "1.0"
+    assert data["environment"]["latency_limit"] == 120.0
 
 
 def test_graph_from_records_can_be_checked_for_cycles():

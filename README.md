@@ -18,6 +18,7 @@ The application stores graph topology, node/edge costs, environment parameters, 
 - The evaluator walks the DAG in topological order and enforces one execution queue per device through `time_dev_ready` and `time_host_ready`.
 - Cross-device edges pay `latency_ms + size_mb / bandwidth_mb_s * 1000`.
 - The solver can run Auto, Enumerate, Random Search, or Simulated Annealing. Auto uses enumeration for up to 12 free nodes and random search beyond that.
+- `latency_limit` is an optional E2E latency cap in milliseconds. Use `0` to disable it; assignments above a positive limit are rejected.
 
 ## Example
 

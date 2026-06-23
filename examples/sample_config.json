@@ -67,6 +67,7 @@
   "environment": {
     "bandwidth": 50.0,
     "latency": 5.0,
-    "weight_latency": 0.7
+    "weight_latency": 0.7,
+    "latency_limit": 120.0
   }
 }
