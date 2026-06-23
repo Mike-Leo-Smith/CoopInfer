@@ -1,0 +1,232 @@
+\documentclass[aspectratio=169]{beamer}
+
+\usetheme{Madrid}
+\usecolortheme{default}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning}
+
+\title[CoopInfer]{CoopInfer: Host--Device Cooperative Inference Scheduling}
+\subtitle{A strategy-driven prototype for DAG partitioning and schedule visualization}
+\author{CoopInfer Project}
+\date{\today}
+
+\newcommand{\device}{\textsc{Device}}
+\newcommand{\host}{\textsc{Host}}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+\begin{frame}{Motivation}
+  \begin{itemize}
+    \item Embodied AI pipelines often run as DAGs of perception, fusion, and control operators.
+    \item Some operators must stay on the robot-side device, while others may run on an edge host.
+    \item The scheduling problem is not only graph partitioning:
+      \begin{itemize}
+        \item cross-device edges incur network transfer cost;
+        \item each side has a finite execution queue;
+        \item end-to-end latency constraints can make otherwise low-loss solutions infeasible.
+      \end{itemize}
+    \item CoopInfer is a desktop prototype for editing, solving, and visualizing these schedules.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{System Overview}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.48\textwidth}
+      \textbf{Inputs}
+      \begin{itemize}
+        \item DAG nodes with device/host compute costs.
+        \item Edges with transfer sizes.
+        \item Bandwidth, latency, objective weight.
+        \item Optional E2E latency limit.
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \textbf{Outputs}
+      \begin{itemize}
+        \item Node placement: $x_i=0$ for \device, $x_i=1$ for \host.
+        \item End-to-end latency and device utilization.
+        \item SVG topology and profiler-style schedule timeline.
+      \end{itemize}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+\begin{frame}{Data Model}
+  \begin{itemize}
+    \item In memory, topology is stored in a \texttt{networkx.DiGraph}.
+    \item Node attributes:
+      \begin{itemize}
+        \item \texttt{id}, \texttt{name}, \texttt{c\_dev}, \texttt{c\_host}, \texttt{fixed\_dev}, \texttt{x}.
+      \end{itemize}
+    \item Edge attributes:
+      \begin{itemize}
+        \item \texttt{source}, \texttt{target}, \texttt{size} in MB.
+      \end{itemize}
+    \item Environment fields:
+      \begin{itemize}
+        \item \texttt{bandwidth}, \texttt{latency}, \texttt{weight\_latency}, \texttt{latency\_limit}.
+      \end{itemize}
+    \item JSON load/save keeps experiments reproducible and shareable.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Evaluator: Data Dependency + Resource Queues}
+  For each node $i$ in topological order:
+  \[
+    DataReady_i =
+    \max_{j \in pred(i)}
+    \left(
+      F_j +
+      \mathbb{I}(x_j \neq x_i)
+      \left(L + \frac{s_{ji}}{B}\right)
+    \right)
+  \]
+  \vspace{0.5em}
+  The evaluator then waits for the selected worker queue:
+  \[
+    S_i =
+    \begin{cases}
+      \max(DataReady_i, time\_dev\_ready), & x_i=0 \\
+      \max(DataReady_i, time\_host\_ready), & x_i=1
+    \end{cases}
+  \]
+  \[
+    F_i = S_i + (1-x_i)c_i^{dev} + x_i c_i^{host}
+  \]
+  The E2E latency is $\tau=\max_i F_i$.
+\end{frame}
+
+\begin{frame}{Objective and Feasibility}
+  The solver minimizes a weighted objective:
+  \[
+    J =
+    w \cdot
+    \frac{\tau-\tau_{min}}{\tau_{max}-\tau_{min}}
+    +
+    (1-w)
+    \left(
+      1-\frac{\sum_i(1-x_i)c_i^{dev}}{\sum_i c_i^{dev}}
+    \right)
+  \]
+  \vspace{0.5em}
+  \begin{block}{Latency limit}
+    A positive \texttt{latency\_limit} acts as a hard feasibility constraint:
+    \[
+      \tau \leq latency\_limit
+    \]
+    Candidates above the limit are rejected before objective comparison.
+  \end{block}
+\end{frame}
+
+\begin{frame}{Solver Modes}
+  \begin{table}
+    \centering
+    \small
+    \begin{tabular}{p{0.2\textwidth}p{0.23\textwidth}p{0.46\textwidth}}
+      \toprule
+      Mode & Use case & Behavior \\
+      \midrule
+      Auto & Default & Enumerates if $\leq 12$ free nodes; otherwise random search \\
+      Enumerate & Small DAGs & Tests every assignment and returns the feasible global best \\
+      Random Search & Larger DAGs & Perturbs placements and keeps the best feasible candidate \\
+      Simulated Annealing & Escaping local minima & Accepts some worse moves according to temperature \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+  \vspace{0.5em}
+  All modes enforce fixed-device nodes and the E2E latency cap.
+\end{frame}
+
+\begin{frame}{GUI Workflow}
+  \begin{enumerate}
+    \item Edit nodes, names, compute costs, fixed-device flags.
+    \item Edit edges and transfer sizes in MB.
+    \item Configure bandwidth, latency, objective weight, solver mode, iterations, and E2E cap.
+    \item Click \textbf{Solve}.
+    \item Inspect metrics, topology placement, and profiler-style timeline.
+  \end{enumerate}
+  \vspace{0.5em}
+  Validation catches duplicate node IDs, unknown edge endpoints, and non-DAG topologies.
+\end{frame}
+
+\begin{frame}{Visualization Design}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.5\textwidth}
+      \textbf{Topology SVG}
+      \begin{itemize}
+        \item Blue: \device.
+        \item Green: \host.
+        \item Bold node border: fixed on \device.
+        \item Red dashed edge: cross-device transfer.
+        \item Gray solid edge: local dependency.
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.5\textwidth}
+      \textbf{Timeline SVG}
+      \begin{itemize}
+        \item Host, Transfer, Device lanes.
+        \item Operator bars use computed start/finish times.
+        \item Transfer bars use network transfer duration.
+        \item Browser-native scroll and scale controls.
+      \end{itemize}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+\begin{frame}{Example DAG}
+  \centering
+  \begin{tikzpicture}[
+      node/.style={circle, draw=black, minimum size=1cm, font=\bfseries},
+      edge/.style={-{Latex[length=3mm]}, thick},
+      local/.style={edge, draw=gray},
+      remote/.style={edge, draw=red, dashed}
+    ]
+    \node[node, fill=blue!65, text=white] (v1) {v1};
+    \node[node, fill=green!65, text=white, right=2.8cm of v1] (v2) {v2};
+    \node[node, fill=blue!65, text=white, right=2.8cm of v2] (v3) {v3};
+    \draw[remote] (v1) -- node[above, font=\scriptsize] {2 MB} (v2);
+    \draw[remote] (v2) -- node[above, font=\scriptsize] {1 MB} (v3);
+    \node[below=0.3cm of v1] {\device};
+    \node[below=0.3cm of v2] {\host};
+    \node[below=0.3cm of v3] {\device};
+  \end{tikzpicture}
+  \vspace{1em}
+
+  The evaluator produces a queue-aware schedule rather than an ideal infinite-parallel critical path.
+\end{frame}
+
+\begin{frame}{Current Implementation Stack}
+  \begin{itemize}
+    \item Python 3.9+.
+    \item PyQt6 for desktop controls and layout.
+    \item PyQt6-WebEngine for SVG topology and timeline rendering.
+    \item NetworkX for DAG storage, topological sort, and validation.
+    \item Pytest coverage for evaluator, JSON IO, solver modes, and latency-limit feasibility.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Next Steps}
+  \begin{itemize}
+    \item Add richer solver diagnostics: rejected candidates, constraint slack, convergence history.
+    \item Add exportable SVG/PNG reports for topology and timeline.
+    \item Add batch evaluation over bandwidth/latency sweeps.
+    \item Consider more advanced schedulers for larger DAGs.
+    \item Improve timeline semantics with explicit queue-wait and data-ready intervals.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}
+  \centering
+  \Huge Questions?
+\end{frame}
+
+\end{document}

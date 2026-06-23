@@ -1,0 +1,229 @@
+\documentclass[aspectratio=169]{ctexbeamer}
+
+\usetheme{Madrid}
+\usecolortheme{default}
+
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning}
+
+\title[CoopInfer]{CoopInfer：边端协同推理调度原型}
+\subtitle{面向 DAG 切分、约束求解与时序可视化的桌面验证工具}
+\author{CoopInfer 项目}
+\date{\today}
+
+\newcommand{\device}{\textsc{Device}}
+\newcommand{\host}{\textsc{Host}}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+\begin{frame}{项目动机}
+  \begin{itemize}
+    \item 具身智能系统常由感知、融合、控制等算子组成，并形成 DAG。
+    \item 部分算子必须固定在机器人端侧设备，部分算子可以卸载到边侧主机。
+    \item 真实调度不仅是图切分：
+      \begin{itemize}
+        \item 跨设备边会产生网络传输代价；
+        \item 端侧和边侧都有有限执行队列；
+        \item 端到端时延上限会直接排除不可行方案。
+      \end{itemize}
+    \item CoopInfer 用于快速编辑、求解、验证并可视化这类调度方案。
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{系统概览}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.48\textwidth}
+      \textbf{输入}
+      \begin{itemize}
+        \item DAG 节点及端侧/边侧执行耗时。
+        \item 边数据量。
+        \item 带宽、固定时延、优化权重。
+        \item 可选端到端时延上限。
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \textbf{输出}
+      \begin{itemize}
+        \item 节点放置决策：$x_i=0$ 表示端侧，$x_i=1$ 表示边侧。
+        \item 端到端时延和端侧算力利用率。
+        \item SVG 拓扑图和 profiler 风格时序图。
+      \end{itemize}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+\begin{frame}{数据模型}
+  \begin{itemize}
+    \item 内存中使用 \texttt{networkx.DiGraph} 存储拓扑。
+    \item 节点属性：
+      \begin{itemize}
+        \item \texttt{id}, \texttt{name}, \texttt{c\_dev}, \texttt{c\_host}, \texttt{fixed\_dev}, \texttt{x}
+      \end{itemize}
+    \item 边属性：
+      \begin{itemize}
+        \item \texttt{source}, \texttt{target}, \texttt{size}，单位为 MB。
+      \end{itemize}
+    \item 环境参数：
+      \begin{itemize}
+        \item \texttt{bandwidth}, \texttt{latency}, \texttt{weight\_latency}, \texttt{latency\_limit}
+      \end{itemize}
+    \item JSON 导入/导出保证实验可复现、可共享。
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{内层解析器：数据依赖与资源排队}
+  对 DAG 按拓扑序遍历。对节点 $i$：
+  \[
+    DataReady_i =
+    \max_{j \in pred(i)}
+    \left(
+      F_j +
+      \mathbb{I}(x_j \neq x_i)
+      \left(L + \frac{s_{ji}}{B}\right)
+    \right)
+  \]
+  \vspace{0.5em}
+  数据就绪后，还要等待目标设备队列空闲：
+  \[
+    S_i =
+    \begin{cases}
+      \max(DataReady_i, time\_dev\_ready), & x_i=0 \\
+      \max(DataReady_i, time\_host\_ready), & x_i=1
+    \end{cases}
+  \]
+  \[
+    F_i = S_i + (1-x_i)c_i^{dev} + x_i c_i^{host}
+  \]
+  端到端闭环时延为 $\tau=\max_i F_i$。
+\end{frame}
+
+\begin{frame}{优化目标与可行性约束}
+  求解器最小化加权目标：
+  \[
+    J =
+    w \cdot
+    \frac{\tau-\tau_{min}}{\tau_{max}-\tau_{min}}
+    +
+    (1-w)
+    \left(
+      1-\frac{\sum_i(1-x_i)c_i^{dev}}{\sum_i c_i^{dev}}
+    \right)
+  \]
+  \vspace{0.5em}
+  \begin{block}{端到端时延上限}
+    正数 \texttt{latency\_limit} 是硬约束：
+    \[
+      \tau \leq latency\_limit
+    \]
+    超过上限的候选方案会在目标函数比较前被直接拒绝。
+  \end{block}
+\end{frame}
+
+\begin{frame}{求解模式}
+  \begin{table}
+    \centering
+    \small
+    \begin{tabular}{p{0.2\textwidth}p{0.23\textwidth}p{0.46\textwidth}}
+      \toprule
+      模式 & 适用场景 & 行为 \\
+      \midrule
+      Auto & 默认模式 & 自由节点 $\leq 12$ 时枚举，否则随机搜索 \\
+      Enumerate & 小规模 DAG & 遍历所有方案，返回全局最优可行解 \\
+      Random Search & 较大 DAG & 随机扰动放置方案，保留最佳可行候选 \\
+      Simulated Annealing & 跳出局部最优 & 按温度接受部分更差移动 \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+  \vspace{0.5em}
+  所有模式都会强制固定端侧节点，并执行端到端时延上限过滤。
+\end{frame}
+
+\begin{frame}{GUI 使用流程}
+  \begin{enumerate}
+    \item 编辑节点、名称、计算耗时和固定端侧标记。
+    \item 编辑边和传输数据量。
+    \item 配置带宽、固定时延、优化权重、求解模式、迭代次数和端到端时延上限。
+    \item 点击 \textbf{Solve}。
+    \item 查看性能看板、拓扑放置和 profiler 风格时序图。
+  \end{enumerate}
+  \vspace{0.5em}
+  系统会校验重名节点、非法边端点以及非 DAG 拓扑。
+\end{frame}
+
+\begin{frame}{可视化设计}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.5\textwidth}
+      \textbf{拓扑 SVG}
+      \begin{itemize}
+        \item 蓝色：端侧。
+        \item 绿色：边侧。
+        \item 加粗边框：固定端侧节点。
+        \item 红色虚线边：跨设备传输。
+        \item 灰色实线边：同侧依赖。
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.5\textwidth}
+      \textbf{时序 SVG}
+      \begin{itemize}
+        \item Host、Transfer、Device 三条泳道。
+        \item 算子条由开始/完成时间决定。
+        \item 传输条由网络传输耗时决定。
+        \item 使用浏览器原生滚动和缩放控件。
+      \end{itemize}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+\begin{frame}{示例 DAG}
+  \centering
+  \begin{tikzpicture}[
+      node/.style={circle, draw=black, minimum size=1cm, font=\bfseries},
+      edge/.style={-{Latex[length=3mm]}, thick},
+      remote/.style={edge, draw=red, dashed}
+    ]
+    \node[node, fill=blue!65, text=white] (v1) {v1};
+    \node[node, fill=green!65, text=white, right=2.8cm of v1] (v2) {v2};
+    \node[node, fill=blue!65, text=white, right=2.8cm of v2] (v3) {v3};
+    \draw[remote] (v1) -- node[above, font=\scriptsize] {2 MB} (v2);
+    \draw[remote] (v2) -- node[above, font=\scriptsize] {1 MB} (v3);
+    \node[below=0.3cm of v1] {端侧};
+    \node[below=0.3cm of v2] {边侧};
+    \node[below=0.3cm of v3] {端侧};
+  \end{tikzpicture}
+  \vspace{1em}
+
+  解析器输出的是考虑设备队列的真实调度，而不是理想无限并行关键路径。
+\end{frame}
+
+\begin{frame}{当前技术栈}
+  \begin{itemize}
+    \item Python 3.9+。
+    \item PyQt6 负责桌面控件和布局。
+    \item PyQt6-WebEngine 负责 SVG 拓扑图和时序图渲染。
+    \item NetworkX 负责 DAG 存储、拓扑排序和环路检测。
+    \item Pytest 覆盖解析器、JSON IO、求解模式和时延上限可行性。
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{后续方向}
+  \begin{itemize}
+    \item 增加求解诊断：被拒绝候选、约束裕量、收敛历史。
+    \item 支持拓扑图和时序图导出为 SVG/PNG 报告。
+    \item 增加带宽/时延参数扫描的批量评估。
+    \item 为大规模 DAG 引入更高级的调度算法。
+    \item 在时序图中显式区分队列等待、数据就绪和传输阶段。
+  \end{itemize}
+\end{frame}
+
+\begin{frame}
+  \centering
+  \Huge Q\&A
+\end{frame}
+
+\end{document}
