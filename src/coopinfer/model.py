@@ -17,6 +17,7 @@ class Environment:
     latency: float = 5.0
     weight_latency: float = 0.7
     latency_limit: float = 0.0
+    batch_transfers: bool = False
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,7 @@ def load_from_json(path: Union[str, Path]) -> ProjectState:
         latency=float(environment_data.get("latency", 5.0)),
         weight_latency=float(environment_data.get("weight_latency", 0.7)),
         latency_limit=float(environment_data.get("latency_limit", 0.0)),
+        batch_transfers=bool(environment_data.get("batch_transfers", False)),
     )
     graph = graph_from_records(data.get("nodes", []), data.get("edges", []))
     return ProjectState(graph=graph, environment=environment)
@@ -104,6 +106,7 @@ def save_to_json(state: ProjectState, path: Union[str, Path]) -> None:
             "latency": float(state.environment.latency),
             "weight_latency": float(state.environment.weight_latency),
             "latency_limit": float(state.environment.latency_limit),
+            "batch_transfers": bool(state.environment.batch_transfers),
         },
     }
     with Path(path).open("w", encoding="utf-8") as file:

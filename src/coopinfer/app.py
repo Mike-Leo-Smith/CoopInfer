@@ -9,6 +9,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -144,6 +145,7 @@ class MainWindow(QMainWindow):
         self.iterations_spin = QSpinBox()
         self.iterations_spin.setRange(1, 1_000_000)
         self.iterations_spin.setValue(3000)
+        self.batch_transfers_check = QCheckBox("Batch successive outgoing transfers")
 
         layout.addWidget(QLabel("Bandwidth"), 0, 0)
         layout.addWidget(self.bandwidth_spin, 0, 1)
@@ -157,10 +159,12 @@ class MainWindow(QMainWindow):
         weight_hint = QLabel("0 = prefer device utilization, 1 = prefer low latency")
         weight_hint.setStyleSheet("color: #6b7280;")
         layout.addWidget(weight_hint, 4, 1, 1, 2)
-        layout.addWidget(QLabel("Solver"), 5, 0)
-        layout.addWidget(self.algorithm_combo, 5, 1, 1, 2)
-        layout.addWidget(QLabel("Iterations"), 6, 0)
-        layout.addWidget(self.iterations_spin, 6, 1, 1, 2)
+        layout.addWidget(QLabel("Network"), 5, 0)
+        layout.addWidget(self.batch_transfers_check, 5, 1, 1, 2)
+        layout.addWidget(QLabel("Solver"), 6, 0)
+        layout.addWidget(self.algorithm_combo, 6, 1, 1, 2)
+        layout.addWidget(QLabel("Iterations"), 7, 0)
+        layout.addWidget(self.iterations_spin, 7, 1, 1, 2)
         return group
 
     def _build_actions(self) -> QHBoxLayout:
@@ -264,6 +268,7 @@ class MainWindow(QMainWindow):
             self.latency_spin.setValue(environment.latency)
             self.latency_limit_spin.setValue(environment.latency_limit)
             self.weight_slider.setValue(round(environment.weight_latency * 100))
+            self.batch_transfers_check.setChecked(environment.batch_transfers)
         finally:
             self._loading_tables = False
 
@@ -373,6 +378,7 @@ class MainWindow(QMainWindow):
                 algorithm=self.algorithm_combo.currentText(),
                 heuristic_iterations=self.iterations_spin.value(),
                 latency_limit=environment.latency_limit,
+                batch_transfers=environment.batch_transfers,
             )
         except Exception as exc:
             QMessageBox.warning(self, "Solve failed", str(exc))
@@ -452,6 +458,7 @@ class MainWindow(QMainWindow):
             latency=self.latency_spin.value(),
             weight_latency=self.weight_slider.value() / 100.0,
             latency_limit=self.latency_limit_spin.value(),
+            batch_transfers=self.batch_transfers_check.isChecked(),
         )
 
     def _cell_text(self, table: QTableWidget, row: int, column: int) -> str:
@@ -664,33 +671,43 @@ class MainWindow(QMainWindow):
                 f'{start:.1f}-{finish:.1f} ms</text></g>'
             )
 
-        transfer_index = 0
-        for source, target, attrs in self.graph.edges(data=True):
-            if source not in metrics.finish_times or target not in metrics.start_times:
-                continue
-            if int(assignment[source]) == int(assignment[target]):
-                continue
-            start = metrics.finish_times[source]
-            transfer_ms = edge_transfer_ms(
-                float(attrs.get("size", 0.0)), environment.bandwidth, environment.latency
-            )
-            finish = start + transfer_ms
+        for transfer_index, transfer in enumerate(metrics.transfer_records):
+            start = transfer.start
+            finish = transfer.finish
+            transfer_ms = finish - start
             y_center = lane_y["transfer"] + ((transfer_index % 3) - 1) * 12
-            transfer_index += 1
             x_pos = x_at(start)
             bar_width = max(6.0, transfer_ms * px_per_ms)
-            source_y = lane_y[int(assignment[source])]
-            target_y = lane_y[int(assignment[target])]
             end_x = x_at(finish)
+            if transfer.batched:
+                edge_text = ", ".join(f"{source}->{target}" for source, target in transfer.edges)
+                title = (
+                    f"Batch: {edge_text}; {transfer.size_mb:g} MB, "
+                    f"{transfer_ms:.1f} ms"
+                )
+                label = f"batch {len(transfer.edges)} edges / {transfer.size_mb:g} MB"
+            else:
+                source, target = transfer.edges[0]
+                title = (
+                    f"{source} -> {target}: {transfer.size_mb:g} MB, "
+                    f"{transfer_ms:.1f} ms"
+                )
+                label = f"{source}->{target} {transfer.size_mb:g} MB"
             rows.append(
-                f'<g><title>{esc(source)} → {esc(target)}: {float(attrs.get("size", 0.0)):g} MB, '
-                f'{transfer_ms:.1f} ms</title>'
-                f'<line class="dep" data-ms="{start:.6f}" x1="{x_pos:.1f}" y1="{source_y:.1f}" x2="{x_pos:.1f}" y2="{y_center:.1f}" />'
+                f'<g><title>{esc(title)}</title>'
                 f'<rect class="transfer" data-start="{start:.6f}" data-duration="{transfer_ms:.6f}" x="{x_pos:.1f}" y="{y_center - 10:.1f}" width="{bar_width:.1f}" '
                 f'height="20" rx="3" />'
                 f'<text class="transfer-label" data-start="{start:.6f}" data-duration="{transfer_ms:.6f}" data-anchor="center" x="{x_pos + bar_width / 2:.1f}" y="{y_center + 4:.1f}">'
-                f'{esc(source)}→{esc(target)} {float(attrs.get("size", 0.0)):g} MB</text>'
-                f'<line class="dep" data-ms="{finish:.6f}" x1="{end_x:.1f}" y1="{y_center:.1f}" x2="{end_x:.1f}" y2="{target_y:.1f}" />'
+                f'{esc(label)}</text>'
+            )
+            for source, target in transfer.edges:
+                source_y = lane_y[int(assignment[source])]
+                target_y = lane_y[int(assignment[target])]
+                rows.append(
+                    f'<line class="dep" data-ms="{start:.6f}" x1="{x_pos:.1f}" y1="{source_y:.1f}" x2="{x_pos:.1f}" y2="{y_center:.1f}" />'
+                    f'<line class="dep" data-ms="{finish:.6f}" x1="{end_x:.1f}" y1="{y_center:.1f}" x2="{end_x:.1f}" y2="{target_y:.1f}" />'
+                )
+            rows.append(
                 f'</g>'
             )
 
@@ -700,7 +717,10 @@ class MainWindow(QMainWindow):
             svg,
             width,
             height,
-            extra_info=f"<span>Total: {total_ms:.1f} ms</span>",
+            extra_info=(
+                f"<span>Total: {total_ms:.1f} ms</span>"
+                f"<span>Network: {'batched' if environment.batch_transfers else 'serialized'}</span>"
+            ),
             scale_axis="timeline",
             timeline_left_pad=left_pad,
             timeline_px_per_ms=px_per_ms,

@@ -28,6 +28,7 @@ def solve(
     heuristic_iterations: int = 3000,
     seed: int = 7,
     latency_limit: float = 0.0,
+    batch_transfers: bool = False,
 ) -> SolverResult:
     free_nodes = [
         node for node, attrs in graph.nodes(data=True) if not attrs.get("fixed_dev", False)
@@ -36,13 +37,16 @@ def solve(
         node: 0 if attrs.get("fixed_dev", False) else int(attrs.get("x", 1))
         for node, attrs in graph.nodes(data=True)
     }
-    tau_min, tau_max = baseline_bounds(graph, bandwidth, latency)
+    tau_min, tau_max = baseline_bounds(
+        graph, bandwidth, latency, batch_transfers=batch_transfers
+    )
     algorithm_key = algorithm.strip().lower().replace(" ", "_").replace("-", "_")
     limit = float(latency_limit)
 
     if algorithm_key in {"auto", ""} and len(free_nodes) <= 12:
         return _brute_force(
-            graph, free_nodes, fixed_assignment, bandwidth, latency, weight_latency, tau_min, tau_max, limit
+            graph, free_nodes, fixed_assignment, bandwidth, latency, weight_latency,
+            tau_min, tau_max, limit, batch_transfers
         )
     if algorithm_key in {"auto", ""}:
         return _random_search(
@@ -57,11 +61,13 @@ def solve(
             heuristic_iterations,
             seed,
             limit,
+            batch_transfers,
             mode="Auto Random",
         )
     if algorithm_key in {"enumerate", "brute", "brute_force"}:
         return _brute_force(
-            graph, free_nodes, fixed_assignment, bandwidth, latency, weight_latency, tau_min, tau_max, limit
+            graph, free_nodes, fixed_assignment, bandwidth, latency, weight_latency,
+            tau_min, tau_max, limit, batch_transfers
         )
     if algorithm_key in {"random", "random_search", "random_n"}:
         return _random_search(
@@ -76,6 +82,7 @@ def solve(
             heuristic_iterations,
             seed,
             limit,
+            batch_transfers,
             mode="Random Search",
         )
     if algorithm_key in {"simulated_annealing", "annealing", "sim_anneal", "sim_aneal"}:
@@ -91,6 +98,7 @@ def solve(
             heuristic_iterations,
             seed,
             limit,
+            batch_transfers,
         )
     raise ValueError(f"Unknown solver algorithm: {algorithm}")
 
@@ -105,6 +113,7 @@ def _brute_force(
     tau_min: float,
     tau_max: float,
     latency_limit: float,
+    batch_transfers: bool,
 ) -> SolverResult:
     best_assignment: Optional[Dict[str, int]] = None
     best_metrics: Optional[EvaluationResult] = None
@@ -115,7 +124,8 @@ def _brute_force(
         assignment = dict(base_assignment)
         assignment.update(dict(zip(free_nodes, bits)))
         metrics = evaluate(
-            graph, assignment, bandwidth, latency, weight_latency, tau_min=tau_min, tau_max=tau_max
+            graph, assignment, bandwidth, latency, weight_latency,
+            tau_min=tau_min, tau_max=tau_max, batch_transfers=batch_transfers
         )
         if _exceeds_latency_limit(metrics, latency_limit):
             continue
@@ -146,12 +156,14 @@ def _random_search(
     iterations: int,
     seed: int,
     latency_limit: float,
+    batch_transfers: bool,
     mode: str,
 ) -> SolverResult:
     rng = random.Random(seed)
     best_assignment = _mostly_host_seed(free_nodes, base_assignment)
     best_metrics = evaluate(
-        graph, best_assignment, bandwidth, latency, weight_latency, tau_min=tau_min, tau_max=tau_max
+        graph, best_assignment, bandwidth, latency, weight_latency,
+        tau_min=tau_min, tau_max=tau_max, batch_transfers=batch_transfers
     )
     if _exceeds_latency_limit(best_metrics, latency_limit):
         best_assignment = None
@@ -167,7 +179,8 @@ def _random_search(
         for node in rng.sample(free_nodes, flips):
             assignment[node] = 1 - int(assignment[node])
         metrics = evaluate(
-            graph, assignment, bandwidth, latency, weight_latency, tau_min=tau_min, tau_max=tau_max
+            graph, assignment, bandwidth, latency, weight_latency,
+            tau_min=tau_min, tau_max=tau_max, batch_transfers=batch_transfers
         )
         if _exceeds_latency_limit(metrics, latency_limit):
             continue
@@ -198,11 +211,13 @@ def _simulated_annealing(
     iterations: int,
     seed: int,
     latency_limit: float,
+    batch_transfers: bool,
 ) -> SolverResult:
     rng = random.Random(seed)
     current = _mostly_host_seed(free_nodes, base_assignment)
     current_metrics = evaluate(
-        graph, current, bandwidth, latency, weight_latency, tau_min=tau_min, tau_max=tau_max
+        graph, current, bandwidth, latency, weight_latency,
+        tau_min=tau_min, tau_max=tau_max, batch_transfers=batch_transfers
     )
     best_assignment = dict(current)
     best_metrics = None if _exceeds_latency_limit(current_metrics, latency_limit) else current_metrics
@@ -229,7 +244,8 @@ def _simulated_annealing(
         node = rng.choice(free_nodes)
         candidate[node] = 1 - int(candidate[node])
         metrics = evaluate(
-            graph, candidate, bandwidth, latency, weight_latency, tau_min=tau_min, tau_max=tau_max
+            graph, candidate, bandwidth, latency, weight_latency,
+            tau_min=tau_min, tau_max=tau_max, batch_transfers=batch_transfers
         )
         if _exceeds_latency_limit(metrics, latency_limit):
             continue

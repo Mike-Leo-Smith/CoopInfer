@@ -71,6 +71,58 @@ def test_infer_latency_waits_for_host_queue_after_data_ready():
     assert latency == 55.0
 
 
+def test_infer_latency_serializes_cross_device_transfers():
+    graph = graph_from_records(
+        [
+            {"id": "source", "c_dev": 1.0, "c_host": 1.0, "fixed_dev": True},
+            {"id": "h1", "c_dev": 1.0, "c_host": 1.0, "fixed_dev": False},
+            {"id": "h2", "c_dev": 1.0, "c_host": 1.0, "fixed_dev": False},
+        ],
+        [
+            {"source": "source", "target": "h1", "size": 1.0},
+            {"source": "source", "target": "h2", "size": 1.0},
+        ],
+    )
+
+    latency, starts, finishes = infer_latency(
+        graph,
+        {"source": 0, "h1": 1, "h2": 1},
+        bandwidth=10.0,
+        latency=5.0,
+    )
+
+    assert finishes["source"] == 1.0
+    assert starts["h1"] == 106.0
+    assert starts["h2"] == 211.0
+    assert latency == 212.0
+
+
+def test_infer_latency_batches_successive_outgoing_transfers():
+    graph = graph_from_records(
+        [
+            {"id": "source", "c_dev": 1.0, "c_host": 1.0, "fixed_dev": True},
+            {"id": "h1", "c_dev": 1.0, "c_host": 1.0, "fixed_dev": False},
+            {"id": "h2", "c_dev": 1.0, "c_host": 1.0, "fixed_dev": False},
+        ],
+        [
+            {"source": "source", "target": "h1", "size": 1.0},
+            {"source": "source", "target": "h2", "size": 1.0},
+        ],
+    )
+
+    latency, starts, _ = infer_latency(
+        graph,
+        {"source": 0, "h1": 1, "h2": 1},
+        bandwidth=10.0,
+        latency=5.0,
+        batch_transfers=True,
+    )
+
+    assert starts["h1"] == 206.0
+    assert starts["h2"] == 207.0
+    assert latency == 208.0
+
+
 def test_evaluate_reports_device_utilization():
     graph = sample_graph()
     result = evaluate(graph, {"v1": 0, "v2": 1}, bandwidth=10.0, latency=5.0, weight_latency=0.7)
@@ -140,10 +192,10 @@ def test_solver_supports_explicit_random_and_annealing_modes():
 def test_json_round_trip(tmp_path):
     graph = sample_graph()
     path = tmp_path / "config.json"
-    save_to_json(ProjectState(graph, Environment(50.0, 5.0, 0.7, 120.0)), path)
+    save_to_json(ProjectState(graph, Environment(50.0, 5.0, 0.7, 120.0, True)), path)
 
     loaded = load_from_json(path)
-    assert loaded.environment == Environment(50.0, 5.0, 0.7, 120.0)
+    assert loaded.environment == Environment(50.0, 5.0, 0.7, 120.0, True)
     assert set(loaded.graph.nodes) == {"v1", "v2"}
     assert loaded.graph.nodes["v1"]["name"] == "Input"
     assert loaded.graph.edges["v1", "v2"]["size"] == 1.0
@@ -151,6 +203,7 @@ def test_json_round_trip(tmp_path):
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["version"] == "1.0"
     assert data["environment"]["latency_limit"] == 120.0
+    assert data["environment"]["batch_transfers"] is True
 
 
 def test_graph_from_records_can_be_checked_for_cycles():
