@@ -1,0 +1,375 @@
+{
+  "version": "1.0",
+  "nodes": [
+    {
+      "id": "camera_ingest",
+      "name": "Camera Ingest",
+      "c_dev": 6.0,
+      "c_host": 2.0,
+      "fixed_dev": true
+    },
+    {
+      "id": "lidar_ingest",
+      "name": "LiDAR Ingest",
+      "c_dev": 7.0,
+      "c_host": 2.5,
+      "fixed_dev": true
+    },
+    {
+      "id": "imu_ingest",
+      "name": "IMU Ingest",
+      "c_dev": 2.0,
+      "c_host": 1.0,
+      "fixed_dev": true
+    },
+    {
+      "id": "image_rectify",
+      "name": "Image Rectify",
+      "c_dev": 14.0,
+      "c_host": 4.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "image_backbone",
+      "name": "Image Backbone",
+      "c_dev": 72.0,
+      "c_host": 14.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "image_neck",
+      "name": "Image Feature Neck",
+      "c_dev": 36.0,
+      "c_host": 7.5,
+      "fixed_dev": false
+    },
+    {
+      "id": "depth_head",
+      "name": "Depth Head",
+      "c_dev": 28.0,
+      "c_host": 6.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "seg_head",
+      "name": "Semantic Segmentation",
+      "c_dev": 42.0,
+      "c_host": 8.5,
+      "fixed_dev": false
+    },
+    {
+      "id": "lidar_filter",
+      "name": "LiDAR Filter",
+      "c_dev": 18.0,
+      "c_host": 5.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "voxelize",
+      "name": "Voxelization",
+      "c_dev": 25.0,
+      "c_host": 7.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "point_backbone",
+      "name": "Point Backbone",
+      "c_dev": 68.0,
+      "c_host": 13.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "imu_preintegrate",
+      "name": "IMU Preintegration",
+      "c_dev": 8.0,
+      "c_host": 3.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "visual_odometry",
+      "name": "Visual Odometry",
+      "c_dev": 34.0,
+      "c_host": 9.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "state_estimator",
+      "name": "State Estimator",
+      "c_dev": 20.0,
+      "c_host": 6.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "bev_projection",
+      "name": "BEV Projection",
+      "c_dev": 38.0,
+      "c_host": 8.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "multimodal_fusion",
+      "name": "Multimodal Fusion",
+      "c_dev": 46.0,
+      "c_host": 10.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "object_head",
+      "name": "Object Detection Head",
+      "c_dev": 35.0,
+      "c_host": 7.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "occupancy_head",
+      "name": "Occupancy Head",
+      "c_dev": 32.0,
+      "c_host": 6.5,
+      "fixed_dev": false
+    },
+    {
+      "id": "tracking",
+      "name": "Multi Object Tracking",
+      "c_dev": 24.0,
+      "c_host": 6.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "risk_assessment",
+      "name": "Risk Assessment",
+      "c_dev": 16.0,
+      "c_host": 5.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "local_map",
+      "name": "Local Map Update",
+      "c_dev": 22.0,
+      "c_host": 6.5,
+      "fixed_dev": false
+    },
+    {
+      "id": "behavior_planner",
+      "name": "Behavior Planner",
+      "c_dev": 18.0,
+      "c_host": 5.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "trajectory_optimizer",
+      "name": "Trajectory Optimizer",
+      "c_dev": 30.0,
+      "c_host": 8.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "safety_filter",
+      "name": "Safety Filter",
+      "c_dev": 10.0,
+      "c_host": 4.0,
+      "fixed_dev": true
+    },
+    {
+      "id": "control_policy",
+      "name": "Control Policy",
+      "c_dev": 12.0,
+      "c_host": 4.0,
+      "fixed_dev": true
+    },
+    {
+      "id": "actuator_command",
+      "name": "Actuator Command",
+      "c_dev": 4.0,
+      "c_host": 2.0,
+      "fixed_dev": true
+    }
+  ],
+  "edges": [
+    {
+      "source": "camera_ingest",
+      "target": "image_rectify",
+      "size": 6.0
+    },
+    {
+      "source": "image_rectify",
+      "target": "image_backbone",
+      "size": 8.0
+    },
+    {
+      "source": "image_backbone",
+      "target": "image_neck",
+      "size": 12.0
+    },
+    {
+      "source": "image_neck",
+      "target": "depth_head",
+      "size": 4.0
+    },
+    {
+      "source": "image_neck",
+      "target": "seg_head",
+      "size": 4.0
+    },
+    {
+      "source": "image_neck",
+      "target": "bev_projection",
+      "size": 6.0
+    },
+    {
+      "source": "lidar_ingest",
+      "target": "lidar_filter",
+      "size": 10.0
+    },
+    {
+      "source": "lidar_filter",
+      "target": "voxelize",
+      "size": 5.0
+    },
+    {
+      "source": "voxelize",
+      "target": "point_backbone",
+      "size": 9.0
+    },
+    {
+      "source": "point_backbone",
+      "target": "bev_projection",
+      "size": 7.0
+    },
+    {
+      "source": "imu_ingest",
+      "target": "imu_preintegrate",
+      "size": 0.2
+    },
+    {
+      "source": "image_backbone",
+      "target": "visual_odometry",
+      "size": 3.0
+    },
+    {
+      "source": "imu_preintegrate",
+      "target": "visual_odometry",
+      "size": 0.2
+    },
+    {
+      "source": "visual_odometry",
+      "target": "state_estimator",
+      "size": 0.5
+    },
+    {
+      "source": "imu_preintegrate",
+      "target": "state_estimator",
+      "size": 0.2
+    },
+    {
+      "source": "bev_projection",
+      "target": "multimodal_fusion",
+      "size": 10.0
+    },
+    {
+      "source": "depth_head",
+      "target": "multimodal_fusion",
+      "size": 3.0
+    },
+    {
+      "source": "seg_head",
+      "target": "multimodal_fusion",
+      "size": 3.0
+    },
+    {
+      "source": "state_estimator",
+      "target": "multimodal_fusion",
+      "size": 0.5
+    },
+    {
+      "source": "multimodal_fusion",
+      "target": "object_head",
+      "size": 5.0
+    },
+    {
+      "source": "multimodal_fusion",
+      "target": "occupancy_head",
+      "size": 5.0
+    },
+    {
+      "source": "object_head",
+      "target": "tracking",
+      "size": 1.5
+    },
+    {
+      "source": "state_estimator",
+      "target": "tracking",
+      "size": 0.5
+    },
+    {
+      "source": "tracking",
+      "target": "risk_assessment",
+      "size": 1.0
+    },
+    {
+      "source": "occupancy_head",
+      "target": "risk_assessment",
+      "size": 2.0
+    },
+    {
+      "source": "occupancy_head",
+      "target": "local_map",
+      "size": 3.0
+    },
+    {
+      "source": "state_estimator",
+      "target": "local_map",
+      "size": 0.5
+    },
+    {
+      "source": "risk_assessment",
+      "target": "behavior_planner",
+      "size": 1.0
+    },
+    {
+      "source": "local_map",
+      "target": "behavior_planner",
+      "size": 2.0
+    },
+    {
+      "source": "behavior_planner",
+      "target": "trajectory_optimizer",
+      "size": 1.0
+    },
+    {
+      "source": "state_estimator",
+      "target": "trajectory_optimizer",
+      "size": 0.5
+    },
+    {
+      "source": "trajectory_optimizer",
+      "target": "safety_filter",
+      "size": 0.6
+    },
+    {
+      "source": "risk_assessment",
+      "target": "safety_filter",
+      "size": 0.4
+    },
+    {
+      "source": "safety_filter",
+      "target": "control_policy",
+      "size": 0.3
+    },
+    {
+      "source": "state_estimator",
+      "target": "control_policy",
+      "size": 0.4
+    },
+    {
+      "source": "control_policy",
+      "target": "actuator_command",
+      "size": 0.1
+    }
+  ],
+  "environment": {
+    "bandwidth": 80.0,
+    "latency": 4.0,
+    "weight_latency": 0.75,
+    "latency_limit": 420.0
+  }
+}

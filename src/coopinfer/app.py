@@ -806,7 +806,7 @@ class MainWindow(QMainWindow):
   <div class="toolbar">
     <strong>{html.escape(title)}</strong>
     <label for="scale">Scale</label>
-    <input id="scale" type="range" min="100" max="500" step="25" value="100">
+    <input id="scale" type="range" min="5" max="500" step="5" value="100">
     <span id="scaleText">100%</span>
     {extra_info}
   </div>
