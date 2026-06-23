@@ -44,6 +44,7 @@
         \item DAG 节点及端侧/边侧执行耗时。
         \item 边数据量。
         \item 带宽、固定时延、优化权重。
+        \item 串行网络模型以及可选传输批处理。
         \item 可选端到端时延上限。
       \end{itemize}
     \end{column}
@@ -71,7 +72,7 @@
       \end{itemize}
     \item 环境参数：
       \begin{itemize}
-        \item \texttt{bandwidth}, \texttt{latency}, \texttt{weight\_latency}, \texttt{latency\_limit}
+        \item \texttt{bandwidth}, \texttt{latency}, \texttt{weight\_latency}, \texttt{latency\_limit}, \texttt{batch\_transfers}
       \end{itemize}
     \item JSON 导入/导出保证实验可复现、可共享。
   \end{itemize}
@@ -101,6 +102,25 @@
     F_i = S_i + (1-x_i)c_i^{dev} + x_i c_i^{host}
   \]
   端到端闭环时延为 $\tau=\max_i F_i$。
+\end{frame}
+
+\begin{frame}{网络模型：串行传输与批处理}
+  \begin{itemize}
+    \item 所有跨设备传输共享一条网络工作队列：
+      \[
+        time\_network\_ready
+      \]
+    \item 传输必须等待源节点完成，并且等待网络队列空闲，因此不同传输不会重叠。
+    \item 未开启批处理时，每条跨设备边独立计费：
+      \[
+        T_{edge}=L+\frac{s}{B}
+      \]
+    \item 开启 \texttt{batch\_transfers=true} 后，同一个源节点的多条跨设备出边会作为一次网络事务发送：
+      \[
+        T_{batch}=L+\frac{\sum_k s_k}{B}
+      \]
+    \item 这样既保持网络非重叠，又避免连续出边重复支付固定时延。
+  \end{itemize}
 \end{frame}
 
 \begin{frame}{优化目标与可行性约束}
@@ -148,7 +168,7 @@
   \begin{enumerate}
     \item 编辑节点、名称、计算耗时和固定端侧标记。
     \item 编辑边和传输数据量。
-    \item 配置带宽、固定时延、优化权重、求解模式、迭代次数和端到端时延上限。
+    \item 配置带宽、固定时延、网络批处理、优化权重、求解模式、迭代次数和端到端时延上限。
     \item 点击 \textbf{Solve}。
     \item 查看性能看板、拓扑放置和 profiler 风格时序图。
   \end{enumerate}
@@ -173,7 +193,7 @@
       \begin{itemize}
         \item Host、Transfer、Device 三条泳道。
         \item 算子条由开始/完成时间决定。
-        \item 传输条由网络传输耗时决定。
+        \item 传输条来自解析器的真实传输记录，可展示串行传输和批处理传输。
         \item 使用浏览器原生滚动和缩放控件。
       \end{itemize}
     \end{column}
@@ -208,6 +228,7 @@
     \item PyQt6-WebEngine 负责 SVG 拓扑图和时序图渲染。
     \item NetworkX 负责 DAG 存储、拓扑排序和环路检测。
     \item Pytest 覆盖解析器、JSON IO、求解模式和时延上限可行性。
+    \item 启动命令：\texttt{python -m coopinfer} 或 \texttt{python -m coopinfer.app}。
   \end{itemize}
 \end{frame}
 
@@ -218,6 +239,7 @@
     \item 增加带宽/时延参数扫描的批量评估。
     \item 为大规模 DAG 引入更高级的调度算法。
     \item 在时序图中显式区分队列等待、数据就绪和传输阶段。
+    \item 探索比拓扑源节点 FIFO 更灵活的网络重排策略。
   \end{itemize}
 \end{frame}
 

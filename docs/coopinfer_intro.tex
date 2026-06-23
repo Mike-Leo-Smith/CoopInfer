@@ -46,6 +46,7 @@
         \item DAG nodes with device/host compute costs.
         \item Edges with transfer sizes.
         \item Bandwidth, latency, objective weight.
+        \item Serialized network model with optional transfer batching.
         \item Optional E2E latency limit.
       \end{itemize}
     \end{column}
@@ -73,7 +74,7 @@
       \end{itemize}
     \item Environment fields:
       \begin{itemize}
-        \item \texttt{bandwidth}, \texttt{latency}, \texttt{weight\_latency}, \texttt{latency\_limit}.
+        \item \texttt{bandwidth}, \texttt{latency}, \texttt{weight\_latency}, \texttt{latency\_limit}, \texttt{batch\_transfers}.
       \end{itemize}
     \item JSON load/save keeps experiments reproducible and shareable.
   \end{itemize}
@@ -103,6 +104,25 @@
     F_i = S_i + (1-x_i)c_i^{dev} + x_i c_i^{host}
   \]
   The E2E latency is $\tau=\max_i F_i$.
+\end{frame}
+
+\begin{frame}{Network Model: Serialized Transfers and Batching}
+  \begin{itemize}
+    \item Cross-device transfers share one network worker timeline:
+      \[
+        time\_network\_ready
+      \]
+    \item A transfer can start only after its source node finishes and the network worker is idle.
+    \item Without batching, each cross-device edge is scheduled independently:
+      \[
+        T_{edge}=L+\frac{s}{B}
+      \]
+    \item With \texttt{batch\_transfers=true}, multiple outgoing cross-device edges from the same source node are sent as one transaction:
+      \[
+        T_{batch}=L+\frac{\sum_k s_k}{B}
+      \]
+    \item This preserves non-overlap while avoiding repeated fixed latency for successive outgoing transfers.
+  \end{itemize}
 \end{frame}
 
 \begin{frame}{Objective and Feasibility}
@@ -150,7 +170,7 @@
   \begin{enumerate}
     \item Edit nodes, names, compute costs, fixed-device flags.
     \item Edit edges and transfer sizes in MB.
-    \item Configure bandwidth, latency, objective weight, solver mode, iterations, and E2E cap.
+    \item Configure bandwidth, latency, network batching, objective weight, solver mode, iterations, and E2E cap.
     \item Click \textbf{Solve}.
     \item Inspect metrics, topology placement, and profiler-style timeline.
   \end{enumerate}
@@ -175,7 +195,7 @@
       \begin{itemize}
         \item Host, Transfer, Device lanes.
         \item Operator bars use computed start/finish times.
-        \item Transfer bars use network transfer duration.
+        \item Transfer bars use actual evaluator records, including serialized and batched transfers.
         \item Browser-native scroll and scale controls.
       \end{itemize}
     \end{column}
@@ -211,6 +231,7 @@
     \item PyQt6-WebEngine for SVG topology and timeline rendering.
     \item NetworkX for DAG storage, topological sort, and validation.
     \item Pytest coverage for evaluator, JSON IO, solver modes, and latency-limit feasibility.
+    \item Launch commands: \texttt{python -m coopinfer} or \texttt{python -m coopinfer.app}.
   \end{itemize}
 \end{frame}
 
@@ -221,6 +242,7 @@
     \item Add batch evaluation over bandwidth/latency sweeps.
     \item Consider more advanced schedulers for larger DAGs.
     \item Improve timeline semantics with explicit queue-wait and data-ready intervals.
+    \item Explore network reordering policies beyond deterministic topological-source FIFO.
   \end{itemize}
 \end{frame}
 
