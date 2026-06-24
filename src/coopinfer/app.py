@@ -506,6 +506,15 @@ class MainWindow(QMainWindow):
     def _base_node_id(self, op_id: str) -> str:
         return op_id.split("[f", 1)[0] if "[f" in op_id else op_id
 
+    def _frame_index(self, op_id: str) -> int:
+        if "[f" not in op_id:
+            return 0
+        suffix = op_id.rsplit("[f", 1)[1].rstrip("]")
+        try:
+            return int(suffix)
+        except ValueError:
+            return 0
+
     def _cell_text(self, table: QTableWidget, row: int, column: int) -> str:
         item = table.item(row, column)
         return item.text().strip() if item is not None else ""
@@ -559,10 +568,17 @@ class MainWindow(QMainWindow):
                 self._unrolled_solution_graph(),
                 solved=True,
                 title="Solved Pipeline",
+                extra_info="<span>Fill = frame</span><span>Blue outline = Device</span><span>Green outline = Host</span>",
             )
         )
 
-    def _graph_svg_html(self, graph: nx.DiGraph, solved: bool, title: str) -> str:
+    def _graph_svg_html(
+        self,
+        graph: nx.DiGraph,
+        solved: bool,
+        title: str,
+        extra_info: str = "",
+    ) -> str:
         raw_pos = self._layered_layout(graph)
         x_values = [xy[0] for xy in raw_pos.values()]
         y_values = [xy[1] for xy in raw_pos.values()]
@@ -632,24 +648,50 @@ class MainWindow(QMainWindow):
         for node, attrs in graph.nodes(data=True):
             x_pos, y_pos = pos[node]
             x_value = int(attrs.get("x", 0))
-            fill = "#2563eb" if x_value == 0 else "#16a34a"
+            fill = "#f8fafc"
+            stroke = "#111827"
+            if solved:
+                fill = self._frame_color(int(attrs.get("frame", 0)))
+                stroke = "#2563eb" if x_value == 0 else "#16a34a"
             if not solved:
                 fill = "#f8fafc"
             place = "Dev" if x_value == 0 else "Host"
             compute = float(attrs["c_dev"]) if x_value == 0 else float(attrs["c_host"])
             stroke_width = 4 if attrs.get("fixed_dev", False) else 1.5
+            if solved:
+                stroke_width = 4
             display_id = str(attrs.get("display_id", node))
             node_name = str(attrs.get("name", node))
             meta = f"{place}: {compute:g} ms" if solved else f"D:{float(attrs['c_dev']):g} / H:{float(attrs['c_host']):g} ms"
-            id_fill = "#ffffff" if solved else "#111827"
+            id_fill = "#111827"
             rows.append(
                 f'<g><title>{html.escape(str(node))} {html.escape(node_name)} - {html.escape(meta)}</title>'
                 f'<text class="node-name" x="{x_pos:.1f}" y="{y_pos - 43:.1f}">{html.escape(node_name)}</text>'
-                f'<circle cx="{x_pos:.1f}" cy="{y_pos:.1f}" r="24" fill="{fill}" stroke="#111827" stroke-width="{stroke_width}" />'
+                f'<circle cx="{x_pos:.1f}" cy="{y_pos:.1f}" r="24" fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}" />'
                 f'<text class="node-id" style="fill:{id_fill}" x="{x_pos:.1f}" y="{y_pos + 5:.1f}">{html.escape(display_id)}</text>'
                 f'<text class="compute" x="{x_pos:.1f}" y="{y_pos + 48:.1f}">{html.escape(meta)}</text></g>'
             )
-        return self._svg_page(title, "\n".join(rows), width, height, scale_axis="xy")
+        return self._svg_page(
+            title,
+            "\n".join(rows),
+            width,
+            height,
+            extra_info=extra_info,
+            scale_axis="xy",
+        )
+
+    def _frame_color(self, frame: int) -> str:
+        palette = [
+            "#dbeafe",
+            "#fef3c7",
+            "#dcfce7",
+            "#fce7f3",
+            "#ede9fe",
+            "#ccfbf1",
+            "#fee2e2",
+            "#e0f2fe",
+        ]
+        return palette[frame % len(palette)]
 
     def _unrolled_solution_graph(self) -> nx.DiGraph:
         assert self.solver_result is not None
@@ -794,13 +836,14 @@ class MainWindow(QMainWindow):
             y_center = lane_y[x_value]
             x_pos = x_at(start)
             bar_width = max(6.0, duration * px_per_ms)
-            color = "#2563eb" if x_value == 0 else "#16a34a"
+            fill = self._frame_color(self._frame_index(node))
+            stroke = "#2563eb" if x_value == 0 else "#16a34a"
             node_name = esc(self.graph.nodes[base_node].get("name", base_node))
             rows.append(
                 f'<g><title>{esc(node)} {node_name}: {start:.1f}-{finish:.1f} ms</title>'
                 f'<rect class="op" data-start="{start:.6f}" data-duration="{duration:.6f}" x="{x_pos:.1f}" y="{y_center - 16:.1f}" width="{bar_width:.1f}" '
-                f'height="32" rx="4" fill="{color}" />'
-                f'<text class="op-id" data-start="{start:.6f}" data-duration="{duration:.6f}" data-anchor="center" x="{x_pos + bar_width / 2:.1f}" y="{y_center + 5:.1f}">{esc(node)}</text>'
+                f'height="32" rx="4" fill="{fill}" style="stroke:{stroke};stroke-width:2" />'
+                f'<text class="op-id op-id-dark" data-start="{start:.6f}" data-duration="{duration:.6f}" data-anchor="center" x="{x_pos + bar_width / 2:.1f}" y="{y_center + 5:.1f}">{esc(node)}</text>'
                 f'<text class="op-meta" data-start="{start:.6f}" data-anchor="start" x="{x_pos:.1f}" y="{y_center - 24:.1f}">{esc(node)} {node_name} '
                 f'{start:.1f}-{finish:.1f} ms</text></g>'
             )
@@ -951,6 +994,7 @@ class MainWindow(QMainWindow):
   .tick-label {{ font-size: 10px; fill: #6b7280; text-anchor: middle; }}
   .op {{ stroke: #111827; stroke-width: 1; }}
   .op-id {{ fill: #ffffff; font-size: 11px; font-weight: 700; text-anchor: middle; pointer-events: none; }}
+  .op-id-dark {{ fill: #111827; stroke: none; }}
   .op-meta {{ fill: #111827; font-size: 10px; paint-order: stroke; stroke: #ffffff; stroke-width: 3px; stroke-linejoin: round; }}
   .transfer {{ fill: #f97316; stroke: #9a3412; stroke-width: 1; }}
   .transfer-label {{ fill: #111827; font-size: 10px; font-weight: 700; text-anchor: middle; pointer-events: none; }}
