@@ -150,6 +150,12 @@ def _try_solve_cpp(
         "c_dev": [float(attrs["c_dev"]) for _, attrs in graph.nodes(data=True)],
         "c_host": [float(attrs["c_host"]) for _, attrs in graph.nodes(data=True)],
         "fixed_dev": [bool(attrs.get("fixed_dev", False)) for _, attrs in graph.nodes(data=True)],
+        "source_period_ms": [
+            float(attrs.get("source_period_ms", 0.0)) for _, attrs in graph.nodes(data=True)
+        ],
+        "source_phase_ms": [
+            float(attrs.get("source_phase_ms", 0.0)) for _, attrs in graph.nodes(data=True)
+        ],
         "x_initial": [
             0 if attrs.get("fixed_dev", False) else int(attrs.get("x", 1))
             for _, attrs in graph.nodes(data=True)

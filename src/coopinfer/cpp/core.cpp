@@ -45,6 +45,8 @@ struct GraphData {
     std::vector<double> c_dev;
     std::vector<double> c_host;
     std::vector<bool> fixed_dev;
+    std::vector<double> source_period_ms;
+    std::vector<double> source_phase_ms;
     std::vector<int> x_initial;
     std::vector<Edge> edges;
     std::vector<std::vector<Edge>> outgoing;
@@ -80,6 +82,15 @@ std::string op_id(const GraphData& graph, int op, int unroll) {
 
 long long transfer_key(int source, int target, int op_count) {
     return static_cast<long long>(source) * static_cast<long long>(op_count) + target;
+}
+
+double source_release_time(const GraphData& graph, int node, int frame) {
+    if (!graph.incoming[node].empty()) {
+        return 0.0;
+    }
+    double period = std::max(0.0, graph.source_period_ms[node]);
+    double phase = std::max(0.0, graph.source_phase_ms[node]);
+    return phase + static_cast<double>(frame) * period;
 }
 
 std::vector<int> topo_sort_base(int node_count, const std::vector<Edge>& edges) {
@@ -119,6 +130,8 @@ GraphData parse_graph(const py::dict& data) {
     graph.c_dev = data["c_dev"].cast<std::vector<double>>();
     graph.c_host = data["c_host"].cast<std::vector<double>>();
     graph.fixed_dev = data["fixed_dev"].cast<std::vector<bool>>();
+    graph.source_period_ms = data["source_period_ms"].cast<std::vector<double>>();
+    graph.source_phase_ms = data["source_phase_ms"].cast<std::vector<double>>();
     graph.x_initial = data["x_initial"].cast<std::vector<int>>();
     auto sources = data["edge_sources"].cast<std::vector<int>>();
     auto targets = data["edge_targets"].cast<std::vector<int>>();
@@ -153,6 +166,9 @@ std::vector<int> expanded_topo(const GraphData& graph, int unroll) {
     }
     for (int frame = 1; frame < unroll; ++frame) {
         for (int node : graph.topo) {
+            if (graph.incoming[node].empty()) {
+                continue;
+            }
             int source = (frame - 1) * n + node;
             int target = frame * n + node;
             outgoing[source].push_back(target);
@@ -230,10 +246,14 @@ Metrics schedule(
             int prev = (frame - 1) * n + node;
             data_ready = std::max(data_ready, metrics.finishes[prev]);
         }
+        data_ready = std::max(data_ready, source_release_time(graph, node, frame));
 
         double start = 0.0;
         double finish = 0.0;
-        if (node_x == 0) {
+        if (graph.incoming[node].empty()) {
+            start = data_ready;
+            finish = data_ready;
+        } else if (node_x == 0) {
             start = std::max(data_ready, dev_ready);
             finish = start + graph.c_dev[node];
             dev_ready = finish;
@@ -287,7 +307,17 @@ Metrics schedule(
     for (double finish : metrics.finishes) {
         makespan = std::max(makespan, finish);
     }
-    metrics.latency = makespan / static_cast<double>(unroll);
+    double first_release = 0.0;
+    bool has_source = false;
+    for (int node = 0; node < n; ++node) {
+        if (graph.incoming[node].empty()) {
+            double release = source_release_time(graph, node, 0);
+            first_release = has_source ? std::min(first_release, release) : release;
+            has_source = true;
+        }
+    }
+    double pipeline_time = std::max(0.0, makespan - first_release);
+    metrics.latency = pipeline_time / static_cast<double>(unroll);
 
     double dev_active = 0.0;
     for (int op = 0; op < op_count; ++op) {
@@ -296,7 +326,7 @@ Metrics schedule(
             dev_active += metrics.finishes[op] - metrics.starts[op];
         }
     }
-    metrics.utilization = makespan <= 0.0 ? 0.0 : dev_active / makespan;
+    metrics.utilization = pipeline_time <= 0.0 ? 0.0 : dev_active / pipeline_time;
 
     double denom = tau_max - tau_min;
     double normalized_latency = std::abs(denom) < 1e-12 ? 0.0 : (metrics.latency - tau_min) / denom;

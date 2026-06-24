@@ -23,21 +23,22 @@ def test_infer_latency_adds_cross_device_transfer():
         graph, {"v1": 0, "v2": 1}, bandwidth=10.0, latency=5.0
     )
 
-    assert finishes["v1"] == 10.0
-    assert starts["v2"] == 115.0
-    assert latency == 117.0
+    assert finishes["v1"] == 0.0
+    assert starts["v2"] == 105.0
+    assert latency == 107.0
 
 
 def test_infer_latency_queues_independent_nodes_on_same_device():
     graph = graph_from_records(
         [
+            {"id": "input", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": True},
             {"id": "a", "c_dev": 10.0, "c_host": 1.0, "fixed_dev": False},
             {"id": "b", "c_dev": 20.0, "c_host": 1.0, "fixed_dev": False},
         ],
-        [],
+        [{"source": "input", "target": "a", "size": 0.0}, {"source": "input", "target": "b", "size": 0.0}],
     )
     latency, starts, finishes = infer_latency(
-        graph, {"a": 0, "b": 0}, bandwidth=10.0, latency=5.0
+        graph, {"input": 0, "a": 0, "b": 0}, bandwidth=10.0, latency=5.0
     )
 
     assert starts["a"] == 0.0
@@ -50,20 +51,24 @@ def test_infer_latency_queues_independent_nodes_on_same_device():
 def test_infer_latency_waits_for_host_queue_after_data_ready():
     graph = graph_from_records(
         [
+            {"id": "input", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": True},
             {"id": "dev_source", "c_dev": 1.0, "c_host": 1.0, "fixed_dev": True},
             {"id": "host_busy", "c_dev": 1.0, "c_host": 50.0, "fixed_dev": False},
             {"id": "host_after_data", "c_dev": 1.0, "c_host": 5.0, "fixed_dev": False},
         ],
-        [{"source": "dev_source", "target": "host_after_data", "size": 0.0}],
+        [
+            {"source": "input", "target": "host_busy", "size": 0.0},
+            {"source": "dev_source", "target": "host_after_data", "size": 0.0},
+        ],
     )
     latency, starts, finishes = infer_latency(
         graph,
-        {"dev_source": 0, "host_busy": 1, "host_after_data": 1},
+        {"input": 1, "dev_source": 0, "host_busy": 1, "host_after_data": 1},
         bandwidth=10.0,
         latency=5.0,
     )
 
-    assert finishes["dev_source"] == 1.0
+    assert finishes["dev_source"] == 0.0
     assert starts["host_busy"] == 0.0
     assert finishes["host_busy"] == 50.0
     assert starts["host_after_data"] == 50.0
@@ -91,10 +96,10 @@ def test_infer_latency_serializes_cross_device_transfers():
         latency=5.0,
     )
 
-    assert finishes["source"] == 1.0
-    assert starts["h1"] == 106.0
-    assert starts["h2"] == 211.0
-    assert latency == 212.0
+    assert finishes["source"] == 0.0
+    assert starts["h1"] == 105.0
+    assert starts["h2"] == 210.0
+    assert latency == 211.0
 
 
 def test_infer_latency_batches_successive_outgoing_transfers():
@@ -118,48 +123,149 @@ def test_infer_latency_batches_successive_outgoing_transfers():
         batch_transfers=True,
     )
 
-    assert starts["h1"] == 206.0
-    assert starts["h2"] == 207.0
-    assert latency == 208.0
+    assert starts["h1"] == 205.0
+    assert starts["h2"] == 206.0
+    assert latency == 207.0
 
 
 def test_pipeline_unroll_preserves_same_label_fifo():
-    graph = sample_graph()
+    graph = graph_from_records(
+        [
+            {"id": "input", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": True},
+            {"id": "stage", "c_dev": 10.0, "c_host": 1.0, "fixed_dev": False},
+            {"id": "head", "c_dev": 20.0, "c_host": 2.0, "fixed_dev": False},
+        ],
+        [
+            {"source": "input", "target": "stage", "size": 0.0},
+            {"source": "stage", "target": "head", "size": 1.0},
+        ],
+    )
     latency, starts, finishes = infer_latency(
         graph,
-        {"v1": 0, "v2": 1},
+        {"input": 0, "stage": 0, "head": 1},
         bandwidth=1000.0,
         latency=0.0,
         pipeline_unroll=2,
     )
 
-    assert starts["v1[f0]"] == 0.0
-    assert finishes["v1[f0]"] == 10.0
-    assert starts["v1[f1]"] == 10.0
-    assert starts["v2[f0]"] == 11.0
-    assert starts["v2[f1]"] == 21.0
+    assert starts["input[f0]"] == 0.0
+    assert finishes["input[f0]"] == 0.0
+    assert starts["input[f1]"] == 0.0
+    assert starts["stage[f0]"] == 0.0
+    assert starts["stage[f1]"] == 10.0
+    assert starts["head[f0]"] == 11.0
+    assert starts["head[f1]"] == 21.0
     assert latency == 11.5
+
+
+def test_source_period_delays_unrolled_input_frames():
+    graph = graph_from_records(
+        [
+            {
+                "id": "camera",
+                "name": "Camera",
+                "c_dev": 1.0,
+                "c_host": 1.0,
+                "fixed_dev": True,
+                "source_period_ms": 33.0,
+            },
+            {"id": "head", "c_dev": 2.0, "c_host": 1.0, "fixed_dev": False},
+        ],
+        [{"source": "camera", "target": "head", "size": 0.0}],
+    )
+
+    latency, starts, finishes = infer_latency(
+        graph,
+        {"camera": 0, "head": 0},
+        bandwidth=1000.0,
+        latency=0.0,
+        pipeline_unroll=3,
+    )
+
+    assert starts["camera[f0]"] == 0.0
+    assert starts["camera[f1]"] == 33.0
+    assert starts["camera[f2]"] == 66.0
+    assert finishes["camera[f2]"] == 66.0
+    assert finishes["head[f2]"] == 68.0
+    assert latency == 68.0 / 3.0
+
+
+def test_source_nodes_overlap_downstream_pipeline_work():
+    graph = graph_from_records(
+        [
+            {
+                "id": "camera",
+                "c_dev": 100.0,
+                "c_host": 100.0,
+                "fixed_dev": True,
+                "source_period_ms": 10.0,
+            },
+            {"id": "slow_out", "c_dev": 50.0, "c_host": 50.0, "fixed_dev": False},
+        ],
+        [{"source": "camera", "target": "slow_out", "size": 0.0}],
+    )
+
+    _, starts, finishes = infer_latency(
+        graph,
+        {"camera": 0, "slow_out": 1},
+        bandwidth=1000.0,
+        latency=0.0,
+        pipeline_unroll=3,
+    )
+
+    assert starts["camera[f1]"] == 10.0
+    assert finishes["camera[f1]"] == 10.0
+    assert starts["camera[f2]"] == 20.0
+    assert starts["slow_out[f1]"] == 50.0
+
+
+def test_solver_accounts_for_source_period_in_pipeline_result():
+    graph = graph_from_records(
+        [
+            {
+                "id": "camera",
+                "c_dev": 1.0,
+                "c_host": 1.0,
+                "fixed_dev": True,
+                "source_period_ms": 33.0,
+            },
+            {"id": "head", "c_dev": 2.0, "c_host": 1.0, "fixed_dev": False},
+        ],
+        [{"source": "camera", "target": "head", "size": 0.0}],
+    )
+
+    result = solve(
+        graph,
+        bandwidth=1000.0,
+        latency=0.0,
+        weight_latency=1.0,
+        algorithm="Enumerate",
+        pipeline_unroll=3,
+    )
+
+    assert result.metrics.start_times["camera[f2]"] == 66.0
+    assert result.metrics.latency >= 22.0
 
 
 def test_evaluate_reports_pipeline_device_active_utilization():
     graph = sample_graph()
     result = evaluate(
         graph,
-        {"v1": 0, "v2": 1},
+        {"v1": 0, "v2": 0},
         bandwidth=1000.0,
         latency=0.0,
         weight_latency=0.7,
         pipeline_unroll=2,
     )
 
-    assert result.device_utilization == 20.0 / 23.0
+    assert result.device_utilization == 1.0
 
 
 def test_evaluate_reports_device_utilization():
     graph = sample_graph()
     result = evaluate(graph, {"v1": 0, "v2": 1}, bandwidth=10.0, latency=5.0, weight_latency=0.7)
 
-    assert result.device_utilization == 10.0 / 117.0
+    assert result.device_utilization == 0.0
     assert result.loss >= 0.0
 
 
@@ -189,7 +295,7 @@ def test_solver_rejects_assignments_above_latency_limit():
 def test_solver_raises_when_no_assignment_satisfies_latency_limit():
     graph = sample_graph()
     try:
-        solve(graph, bandwidth=50.0, latency=5.0, weight_latency=1.0, latency_limit=20.0)
+        solve(graph, bandwidth=50.0, latency=5.0, weight_latency=1.0, latency_limit=19.0)
     except ValueError as exc:
         assert "No feasible assignment" in str(exc)
     else:
@@ -252,6 +358,8 @@ def test_json_round_trip(tmp_path):
     assert data["environment"]["latency_limit"] == 120.0
     assert data["environment"]["batch_transfers"] is True
     assert data["environment"]["pipeline_unroll"] == 3
+    assert data["nodes"][0]["source_period_ms"] == 0.0
+    assert data["nodes"][0]["source_phase_ms"] == 0.0
 
 
 def test_graph_from_records_can_be_checked_for_cycles():

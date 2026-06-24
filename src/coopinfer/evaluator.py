@@ -72,9 +72,18 @@ def infer_schedule(
     time_network_ready = 0.0
     topo_nodes = list(nx.topological_sort(graph))
     unroll = max(1, int(pipeline_unroll))
+    source_nodes = {node for node in graph.nodes if graph.in_degree(node) == 0}
 
     def op_id(node: str, frame: int) -> str:
         return str(node) if unroll == 1 else f"{node}[f{frame}]"
+
+    def source_release_time(node: str, frame: int) -> float:
+        if node not in source_nodes:
+            return 0.0
+        attrs = graph.nodes[node]
+        period_ms = max(0.0, float(attrs.get("source_period_ms", 0.0)))
+        phase_ms = max(0.0, float(attrs.get("source_phase_ms", 0.0)))
+        return phase_ms + frame * period_ms
 
     expanded = nx.DiGraph()
     for frame in range(unroll):
@@ -90,6 +99,8 @@ def infer_schedule(
     if unroll > 1:
         for frame in range(1, unroll):
             for node in topo_nodes:
+                if node in source_nodes:
+                    continue
                 expanded.add_edge(
                     op_id(str(node), frame - 1),
                     op_id(str(node), frame),
@@ -99,6 +110,7 @@ def infer_schedule(
 
     for current in nx.topological_sort(expanded):
         base_node = expanded.nodes[current]["base"]
+        frame = int(expanded.nodes[current]["frame"])
         data_ready_at = 0.0
         node_x = int(assignment[base_node])
         for predecessor in expanded.predecessors(current):
@@ -110,8 +122,13 @@ def infer_schedule(
             else:
                 data_ready_at = max(data_ready_at, finish_times[predecessor])
 
+        data_ready_at = max(data_ready_at, source_release_time(base_node, frame))
+
         attrs = graph.nodes[base_node]
-        if node_x == 0:
+        if base_node in source_nodes:
+            start_at = data_ready_at
+            finish_at = data_ready_at
+        elif node_x == 0:
             start_at = max(data_ready_at, time_dev_ready)
             finish_at = start_at + float(attrs["c_dev"])
             time_dev_ready = finish_at
@@ -164,9 +181,13 @@ def infer_schedule(
                     )
                 )
 
-    makespan = max(finish_times.values()) if finish_times else 0.0
+    first_release = min(
+        (source_release_time(str(node), 0) for node in source_nodes),
+        default=0.0,
+    )
+    makespan = max(finish_times.values()) if finish_times else first_release
     return (
-        makespan / unroll,
+        max(0.0, makespan - first_release) / unroll,
         start_times,
         finish_times,
         tuple(transfer_records),
@@ -235,7 +256,16 @@ def evaluate(
     denom = tau_max - tau_min
     normalized_latency = 0.0 if abs(denom) < 1e-12 else (tau - tau_min) / denom
 
-    pipeline_makespan = max(finish_times.values()) if finish_times else 0.0
+    source_nodes = [node for node in graph.nodes if graph.in_degree(node) == 0]
+    first_release = min(
+        (
+            max(0.0, float(graph.nodes[node].get("source_phase_ms", 0.0)))
+            for node in source_nodes
+        ),
+        default=0.0,
+    )
+    pipeline_finish = max(finish_times.values()) if finish_times else first_release
+    pipeline_makespan = max(0.0, pipeline_finish - first_release)
     used_dev_active_time = sum(
         finish_times[op_id] - start_times[op_id]
         for op_id in start_times

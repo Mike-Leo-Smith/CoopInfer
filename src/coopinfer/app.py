@@ -74,11 +74,23 @@ class MainWindow(QMainWindow):
         group.setMinimumHeight(120)
         layout = QVBoxLayout(group)
 
-        self.nodes_table = QTableWidget(0, 5)
+        self.nodes_table = QTableWidget(0, 7)
         self.nodes_table.setHorizontalHeaderLabels(
-            ["Node ID", "Name", "C_dev (ms)", "C_host (ms)", "Fixed on Dev"]
+            [
+                "Node ID",
+                "Name",
+                "C_dev (ms)",
+                "C_host (ms)",
+                "Source Period (ms)",
+                "Source Phase (ms)",
+                "Fixed on Dev",
+            ]
         )
-        self.nodes_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        node_header = self.nodes_table.horizontalHeader()
+        node_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        node_header.setStretchLastSection(False)
+        for column, width in enumerate([95, 150, 95, 95, 135, 125, 105]):
+            self.nodes_table.setColumnWidth(column, width)
         self.nodes_table.itemChanged.connect(self._preview_from_tables)
         layout.addWidget(self.nodes_table)
 
@@ -99,7 +111,11 @@ class MainWindow(QMainWindow):
 
         self.edges_table = QTableWidget(0, 3)
         self.edges_table.setHorizontalHeaderLabels(["Source", "Target", "Size (MB)"])
-        self.edges_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        edge_header = self.edges_table.horizontalHeader()
+        edge_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        edge_header.setStretchLastSection(False)
+        for column, width in enumerate([130, 130, 100]):
+            self.edges_table.setColumnWidth(column, width)
         self.edges_table.itemChanged.connect(self._preview_from_tables)
         layout.addWidget(self.edges_table)
 
@@ -251,6 +267,8 @@ class MainWindow(QMainWindow):
                     "name": "Sensor Pre",
                     "c_dev": 15.5,
                     "c_host": 2.1,
+                    "source_period_ms": 33.333,
+                    "source_phase_ms": 0.0,
                     "fixed_dev": True,
                 },
                 {
@@ -258,6 +276,8 @@ class MainWindow(QMainWindow):
                     "name": "Backbone",
                     "c_dev": 40.0,
                     "c_host": 8.5,
+                    "source_period_ms": 0.0,
+                    "source_phase_ms": 0.0,
                     "fixed_dev": False,
                 },
                 {
@@ -265,6 +285,8 @@ class MainWindow(QMainWindow):
                     "name": "Control Head",
                     "c_dev": 22.0,
                     "c_host": 4.0,
+                    "source_period_ms": 0.0,
+                    "source_phase_ms": 0.0,
                     "fixed_dev": False,
                 },
             ],
@@ -290,6 +312,8 @@ class MainWindow(QMainWindow):
                     str(node.get("name", node["id"])),
                     float(node["c_dev"]),
                     float(node["c_host"]),
+                    float(node.get("source_period_ms", 0.0)),
+                    float(node.get("source_phase_ms", 0.0)),
                     bool(node.get("fixed_dev", False)),
                 )
 
@@ -312,6 +336,8 @@ class MainWindow(QMainWindow):
         name: Optional[str] = None,
         c_dev: float = 10.0,
         c_host: float = 2.0,
+        source_period_ms: float = 0.0,
+        source_phase_ms: float = 0.0,
         fixed_dev: bool = False,
     ) -> None:
         row = self.nodes_table.rowCount()
@@ -321,10 +347,12 @@ class MainWindow(QMainWindow):
         self.nodes_table.setItem(row, 1, QTableWidgetItem(name or next_id))
         self.nodes_table.setItem(row, 2, QTableWidgetItem(f"{c_dev:g}"))
         self.nodes_table.setItem(row, 3, QTableWidgetItem(f"{c_host:g}"))
+        self.nodes_table.setItem(row, 4, QTableWidgetItem(f"{source_period_ms:g}"))
+        self.nodes_table.setItem(row, 5, QTableWidgetItem(f"{source_phase_ms:g}"))
         fixed_item = QTableWidgetItem()
         fixed_item.setFlags(fixed_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         fixed_item.setCheckState(Qt.CheckState.Checked if fixed_dev else Qt.CheckState.Unchecked)
-        self.nodes_table.setItem(row, 4, fixed_item)
+        self.nodes_table.setItem(row, 6, fixed_item)
         self._preview_from_tables()
 
     def _add_edge_row(
@@ -465,7 +493,13 @@ class MainWindow(QMainWindow):
                     "name": self._cell_text(self.nodes_table, row, 1) or node_id,
                     "c_dev": self._cell_float(self.nodes_table, row, 2, "C_dev (ms)"),
                     "c_host": self._cell_float(self.nodes_table, row, 3, "C_host (ms)"),
-                    "fixed_dev": self.nodes_table.item(row, 4).checkState()
+                    "source_period_ms": self._cell_float(
+                        self.nodes_table, row, 4, "Source Period (ms)"
+                    ),
+                    "source_phase_ms": self._cell_float(
+                        self.nodes_table, row, 5, "Source Phase (ms)"
+                    ),
+                    "fixed_dev": self.nodes_table.item(row, 6).checkState()
                     == Qt.CheckState.Checked,
                 }
             )
@@ -515,6 +549,14 @@ class MainWindow(QMainWindow):
         except ValueError:
             return 0
 
+    def _source_release_time(self, node: str, frame: int) -> float:
+        if self.graph.in_degree(node) != 0:
+            return 0.0
+        attrs = self.graph.nodes[node]
+        period_ms = max(0.0, float(attrs.get("source_period_ms", 0.0)))
+        phase_ms = max(0.0, float(attrs.get("source_phase_ms", 0.0)))
+        return phase_ms + frame * period_ms
+
     def _cell_text(self, table: QTableWidget, row: int, column: int) -> str:
         item = table.item(row, column)
         return item.text().strip() if item is not None else ""
@@ -538,6 +580,8 @@ class MainWindow(QMainWindow):
                 "name": attrs.get("name", node),
                 "c_dev": attrs.get("c_dev", 0.0),
                 "c_host": attrs.get("c_host", 0.0),
+                "source_period_ms": attrs.get("source_period_ms", 0.0),
+                "source_phase_ms": attrs.get("source_phase_ms", 0.0),
                 "fixed_dev": attrs.get("fixed_dev", False),
             }
             for node, attrs in graph.nodes(data=True)
@@ -614,6 +658,11 @@ class MainWindow(QMainWindow):
                 dash = ' stroke-dasharray="3 5"'
                 marker = "arrow-purple"
                 label = "FIFO"
+            elif attrs.get("kind") == "source_period":
+                color = "#be123c"
+                dash = ' stroke-dasharray="6 4"'
+                marker = ""
+                label = f"period {float(attrs.get('period', 0.0)):g} ms"
             elif not solved:
                 color = "#6b7280"
                 dash = ""
@@ -640,14 +689,16 @@ class MainWindow(QMainWindow):
             end_y = ty - dy / dist * (radius + 5)
             mid_x = (start_x + end_x) / 2.0
             mid_y = (start_y + end_y) / 2.0 - 10.0
+            marker_attr = f' marker-end="url(#{marker})"' if marker else ""
             rows.append(
                 f'<line class="edge" x1="{start_x:.1f}" y1="{start_y:.1f}" x2="{end_x:.1f}" y2="{end_y:.1f}" '
-                f'stroke="{color}"{dash} marker-end="url(#{marker})"><title>{html.escape(str(source))} → {html.escape(str(target))}: {html.escape(label)}</title></line>'
+                f'stroke="{color}"{dash}{marker_attr}><title>{html.escape(str(source))} → {html.escape(str(target))}: {html.escape(label)}</title></line>'
                 f'<text class="edge-label" x="{mid_x:.1f}" y="{mid_y:.1f}">{html.escape(label)}</text>'
             )
         for node, attrs in graph.nodes(data=True):
             x_pos, y_pos = pos[node]
             x_value = int(attrs.get("x", 0))
+            is_source = bool(attrs.get("is_source", False))
             fill = "#f8fafc"
             stroke = "#111827"
             if solved:
@@ -660,14 +711,25 @@ class MainWindow(QMainWindow):
             stroke_width = 4 if attrs.get("fixed_dev", False) else 1.5
             if solved:
                 stroke_width = 4
+            dash = ' stroke-dasharray="6 4"' if solved and is_source else ""
             display_id = str(attrs.get("display_id", node))
             node_name = str(attrs.get("name", node))
-            meta = f"{place}: {compute:g} ms" if solved else f"D:{float(attrs['c_dev']):g} / H:{float(attrs['c_host']):g} ms"
+            source_period = float(attrs.get("source_period_ms", 0.0))
+            source_phase = float(attrs.get("source_phase_ms", 0.0))
+            source_text = ""
+            if source_period > 0 or source_phase > 0:
+                source_text = f" / src period:{source_period:g} ms phase:{source_phase:g} ms"
+            if solved and is_source:
+                meta = f"source event: 0 ms{source_text}"
+            elif solved:
+                meta = f"{place}: {compute:g} ms{source_text}"
+            else:
+                meta = f"D:{float(attrs['c_dev']):g} / H:{float(attrs['c_host']):g} ms{source_text}"
             id_fill = "#111827"
             rows.append(
                 f'<g><title>{html.escape(str(node))} {html.escape(node_name)} - {html.escape(meta)}</title>'
                 f'<text class="node-name" x="{x_pos:.1f}" y="{y_pos - 43:.1f}">{html.escape(node_name)}</text>'
-                f'<circle cx="{x_pos:.1f}" cy="{y_pos:.1f}" r="24" fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}" />'
+                f'<circle cx="{x_pos:.1f}" cy="{y_pos:.1f}" r="24" fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}"{dash} />'
                 f'<text class="node-id" style="fill:{id_fill}" x="{x_pos:.1f}" y="{y_pos + 5:.1f}">{html.escape(display_id)}</text>'
                 f'<text class="compute" x="{x_pos:.1f}" y="{y_pos + 48:.1f}">{html.escape(meta)}</text></g>'
             )
@@ -715,6 +777,9 @@ class MainWindow(QMainWindow):
                     layer=base_layers[node] + frame * (len(set(base_layers.values())) + 1),
                     c_dev=attrs["c_dev"],
                     c_host=attrs["c_host"],
+                    source_period_ms=attrs.get("source_period_ms", 0.0),
+                    source_phase_ms=attrs.get("source_phase_ms", 0.0),
+                    is_source=self.graph.in_degree(node) == 0,
                     fixed_dev=attrs.get("fixed_dev", False),
                     x=result.assignment[node],
                 )
@@ -728,6 +793,15 @@ class MainWindow(QMainWindow):
         if unroll > 1:
             for frame in range(1, unroll):
                 for node in self.graph.nodes:
+                    if self.graph.in_degree(node) == 0:
+                        graph.add_edge(
+                            self._op_id(str(node), frame - 1, unroll),
+                            self._op_id(str(node), frame, unroll),
+                            size=0.0,
+                            kind="source_period",
+                            period=float(self.graph.nodes[node].get("source_period_ms", 0.0)),
+                        )
+                        continue
                     graph.add_edge(
                         self._op_id(str(node), frame - 1, unroll),
                         self._op_id(str(node), frame, unroll),
@@ -794,15 +868,39 @@ class MainWindow(QMainWindow):
         assignment = self.solver_result.assignment
         environment = self._environment_from_controls()
 
-        total_ms = max(1.0, max(metrics.finish_times.values()) if metrics.finish_times else 1.0)
+        source_nodes = [str(node) for node in self.graph.nodes if self.graph.in_degree(node) == 0]
+        max_release_ms = max(
+            (
+                self._source_release_time(node, frame)
+                for node in source_nodes
+                for frame in range(max(1, metrics.pipeline_unroll))
+            ),
+            default=0.0,
+        )
+        total_ms = max(
+            1.0,
+            max(metrics.finish_times.values()) if metrics.finish_times else 1.0,
+            max_release_ms,
+        )
         px_per_ms = 9.0
         left_pad = 120.0
         right_pad = 80.0
         top_pad = 42.0
         lane_height = 58.0
-        lane_y = {1: top_pad, "transfer": top_pad + lane_height, 0: top_pad + lane_height * 2}
+        input_lane_height = max(lane_height, 28.0 * max(1, len(source_nodes)))
+        input_top = top_pad
+        lane_y = {
+            "input": input_top + input_lane_height / 2.0,
+            1: input_top + input_lane_height + lane_height,
+            "transfer": input_top + input_lane_height + lane_height * 2,
+            0: input_top + input_lane_height + lane_height * 3,
+        }
+        source_lane_y = {
+            node: input_top + 22.0 + index * 28.0
+            for index, node in enumerate(sorted(source_nodes))
+        }
         width = int(left_pad + total_ms * px_per_ms + right_pad)
-        height = int(top_pad + lane_height * 3 + 50)
+        height = int(input_top + input_lane_height + lane_height * 3 + 50)
 
         def esc(value: object) -> str:
             return html.escape(str(value), quote=True)
@@ -811,7 +909,12 @@ class MainWindow(QMainWindow):
             return left_pad + ms * px_per_ms
 
         rows = []
-        for label, y_pos in [("Host", lane_y[1]), ("Transfer", lane_y["transfer"]), ("Device", lane_y[0])]:
+        for label, y_pos in [
+            ("Input", lane_y["input"]),
+            ("Host", lane_y[1]),
+            ("Transfer", lane_y["transfer"]),
+            ("Device", lane_y[0]),
+        ]:
             rows.append(
                 f'<line class="lane" x1="0" y1="{y_pos}" x2="{width}" y2="{y_pos}" />'
                 f'<text class="lane-label" x="16" y="{y_pos + 5}">{label}</text>'
@@ -827,8 +930,44 @@ class MainWindow(QMainWindow):
             )
             tick += tick_step
 
+        for node in source_nodes:
+            period = float(self.graph.nodes[node].get("source_period_ms", 0.0))
+            if period <= 0:
+                continue
+            y_center = source_lane_y[node]
+            node_name = esc(self.graph.nodes[node].get("name", node))
+            rows.append(
+                f'<text class="source-lane-label" x="{left_pad - 10:.1f}" y="{y_center + 4:.1f}">{node_name}</text>'
+            )
+            releases = [
+                self._source_release_time(node, frame)
+                for frame in range(max(1, metrics.pipeline_unroll))
+            ]
+            for frame in range(1, len(releases)):
+                start = releases[frame - 1]
+                finish = releases[frame]
+                x_pos = x_at(start)
+                span = max(6.0, (finish - start) * px_per_ms)
+                rows.append(
+                    f'<rect class="source-span" data-start="{start:.6f}" data-duration="{finish - start:.6f}" '
+                    f'x="{x_pos:.1f}" y="{y_center - 8:.1f}" width="{span:.1f}" height="16" rx="3">'
+                    f'<title>{node_name}: period span {start:.1f}-{finish:.1f} ms</title></rect>'
+                )
+            for frame in range(max(1, metrics.pipeline_unroll)):
+                release = releases[frame]
+                x_pos = x_at(release)
+                label = f"{node} f{frame}" if metrics.pipeline_unroll > 1 else node
+                rows.append(
+                    f'<g><title>{esc(label)} source release at {release:.1f} ms; period {period:g} ms</title>'
+                    f'<line class="release" data-ms="{release:.6f}" x1="{x_pos:.1f}" y1="{y_center - 13:.1f}" x2="{x_pos:.1f}" y2="{y_center + 13:.1f}" />'
+                    f'<circle class="release-dot" data-ms="{release:.6f}" cx="{x_pos:.1f}" cy="{y_center:.1f}" r="4" />'
+                    f'<text class="release-label" data-ms="{release:.6f}" x="{x_pos:.1f}" y="{y_center - 16:.1f}">f{frame}</text></g>'
+                )
+
         for node in sorted(metrics.start_times, key=lambda n: metrics.start_times[n]):
             base_node = self._base_node_id(node)
+            if base_node in source_nodes:
+                continue
             start = metrics.start_times[node]
             finish = metrics.finish_times[node]
             duration = max(0.1, finish - start)
@@ -941,6 +1080,8 @@ class MainWindow(QMainWindow):
       if (el.tagName === 'line') {{
         el.setAttribute('x1', x);
         el.setAttribute('x2', x);
+      }} else if (el.tagName === 'circle') {{
+        el.setAttribute('cx', x);
       }} else {{
         el.setAttribute('x', x);
       }}
@@ -992,6 +1133,11 @@ class MainWindow(QMainWindow):
   .lane-label {{ font-size: 12px; font-weight: 700; fill: #374151; }}
   .tick {{ stroke: #eef2f7; stroke-width: 1; }}
   .tick-label {{ font-size: 10px; fill: #6b7280; text-anchor: middle; }}
+  .release {{ stroke: #be123c; stroke-width: 1.5; stroke-dasharray: 4 4; }}
+  .release-dot {{ fill: #be123c; stroke: #ffffff; stroke-width: 1.5; }}
+  .release-label {{ font-size: 10px; fill: #be123c; font-weight: 700; text-anchor: middle; paint-order: stroke; stroke: #ffffff; stroke-width: 3px; stroke-linejoin: round; }}
+  .source-span {{ fill: #fff1f2; stroke: #be123c; stroke-width: 1.5; stroke-dasharray: 6 4; }}
+  .source-lane-label {{ fill: #7f1d1d; font-size: 10px; font-weight: 700; text-anchor: end; }}
   .op {{ stroke: #111827; stroke-width: 1; }}
   .op-id {{ fill: #ffffff; font-size: 11px; font-weight: 700; text-anchor: middle; pointer-events: none; }}
   .op-id-dark {{ fill: #111827; stroke: none; }}

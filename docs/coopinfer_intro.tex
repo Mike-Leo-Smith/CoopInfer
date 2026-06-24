@@ -94,6 +94,7 @@
     \item Node attributes:
       \begin{itemize}
         \item \texttt{id}, \texttt{name}, \texttt{c\_dev}, \texttt{c\_host}, \texttt{fixed\_dev}, \texttt{x}.
+        \item Optional input cadence fields: \texttt{source\_period\_ms}, \texttt{source\_phase\_ms}.
       \end{itemize}
     \item Edge attributes:
       \begin{itemize}
@@ -144,13 +145,18 @@
   For each node $i$ in topological order:
   \[
     DataReady_i =
-    \max_{j \in pred(i)}
-    \left(
-      F_j +
-      \mathbb{I}(x_j \neq x_i)
-      \left(L + \frac{s_{ji}}{B}\right)
+    \max\left(
+      release_i(f),
+      \max_{j \in pred(i)}
+      \left[
+        F_j +
+        \mathbb{I}(x_j \neq x_i)
+        \left(L + \frac{s_{ji}}{B}\right)
+      \right]
     \right)
   \]
+  where input/source nodes may use $release_i(f)=phase_i+f\cdot period_i$ for frame $f$.
+  Source nodes are zero-duration external events: they do not occupy the device or host worker queues, and later releases may occur while older frames are still being processed downstream.
   \vspace{0.5em}
   The evaluator then waits for the selected worker queue:
   \[

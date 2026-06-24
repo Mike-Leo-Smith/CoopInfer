@@ -40,6 +40,8 @@ def graph_from_records(
             c_dev=float(node["c_dev"]),
             c_host=float(node["c_host"]),
             fixed_dev=bool(node.get("fixed_dev", False)),
+            source_period_ms=float(node.get("source_period_ms", 0.0)),
+            source_phase_ms=float(node.get("source_phase_ms", 0.0)),
             x=int(node.get("x", 0 if node.get("fixed_dev", False) else 1)),
         )
 
@@ -62,6 +64,8 @@ def records_from_graph(graph: nx.DiGraph) -> Tuple[List[Dict[str, Any]], List[Di
                 "c_dev": float(attrs["c_dev"]),
                 "c_host": float(attrs["c_host"]),
                 "fixed_dev": bool(attrs.get("fixed_dev", False)),
+                "source_period_ms": float(attrs.get("source_period_ms", 0.0)),
+                "source_phase_ms": float(attrs.get("source_phase_ms", 0.0)),
             }
         )
 

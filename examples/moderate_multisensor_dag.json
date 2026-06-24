@@ -1,0 +1,153 @@
+{
+  "version": "1.0",
+  "nodes": [
+    {
+      "id": "rgb_input",
+      "name": "RGB Camera Input",
+      "c_dev": 4.0,
+      "c_host": 1.5,
+      "source_period_ms": 33.333,
+      "source_phase_ms": 0.0,
+      "fixed_dev": true
+    },
+    {
+      "id": "depth_input",
+      "name": "Depth Camera Input",
+      "c_dev": 5.0,
+      "c_host": 2.0,
+      "source_period_ms": 33.333,
+      "source_phase_ms": 4.0,
+      "fixed_dev": true
+    },
+    {
+      "id": "imu_input",
+      "name": "IMU Input",
+      "c_dev": 1.0,
+      "c_host": 0.5,
+      "source_period_ms": 10.0,
+      "source_phase_ms": 0.0,
+      "fixed_dev": true
+    },
+    {
+      "id": "rgb_preprocess",
+      "name": "RGB Preprocess",
+      "c_dev": 10.0,
+      "c_host": 3.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "depth_preprocess",
+      "name": "Depth Preprocess",
+      "c_dev": 12.0,
+      "c_host": 3.5,
+      "fixed_dev": false
+    },
+    {
+      "id": "feature_backbone",
+      "name": "Shared Feature Backbone",
+      "c_dev": 44.0,
+      "c_host": 9.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "depth_refine",
+      "name": "Depth Refinement",
+      "c_dev": 26.0,
+      "c_host": 6.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "imu_filter",
+      "name": "IMU Filter",
+      "c_dev": 5.0,
+      "c_host": 1.5,
+      "fixed_dev": false
+    },
+    {
+      "id": "pose_estimator",
+      "name": "Pose Estimator",
+      "c_dev": 18.0,
+      "c_host": 5.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "scene_fusion",
+      "name": "Scene Fusion",
+      "c_dev": 30.0,
+      "c_host": 7.0,
+      "fixed_dev": false
+    },
+    {
+      "id": "policy_head",
+      "name": "Policy Head",
+      "c_dev": 14.0,
+      "c_host": 4.0,
+      "fixed_dev": true
+    }
+  ],
+  "edges": [
+    {
+      "source": "rgb_input",
+      "target": "rgb_preprocess",
+      "size": 3.0
+    },
+    {
+      "source": "depth_input",
+      "target": "depth_preprocess",
+      "size": 2.4
+    },
+    {
+      "source": "rgb_preprocess",
+      "target": "feature_backbone",
+      "size": 2.0
+    },
+    {
+      "source": "depth_preprocess",
+      "target": "depth_refine",
+      "size": 1.6
+    },
+    {
+      "source": "feature_backbone",
+      "target": "scene_fusion",
+      "size": 5.0
+    },
+    {
+      "source": "depth_refine",
+      "target": "scene_fusion",
+      "size": 3.5
+    },
+    {
+      "source": "imu_input",
+      "target": "imu_filter",
+      "size": 0.2
+    },
+    {
+      "source": "imu_filter",
+      "target": "pose_estimator",
+      "size": 0.3
+    },
+    {
+      "source": "feature_backbone",
+      "target": "pose_estimator",
+      "size": 1.0
+    },
+    {
+      "source": "pose_estimator",
+      "target": "scene_fusion",
+      "size": 0.8
+    },
+    {
+      "source": "scene_fusion",
+      "target": "policy_head",
+      "size": 1.2
+    }
+  ],
+  "environment": {
+    "bandwidth": 80.0,
+    "latency": 4.0,
+    "weight_latency": 0.75,
+    "latency_limit": 150.0,
+    "batch_transfers": true,
+    "pipeline_unroll": 3
+  }
+}

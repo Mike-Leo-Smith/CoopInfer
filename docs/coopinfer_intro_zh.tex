@@ -92,6 +92,7 @@
     \item 节点属性：
       \begin{itemize}
         \item \texttt{id}, \texttt{name}, \texttt{c\_dev}, \texttt{c\_host}, \texttt{fixed\_dev}, \texttt{x}
+        \item 可选输入频率字段：\texttt{source\_period\_ms}, \texttt{source\_phase\_ms}
       \end{itemize}
     \item 边属性：
       \begin{itemize}
@@ -142,13 +143,18 @@
   对 DAG 按拓扑序遍历。对节点 $i$：
   \[
     DataReady_i =
-    \max_{j \in pred(i)}
-    \left(
-      F_j +
-      \mathbb{I}(x_j \neq x_i)
-      \left(L + \frac{s_{ji}}{B}\right)
+    \max\left(
+      release_i(f),
+      \max_{j \in pred(i)}
+      \left[
+        F_j +
+        \mathbb{I}(x_j \neq x_i)
+        \left(L + \frac{s_{ji}}{B}\right)
+      \right]
     \right)
   \]
+  输入源节点可使用 $release_i(f)=phase_i+f\cdot period_i$ 表示第 $f$ 帧的生成时刻。
+  源节点是零耗时的外部输入事件，不占用端侧或边侧计算队列；后续帧输入可以在前一帧下游计算尚未完成时继续按周期到达。
   \vspace{0.5em}
   数据就绪后，还要等待目标设备队列空闲：
   \[
