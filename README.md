@@ -29,12 +29,15 @@ The application stores graph topology, node/edge costs, environment parameters, 
 - The optional `batch_transfers` environment flag groups multiple outgoing cross-device transfers from the same source node into one network transaction. The batch pays fixed latency once and still pays bandwidth time for the summed payload size.
 - `pipeline_unroll` repeats the same DAG for multiple frames to model pipeline parallelism across consecutive inputs. The evaluator enforces FIFO ordering for the same logical node label across frames, while device, host, and network queues can overlap different labels from different frames.
 - Source nodes can define `source_period_ms` and `source_phase_ms`. For unrolled pipelines, frame `f` of that input is released at `source_phase_ms + f * source_period_ms`. These nodes are independent zero-duration input events: they do not consume device/host compute queues and their successive frames may overlap downstream work.
-- Device utilization is reported as `device_active_time / total_pipeline_makespan`, not as a static sum of assigned node costs.
+- End-to-end latency excludes source/input events. It is measured from the first non-input compute or transfer event to the last non-input output node finish, then amortized over `pipeline_unroll`.
+- Max-frame latency is the worst per-frame version of the same input-excluded window.
+- Device utilization is reported as active device compute time over the same input-excluded pipeline span, not as a static sum of assigned node costs.
+- The objective is an explicit weighted sum: `weight_avg_latency * L_avg + weight_max_latency * L_max + weight_device_utilization * L_util`. Each weight is in `[0, 1]`. `L_avg` and `L_max` are normalized by all-device/all-host baseline scales; `L_util` is `1 - device_utilization`.
 - The solver can run Auto, Enumerate, Random Search, or Simulated Annealing. Auto uses enumeration for up to 12 free nodes and random search beyond that.
-- `latency_limit` is an optional E2E latency cap in milliseconds. Use `0` to disable it; assignments above a positive limit are rejected.
-- The GUI has two topology views: the config DAG before solving, and the solved unrolled pipeline with placement, transfer, and FIFO edges.
-- The timeline visualizes the evaluator's actual compute and transfer records, including serialized, batched, and unrolled pipeline transfers.
-- Solver search and repeated schedule evaluation run through a C++ extension built with CMake/scikit-build-core. If the extension is unavailable in a source checkout, the Python implementation is used as a fallback.
+- `latency_limit` is an optional amortized E2E latency cap in milliseconds. `max_frame_latency_limit` is an optional worst-frame E2E cap. Use `0` to disable either limit; assignments above a positive limit are rejected.
+- The GUI has two topology views: the config DAG before solving, and the solved unrolled pipeline with placement, transfer, and FIFO edges. In solved views, node fill color identifies the frame; device/host placement is shown by the node outline.
+- The timeline visualizes the evaluator's actual compute and transfer records, including serialized, batched, and unrolled pipeline transfers. Input releases, transfer bars, and vertical dependency/release lines reuse the same high-contrast frame colors as the filled pipeline nodes.
+- Solver search and all schedule/performance evaluation run through a required C++ extension built with CMake/scikit-build-core. Python modules handle validation, JSON IO, GUI wiring, and native-core bindings.
 
 ## JSON Environment Fields
 
@@ -42,8 +45,11 @@ The application stores graph topology, node/edge costs, environment parameters, 
 {
   "bandwidth": 50.0,
   "latency": 5.0,
-  "weight_latency": 0.7,
+  "weight_avg_latency": 0.7,
+  "weight_max_latency": 0.3,
+  "weight_device_utilization": 0.3,
   "latency_limit": 120.0,
+  "max_frame_latency_limit": 180.0,
   "batch_transfers": false,
   "pipeline_unroll": 1
 }
@@ -62,3 +68,7 @@ Load one of the bundled examples from the GUI:
 ```bash
 python -m pytest
 ```
+
+## Wheels
+
+GitHub Actions builds wheel artifacts for Linux, Windows, and macOS through `cibuildwheel` on pushes, pull requests, and manual dispatches.

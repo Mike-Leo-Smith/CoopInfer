@@ -22,6 +22,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "cmake>=3.18",
+    "cibuildwheel>=2.20",
     "ninja>=1.11",
     "pytest>=7.0",
     "pybind11>=2.12",
@@ -31,6 +32,15 @@ dev = [
 [tool.scikit-build]
 cmake.version = ">=3.18"
 wheel.packages = ["src/coopinfer"]
+
+[tool.cibuildwheel]
+build = "cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip = "*-musllinux_*"
+test-command = "python -m pytest {project}/tests"
+test-requires = ["pytest>=7.0"]
+
+[tool.cibuildwheel.linux]
+manylinux-x86_64-image = "manylinux_2_34"
 
 [project.scripts]
 coopinfer = "coopinfer.app:main"

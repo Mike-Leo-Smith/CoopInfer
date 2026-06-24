@@ -31,7 +31,14 @@ from PyQt6.QtWidgets import (
 )
 
 from .evaluator import edge_transfer_ms
-from .model import Environment, ProjectState, graph_from_records, load_from_json, save_to_json
+from .model import (
+    Environment,
+    ProjectState,
+    graph_from_records,
+    load_from_json,
+    save_to_json,
+    validate_environment,
+)
 from .solver import SolverResult, solve
 
 
@@ -131,7 +138,7 @@ class MainWindow(QMainWindow):
 
     def _build_environment_group(self) -> QGroupBox:
         group = QGroupBox("环境与策略 (Environment)")
-        group.setMinimumHeight(190)
+        group.setMinimumHeight(300)
         layout = QGridLayout(group)
 
         self.bandwidth_spin = QDoubleSpinBox()
@@ -153,13 +160,25 @@ class MainWindow(QMainWindow):
         self.latency_limit_spin.setSpecialValueText("No limit")
         self.latency_limit_spin.setValue(0.0)
 
-        self.weight_slider = QSlider(Qt.Orientation.Horizontal)
-        self.weight_slider.setRange(0, 100)
-        self.weight_slider.setValue(70)
-        self.weight_label = QLabel("0.70")
-        self.weight_slider.valueChanged.connect(
-            lambda value: self.weight_label.setText(f"{value / 100.0:.2f}")
-        )
+        self.max_frame_latency_limit_spin = QDoubleSpinBox()
+        self.max_frame_latency_limit_spin.setRange(0.0, 1_000_000.0)
+        self.max_frame_latency_limit_spin.setDecimals(3)
+        self.max_frame_latency_limit_spin.setSuffix(" ms")
+        self.max_frame_latency_limit_spin.setSpecialValueText("No limit")
+        self.max_frame_latency_limit_spin.setValue(0.0)
+
+        (
+            self.weight_avg_latency_slider,
+            self.weight_avg_latency_label,
+        ) = self._objective_weight_slider(0.7)
+        (
+            self.weight_max_latency_slider,
+            self.weight_max_latency_label,
+        ) = self._objective_weight_slider(0.3)
+        (
+            self.weight_device_utilization_slider,
+            self.weight_device_utilization_label,
+        ) = self._objective_weight_slider(0.3)
         self.algorithm_combo = QComboBox()
         self.algorithm_combo.addItems(
             ["Auto", "Enumerate", "Random Search", "Simulated Annealing"]
@@ -176,23 +195,46 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.bandwidth_spin, 0, 1)
         layout.addWidget(QLabel("Latency"), 1, 0)
         layout.addWidget(self.latency_spin, 1, 1)
-        layout.addWidget(QLabel("E2E Limit"), 2, 0)
+        layout.addWidget(QLabel("Avg E2E Limit"), 2, 0)
         layout.addWidget(self.latency_limit_spin, 2, 1)
-        layout.addWidget(QLabel("Weight w"), 3, 0)
-        layout.addWidget(self.weight_slider, 3, 1)
-        layout.addWidget(self.weight_label, 3, 2)
-        weight_hint = QLabel("0 = prefer device utilization, 1 = prefer low latency")
+        layout.addWidget(QLabel("Max Frame Limit"), 3, 0)
+        layout.addWidget(self.max_frame_latency_limit_spin, 3, 1)
+        layout.addWidget(QLabel("w Avg E2E"), 4, 0)
+        layout.addWidget(self.weight_avg_latency_slider, 4, 1)
+        layout.addWidget(self.weight_avg_latency_label, 4, 2)
+        layout.addWidget(QLabel("w Max E2E"), 5, 0)
+        layout.addWidget(self.weight_max_latency_slider, 5, 1)
+        layout.addWidget(self.weight_max_latency_label, 5, 2)
+        layout.addWidget(QLabel("w Device Util"), 6, 0)
+        layout.addWidget(self.weight_device_utilization_slider, 6, 1)
+        layout.addWidget(self.weight_device_utilization_label, 6, 2)
+        weight_hint = QLabel("Loss = w_avg * L_avg + w_max * L_max + w_util * L_util")
         weight_hint.setStyleSheet("color: #6b7280;")
-        layout.addWidget(weight_hint, 4, 1, 1, 2)
-        layout.addWidget(QLabel("Network"), 5, 0)
-        layout.addWidget(self.batch_transfers_check, 5, 1, 1, 2)
-        layout.addWidget(QLabel("Pipeline Unroll"), 6, 0)
-        layout.addWidget(self.pipeline_unroll_spin, 6, 1, 1, 2)
-        layout.addWidget(QLabel("Solver"), 7, 0)
-        layout.addWidget(self.algorithm_combo, 7, 1, 1, 2)
-        layout.addWidget(QLabel("Iterations"), 8, 0)
-        layout.addWidget(self.iterations_spin, 8, 1, 1, 2)
+        layout.addWidget(weight_hint, 7, 1, 1, 2)
+        layout.addWidget(QLabel("Network"), 8, 0)
+        layout.addWidget(self.batch_transfers_check, 8, 1, 1, 2)
+        layout.addWidget(QLabel("Pipeline Unroll"), 9, 0)
+        layout.addWidget(self.pipeline_unroll_spin, 9, 1, 1, 2)
+        layout.addWidget(QLabel("Solver"), 10, 0)
+        layout.addWidget(self.algorithm_combo, 10, 1, 1, 2)
+        layout.addWidget(QLabel("Iterations"), 11, 0)
+        layout.addWidget(self.iterations_spin, 11, 1, 1, 2)
         return group
+
+    def _objective_weight_slider(self, default: float) -> Tuple[QSlider, QLabel]:
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(0, 100)
+        slider.setSingleStep(1)
+        slider.setPageStep(10)
+        slider.setTickInterval(25)
+        slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        label = QLabel()
+        label.setMinimumWidth(44)
+        label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        slider.valueChanged.connect(lambda value: label.setText(f"{value / 100.0:.2f}"))
+        slider.setValue(round(default * 100))
+        label.setText(f"{slider.value() / 100.0:.2f}")
+        return slider, label
 
     def _build_actions_group(self) -> QGroupBox:
         group = QGroupBox("操作 (Actions)")
@@ -234,17 +276,19 @@ class MainWindow(QMainWindow):
         schedule_splitter.addWidget(graph_splitter)
 
         metrics_group = QGroupBox("性能看板")
-        metrics_group.setMinimumHeight(82)
-        metrics_group.setMaximumHeight(96)
+        metrics_group.setMinimumHeight(108)
+        metrics_group.setMaximumHeight(128)
         metrics_layout = QGridLayout(metrics_group)
         self.latency_label = QLabel("端到端时延: -- ms")
         self.util_label = QLabel("端侧算力利用率: -- %")
         self.loss_label = QLabel("最优 Loss: --")
+        self.loss_terms_label = QLabel("Loss terms: --")
         self.mode_label = QLabel("求解模式: --")
         metrics_layout.addWidget(self.latency_label, 0, 0)
         metrics_layout.addWidget(self.util_label, 0, 1)
         metrics_layout.addWidget(self.loss_label, 1, 0)
         metrics_layout.addWidget(self.mode_label, 1, 1)
+        metrics_layout.addWidget(self.loss_terms_label, 2, 0, 1, 2)
 
         timeline_group = QGroupBox("时序图 (Solved Schedule)")
         timeline_group.setMinimumHeight(150)
@@ -324,7 +368,19 @@ class MainWindow(QMainWindow):
             self.bandwidth_spin.setValue(environment.bandwidth)
             self.latency_spin.setValue(environment.latency)
             self.latency_limit_spin.setValue(environment.latency_limit)
-            self.weight_slider.setValue(round(environment.weight_latency * 100))
+            self.max_frame_latency_limit_spin.setValue(environment.max_frame_latency_limit)
+            self._set_objective_slider_value(
+                self.weight_avg_latency_slider,
+                environment.weight_avg_latency,
+            )
+            self._set_objective_slider_value(
+                self.weight_max_latency_slider,
+                environment.weight_max_latency,
+            )
+            self._set_objective_slider_value(
+                self.weight_device_utilization_slider,
+                environment.weight_device_utilization,
+            )
             self.batch_transfers_check.setChecked(environment.batch_transfers)
             self.pipeline_unroll_spin.setValue(environment.pipeline_unroll)
         finally:
@@ -399,6 +455,7 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "Save failed", str(exc))
             return
+        self._preserve_known_assignments(graph)
 
         path, _ = QFileDialog.getSaveFileName(self, "Save configuration", "", "JSON (*.json)")
         if not path:
@@ -437,12 +494,15 @@ class MainWindow(QMainWindow):
                 graph,
                 bandwidth=environment.bandwidth,
                 latency=environment.latency,
-                weight_latency=environment.weight_latency,
+                weight_avg_latency=environment.weight_avg_latency,
+                weight_max_latency=environment.weight_max_latency,
+                weight_device_utilization=environment.weight_device_utilization,
                 algorithm=self.algorithm_combo.currentText(),
                 heuristic_iterations=self.iterations_spin.value(),
                 latency_limit=environment.latency_limit,
                 batch_transfers=environment.batch_transfers,
                 pipeline_unroll=environment.pipeline_unroll,
+                max_frame_latency_limit=environment.max_frame_latency_limit,
             )
         except Exception as exc:
             QMessageBox.warning(self, "Solve failed", str(exc))
@@ -525,14 +585,40 @@ class MainWindow(QMainWindow):
         return nodes, edges
 
     def _environment_from_controls(self) -> Environment:
-        return Environment(
-            bandwidth=self.bandwidth_spin.value(),
-            latency=self.latency_spin.value(),
-            weight_latency=self.weight_slider.value() / 100.0,
-            latency_limit=self.latency_limit_spin.value(),
-            batch_transfers=self.batch_transfers_check.isChecked(),
-            pipeline_unroll=self.pipeline_unroll_spin.value(),
+        return validate_environment(
+            Environment(
+                bandwidth=self.bandwidth_spin.value(),
+                latency=self.latency_spin.value(),
+                weight_avg_latency=self._objective_slider_value(
+                    self.weight_avg_latency_slider
+                ),
+                weight_max_latency=self._objective_slider_value(
+                    self.weight_max_latency_slider
+                ),
+                weight_device_utilization=self._objective_slider_value(
+                    self.weight_device_utilization_slider
+                ),
+                latency_limit=self.latency_limit_spin.value(),
+                batch_transfers=self.batch_transfers_check.isChecked(),
+                pipeline_unroll=self.pipeline_unroll_spin.value(),
+                max_frame_latency_limit=self.max_frame_latency_limit_spin.value(),
+            )
         )
+
+    def _objective_slider_value(self, slider: QSlider) -> float:
+        return slider.value() / 100.0
+
+    def _set_objective_slider_value(self, slider: QSlider, value: float) -> None:
+        slider.setValue(round(max(0.0, min(1.0, value)) * 100))
+
+    def _preserve_known_assignments(self, graph: nx.DiGraph) -> None:
+        for node, attrs in graph.nodes(data=True):
+            if attrs.get("fixed_dev", False):
+                attrs["x"] = 0
+            elif self.solver_result is not None and node in self.solver_result.assignment:
+                attrs["x"] = int(self.solver_result.assignment[node])
+            elif node in self.graph and "x" in self.graph.nodes[node]:
+                attrs["x"] = int(self.graph.nodes[node]["x"])
 
     def _op_id(self, node: str, frame: int, unroll: int) -> str:
         return node if unroll == 1 else f"{node}[f{frame}]"
@@ -644,22 +730,30 @@ class MainWindow(QMainWindow):
         width = int(max(x for x, _ in pos.values()) + right_pad)
         height = int(max(y for _, y in pos.values()) + bottom_pad)
         environment = self._environment_from_controls()
+        frame_markers = "".join(
+            f'<marker id="arrow-frame-{index}" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">'
+            f'<path d="M0,0 L10,4 L0,8 z" fill="{self._frame_color(index)}"/></marker>'
+            for index in range(8)
+        )
         rows = [
             '<defs><marker id="arrow-gray" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="#6b7280"/></marker>',
             '<marker id="arrow-red" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="#dc2626"/></marker>',
-            '<marker id="arrow-purple" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="#7c3aed"/></marker></defs>',
+            f'<marker id="arrow-purple" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="#7c3aed"/></marker>{frame_markers}</defs>',
         ]
         for source, target, attrs in graph.edges(data=True):
             sx, sy = pos[source]
             tx, ty = pos[target]
             size_mb = float(attrs.get("size", 0.0))
+            frame_index = int(graph.nodes[source].get("frame", 0))
+            frame_color = self._frame_color(frame_index)
+            frame_marker = f"arrow-frame-{frame_index % 8}"
             if attrs.get("kind") == "fifo":
-                color = "#7c3aed"
+                color = frame_color
                 dash = ' stroke-dasharray="3 5"'
-                marker = "arrow-purple"
+                marker = frame_marker
                 label = "FIFO"
             elif attrs.get("kind") == "source_period":
-                color = "#be123c"
+                color = frame_color
                 dash = ' stroke-dasharray="6 4"'
                 marker = ""
                 label = f"period {float(attrs.get('period', 0.0)):g} ms"
@@ -669,14 +763,14 @@ class MainWindow(QMainWindow):
                 marker = "arrow-gray"
                 label = f"{size_mb:g} MB"
             elif int(graph.nodes[source].get("x", 0)) == int(graph.nodes[target].get("x", 0)):
-                color = "#6b7280"
+                color = frame_color
                 dash = ""
-                marker = "arrow-gray"
+                marker = frame_marker
                 label = "local / 0 ms"
             else:
-                color = "#dc2626"
+                color = frame_color
                 dash = ' stroke-dasharray="7 5"'
-                marker = "arrow-red"
+                marker = frame_marker
                 transfer_ms = edge_transfer_ms(size_mb, environment.bandwidth, environment.latency)
                 label = f"{size_mb:g} MB / {transfer_ms:.1f} ms"
             dx = tx - sx
@@ -720,7 +814,7 @@ class MainWindow(QMainWindow):
             if source_period > 0 or source_phase > 0:
                 source_text = f" / src period:{source_period:g} ms phase:{source_phase:g} ms"
             if solved and is_source:
-                meta = f"source event: 0 ms{source_text}"
+                meta = f"source event: {float(attrs.get('release_ms', 0.0)):g} ms{source_text}"
             elif solved:
                 meta = f"{place}: {compute:g} ms{source_text}"
             else:
@@ -744,14 +838,14 @@ class MainWindow(QMainWindow):
 
     def _frame_color(self, frame: int) -> str:
         palette = [
-            "#dbeafe",
-            "#fef3c7",
-            "#dcfce7",
-            "#fce7f3",
-            "#ede9fe",
-            "#ccfbf1",
-            "#fee2e2",
-            "#e0f2fe",
+            "#93c5fd",
+            "#fbbf24",
+            "#86efac",
+            "#f9a8d4",
+            "#c4b5fd",
+            "#5eead4",
+            "#fca5a5",
+            "#7dd3fc",
         ]
         return palette[frame % len(palette)]
 
@@ -779,6 +873,7 @@ class MainWindow(QMainWindow):
                     c_host=attrs["c_host"],
                     source_period_ms=attrs.get("source_period_ms", 0.0),
                     source_phase_ms=attrs.get("source_phase_ms", 0.0),
+                    release_ms=self._source_release_time(str(node), frame),
                     is_source=self.graph.in_degree(node) == 0,
                     fixed_dev=attrs.get("fixed_dev", False),
                     x=result.assignment[node],
@@ -836,7 +931,8 @@ class MainWindow(QMainWindow):
     def _update_metrics(self, result: SolverResult) -> None:
         if result.metrics.pipeline_unroll > 1:
             self.latency_label.setText(
-                f"平均端到端时延: {result.metrics.latency:.1f} ms/frame "
+                f"平均时延: {result.metrics.latency:.1f} ms/frame; "
+                f"最大E2E: {result.metrics.max_frame_latency:.1f} ms "
                 f"(unroll {result.metrics.pipeline_unroll})"
             )
         else:
@@ -845,12 +941,19 @@ class MainWindow(QMainWindow):
             f"端侧算力利用率: {result.metrics.device_utilization * 100.0:.1f} %"
         )
         self.loss_label.setText(f"最优 Loss: {result.metrics.loss:.3f}")
+        self.loss_terms_label.setText(
+            "Loss terms: "
+            f"L_avg={result.metrics.avg_latency_loss:.3f}, "
+            f"L_max={result.metrics.max_frame_latency_loss:.3f}, "
+            f"L_util={result.metrics.device_utilization_loss:.3f}"
+        )
         self.mode_label.setText(f"求解模式: {result.mode} ({result.iterations})")
 
     def _clear_metrics(self) -> None:
         self.latency_label.setText("端到端时延: -- ms")
         self.util_label.setText("端侧算力利用率: -- %")
         self.loss_label.setText("最优 Loss: --")
+        self.loss_terms_label.setText("Loss terms: --")
         self.mode_label.setText("求解模式: --")
 
     def _draw_timeline(self) -> None:
@@ -932,8 +1035,6 @@ class MainWindow(QMainWindow):
 
         for node in source_nodes:
             period = float(self.graph.nodes[node].get("source_period_ms", 0.0))
-            if period <= 0:
-                continue
             y_center = source_lane_y[node]
             node_name = esc(self.graph.nodes[node].get("name", node))
             rows.append(
@@ -943,24 +1044,33 @@ class MainWindow(QMainWindow):
                 self._source_release_time(node, frame)
                 for frame in range(max(1, metrics.pipeline_unroll))
             ]
-            for frame in range(1, len(releases)):
-                start = releases[frame - 1]
-                finish = releases[frame]
-                x_pos = x_at(start)
-                span = max(6.0, (finish - start) * px_per_ms)
-                rows.append(
-                    f'<rect class="source-span" data-start="{start:.6f}" data-duration="{finish - start:.6f}" '
-                    f'x="{x_pos:.1f}" y="{y_center - 8:.1f}" width="{span:.1f}" height="16" rx="3">'
-                    f'<title>{node_name}: period span {start:.1f}-{finish:.1f} ms</title></rect>'
-                )
+            if period > 0:
+                for frame in range(1, len(releases)):
+                    start = releases[frame - 1]
+                    finish = releases[frame]
+                    x_pos = x_at(start)
+                    span = max(6.0, (finish - start) * px_per_ms)
+                    fill = self._frame_color(frame - 1)
+                    rows.append(
+                        f'<rect class="source-span" data-start="{start:.6f}" data-duration="{finish - start:.6f}" '
+                        f'x="{x_pos:.1f}" y="{y_center - 8:.1f}" width="{span:.1f}" height="16" rx="3" '
+                        f'style="fill:{fill};stroke:{fill}">'
+                        f'<title>{node_name}: period span {start:.1f}-{finish:.1f} ms</title></rect>'
+                    )
             for frame in range(max(1, metrics.pipeline_unroll)):
                 release = releases[frame]
                 x_pos = x_at(release)
                 label = f"{node} f{frame}" if metrics.pipeline_unroll > 1 else node
+                fill = self._frame_color(frame)
+                placement_y = lane_y[int(assignment[node])]
                 rows.append(
                     f'<g><title>{esc(label)} source release at {release:.1f} ms; period {period:g} ms</title>'
-                    f'<line class="release" data-ms="{release:.6f}" x1="{x_pos:.1f}" y1="{y_center - 13:.1f}" x2="{x_pos:.1f}" y2="{y_center + 13:.1f}" />'
-                    f'<circle class="release-dot" data-ms="{release:.6f}" cx="{x_pos:.1f}" cy="{y_center:.1f}" r="4" />'
+                    f'<line class="dep release-dep" data-ms="{release:.6f}" x1="{x_pos:.1f}" y1="{y_center:.1f}" '
+                    f'x2="{x_pos:.1f}" y2="{placement_y:.1f}" style="stroke:{fill}" />'
+                    f'<line class="release" data-ms="{release:.6f}" x1="{x_pos:.1f}" y1="{y_center - 13:.1f}" '
+                    f'x2="{x_pos:.1f}" y2="{y_center + 13:.1f}" style="stroke:{fill}" />'
+                    f'<circle class="release-dot" data-ms="{release:.6f}" cx="{x_pos:.1f}" cy="{y_center:.1f}" r="5" '
+                    f'style="fill:{fill};stroke:{fill}" />'
                     f'<text class="release-label" data-ms="{release:.6f}" x="{x_pos:.1f}" y="{y_center - 16:.1f}">f{frame}</text></g>'
                 )
 
@@ -991,6 +1101,8 @@ class MainWindow(QMainWindow):
             start = transfer.start
             finish = transfer.finish
             transfer_ms = finish - start
+            frame = self._frame_index(transfer.edges[0][0]) if transfer.edges else 0
+            fill = self._frame_color(frame)
             y_center = lane_y["transfer"] + ((transfer_index % 3) - 1) * 12
             x_pos = x_at(start)
             bar_width = max(6.0, transfer_ms * px_per_ms)
@@ -1012,7 +1124,7 @@ class MainWindow(QMainWindow):
             rows.append(
                 f'<g><title>{esc(title)}</title>'
                 f'<rect class="transfer" data-start="{start:.6f}" data-duration="{transfer_ms:.6f}" x="{x_pos:.1f}" y="{y_center - 10:.1f}" width="{bar_width:.1f}" '
-                f'height="20" rx="3" />'
+                f'height="20" rx="3" style="fill:{fill};stroke:{fill}" />'
                 f'<text class="transfer-label" data-start="{start:.6f}" data-duration="{transfer_ms:.6f}" data-anchor="center" x="{x_pos + bar_width / 2:.1f}" y="{y_center + 4:.1f}">'
                 f'{esc(label)}</text>'
             )
@@ -1020,8 +1132,10 @@ class MainWindow(QMainWindow):
                 source_y = lane_y[int(assignment[self._base_node_id(source)])]
                 target_y = lane_y[int(assignment[self._base_node_id(target)])]
                 rows.append(
-                    f'<line class="dep" data-ms="{start:.6f}" x1="{x_pos:.1f}" y1="{source_y:.1f}" x2="{x_pos:.1f}" y2="{y_center:.1f}" />'
-                    f'<line class="dep" data-ms="{finish:.6f}" x1="{end_x:.1f}" y1="{y_center:.1f}" x2="{end_x:.1f}" y2="{target_y:.1f}" />'
+                    f'<line class="dep" data-ms="{start:.6f}" x1="{x_pos:.1f}" y1="{source_y:.1f}" '
+                    f'x2="{x_pos:.1f}" y2="{y_center:.1f}" style="stroke:{fill}" />'
+                    f'<line class="dep" data-ms="{finish:.6f}" x1="{end_x:.1f}" y1="{y_center:.1f}" '
+                    f'x2="{end_x:.1f}" y2="{target_y:.1f}" style="stroke:{fill}" />'
                 )
             rows.append(
                 f'</g>'
@@ -1134,9 +1248,9 @@ class MainWindow(QMainWindow):
   .tick {{ stroke: #eef2f7; stroke-width: 1; }}
   .tick-label {{ font-size: 10px; fill: #6b7280; text-anchor: middle; }}
   .release {{ stroke: #be123c; stroke-width: 1.5; stroke-dasharray: 4 4; }}
-  .release-dot {{ fill: #be123c; stroke: #ffffff; stroke-width: 1.5; }}
+  .release-dot {{ stroke-width: 1.5; }}
   .release-label {{ font-size: 10px; fill: #be123c; font-weight: 700; text-anchor: middle; paint-order: stroke; stroke: #ffffff; stroke-width: 3px; stroke-linejoin: round; }}
-  .source-span {{ fill: #fff1f2; stroke: #be123c; stroke-width: 1.5; stroke-dasharray: 6 4; }}
+  .source-span {{ stroke: #be123c; stroke-width: 1.5; stroke-dasharray: 6 4; opacity: 0.55; }}
   .source-lane-label {{ fill: #7f1d1d; font-size: 10px; font-weight: 700; text-anchor: end; }}
   .op {{ stroke: #111827; stroke-width: 1; }}
   .op-id {{ fill: #ffffff; font-size: 11px; font-weight: 700; text-anchor: middle; pointer-events: none; }}
@@ -1145,6 +1259,7 @@ class MainWindow(QMainWindow):
   .transfer {{ fill: #f97316; stroke: #9a3412; stroke-width: 1; }}
   .transfer-label {{ fill: #111827; font-size: 10px; font-weight: 700; text-anchor: middle; pointer-events: none; }}
   .dep {{ stroke: #9a3412; stroke-width: 1; opacity: 0.75; }}
+  .release-dep {{ stroke: #be123c; opacity: 0.65; }}
 </style>
 </head>
 <body>

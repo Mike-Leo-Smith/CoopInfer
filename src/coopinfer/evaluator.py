@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import networkx as nx
+
+from .model import Environment, validate_environment, validate_graph
 
 
 @dataclass(frozen=True)
@@ -19,21 +22,39 @@ class TransferRecord:
 class EvaluationResult:
     latency: float
     device_utilization: float
+    avg_latency_loss: float
+    max_frame_latency_loss: float
+    device_utilization_loss: float
     loss: float
     start_times: Dict[str, float]
     finish_times: Dict[str, float]
     transfer_records: Tuple[TransferRecord, ...]
     pipeline_unroll: int = 1
+    max_frame_latency: float = 0.0
 
 
 def edge_transfer_ms(size_mb: float, bandwidth_mb_s: float, latency_ms: float) -> float:
-    if bandwidth_mb_s <= 0:
-        raise ValueError("Bandwidth must be greater than zero")
-    return latency_ms + (size_mb / bandwidth_mb_s * 1000.0)
+    size = _non_negative_float(size_mb, "Transfer size")
+    environment = validate_environment(
+        Environment(bandwidth=bandwidth_mb_s, latency=latency_ms)
+    )
+    return float(
+        _core_module().edge_transfer_ms(size, environment.bandwidth, environment.latency)
+    )
 
 
 def base_node_id(op_id: str) -> str:
     return op_id.split("[f", 1)[0] if "[f" in op_id else op_id
+
+
+def frame_index(op_id: str) -> int:
+    if "[f" not in op_id:
+        return 0
+    suffix = op_id.rsplit("[f", 1)[1].rstrip("]")
+    try:
+        return int(suffix)
+    except ValueError:
+        return 0
 
 
 def infer_latency(
@@ -44,15 +65,18 @@ def infer_latency(
     batch_transfers: bool = False,
     pipeline_unroll: int = 1,
 ) -> tuple[float, Dict[str, float], Dict[str, float]]:
-    tau, start_times, finish_times, _ = infer_schedule(
+    result = evaluate(
         graph,
         assignment,
-        bandwidth,
-        latency,
+        bandwidth=bandwidth,
+        latency=latency,
+        weight_avg_latency=1.0,
+        weight_max_latency=0.0,
+        weight_device_utilization=0.0,
         batch_transfers=batch_transfers,
         pipeline_unroll=pipeline_unroll,
     )
-    return tau, start_times, finish_times
+    return result.latency, result.start_times, result.finish_times
 
 
 def infer_schedule(
@@ -63,166 +87,51 @@ def infer_schedule(
     batch_transfers: bool = False,
     pipeline_unroll: int = 1,
 ) -> tuple[float, Dict[str, float], Dict[str, float], Tuple[TransferRecord, ...]]:
-    start_times: Dict[str, float] = {}
-    finish_times: Dict[str, float] = {}
-    transfer_finish_times: Dict[Tuple[str, str], float] = {}
-    transfer_records: list[TransferRecord] = []
-    time_dev_ready = 0.0
-    time_host_ready = 0.0
-    time_network_ready = 0.0
-    topo_nodes = list(nx.topological_sort(graph))
-    unroll = max(1, int(pipeline_unroll))
-    source_nodes = {node for node in graph.nodes if graph.in_degree(node) == 0}
-
-    def op_id(node: str, frame: int) -> str:
-        return str(node) if unroll == 1 else f"{node}[f{frame}]"
-
-    def source_release_time(node: str, frame: int) -> float:
-        if node not in source_nodes:
-            return 0.0
-        attrs = graph.nodes[node]
-        period_ms = max(0.0, float(attrs.get("source_period_ms", 0.0)))
-        phase_ms = max(0.0, float(attrs.get("source_phase_ms", 0.0)))
-        return phase_ms + frame * period_ms
-
-    expanded = nx.DiGraph()
-    for frame in range(unroll):
-        for node in topo_nodes:
-            expanded.add_node(op_id(str(node), frame), base=node, frame=frame)
-        for source, target, attrs in graph.edges(data=True):
-            expanded.add_edge(
-                op_id(str(source), frame),
-                op_id(str(target), frame),
-                kind="data",
-                size=float(attrs.get("size", 0.0)),
-            )
-    if unroll > 1:
-        for frame in range(1, unroll):
-            for node in topo_nodes:
-                if node in source_nodes:
-                    continue
-                expanded.add_edge(
-                    op_id(str(node), frame - 1),
-                    op_id(str(node), frame),
-                    kind="fifo",
-                    size=0.0,
-                )
-
-    for current in nx.topological_sort(expanded):
-        base_node = expanded.nodes[current]["base"]
-        frame = int(expanded.nodes[current]["frame"])
-        data_ready_at = 0.0
-        node_x = int(assignment[base_node])
-        for predecessor in expanded.predecessors(current):
-            edge_attrs = expanded.edges[predecessor, current]
-            pred_base = expanded.nodes[predecessor]["base"]
-            pred_x = int(assignment[pred_base])
-            if edge_attrs.get("kind") == "data" and pred_x != node_x:
-                data_ready_at = max(data_ready_at, transfer_finish_times[(predecessor, current)])
-            else:
-                data_ready_at = max(data_ready_at, finish_times[predecessor])
-
-        data_ready_at = max(data_ready_at, source_release_time(base_node, frame))
-
-        attrs = graph.nodes[base_node]
-        if base_node in source_nodes:
-            start_at = data_ready_at
-            finish_at = data_ready_at
-        elif node_x == 0:
-            start_at = max(data_ready_at, time_dev_ready)
-            finish_at = start_at + float(attrs["c_dev"])
-            time_dev_ready = finish_at
-        else:
-            start_at = max(data_ready_at, time_host_ready)
-            finish_at = start_at + float(attrs["c_host"])
-            time_host_ready = finish_at
-
-        start_times[current] = start_at
-        finish_times[current] = finish_at
-
-        # The prototype uses one deterministic network worker. Edges become
-        # transferable when their source finishes; we keep topological-source
-        # FIFO order instead of solving a separate network reordering problem.
-        outgoing_transfers = [
-            (current, successor, float(expanded.edges[current, successor].get("size", 0.0)))
-            for successor in expanded.successors(current)
-            if expanded.edges[current, successor].get("kind") == "data"
-            and int(assignment[expanded.nodes[successor]["base"]]) != node_x
-        ]
-        if batch_transfers and len(outgoing_transfers) > 1:
-            total_size = sum(size for _, _, size in outgoing_transfers)
-            transfer_start = max(finish_at, time_network_ready)
-            transfer_finish = transfer_start + edge_transfer_ms(total_size, bandwidth, latency)
-            time_network_ready = transfer_finish
-            for source, target, _ in outgoing_transfers:
-                transfer_finish_times[(source, target)] = transfer_finish
-            transfer_records.append(
-                TransferRecord(
-                    edges=tuple((source, target) for source, target, _ in outgoing_transfers),
-                    start=transfer_start,
-                    finish=transfer_finish,
-                    size_mb=total_size,
-                    batched=True,
-                )
-            )
-        else:
-            for source, target, size in outgoing_transfers:
-                transfer_start = max(finish_at, time_network_ready)
-                transfer_finish = transfer_start + edge_transfer_ms(size, bandwidth, latency)
-                time_network_ready = transfer_finish
-                transfer_finish_times[(source, target)] = transfer_finish
-                transfer_records.append(
-                    TransferRecord(
-                        edges=((source, target),),
-                        start=transfer_start,
-                        finish=transfer_finish,
-                        size_mb=size,
-                        batched=False,
-                    )
-                )
-
-    first_release = min(
-        (source_release_time(str(node), 0) for node in source_nodes),
-        default=0.0,
+    result = evaluate(
+        graph,
+        assignment,
+        bandwidth=bandwidth,
+        latency=latency,
+        weight_avg_latency=1.0,
+        weight_max_latency=0.0,
+        weight_device_utilization=0.0,
+        batch_transfers=batch_transfers,
+        pipeline_unroll=pipeline_unroll,
     )
-    makespan = max(finish_times.values()) if finish_times else first_release
     return (
-        max(0.0, makespan - first_release) / unroll,
-        start_times,
-        finish_times,
-        tuple(transfer_records),
+        result.latency,
+        result.start_times,
+        result.finish_times,
+        result.transfer_records,
     )
 
 
-def baseline_bounds(
+def baseline_scales(
     graph: nx.DiGraph,
     bandwidth: float,
     latency: float,
     batch_transfers: bool = False,
     pipeline_unroll: int = 1,
 ) -> tuple[float, float]:
-    all_device = {node: 0 for node in graph.nodes}
-    mostly_host = {
-        node: 0 if graph.nodes[node].get("fixed_dev", False) else 1
-        for node in graph.nodes
-    }
-    device_latency, _, _ = infer_latency(
-        graph,
-        all_device,
-        bandwidth,
-        latency,
-        batch_transfers=batch_transfers,
-        pipeline_unroll=pipeline_unroll,
+    validate_graph(graph, require_dag=True)
+    environment = validate_environment(
+        Environment(
+            bandwidth=bandwidth,
+            latency=latency,
+            batch_transfers=batch_transfers,
+            pipeline_unroll=pipeline_unroll,
+        )
     )
-    host_latency, _, _ = infer_latency(
-        graph,
-        mostly_host,
-        bandwidth,
-        latency,
-        batch_transfers=batch_transfers,
-        pipeline_unroll=pipeline_unroll,
+    raw = _core_module().baseline_scales_core(
+        graph_to_core_data(graph),
+        {
+            "bandwidth": environment.bandwidth,
+            "latency": environment.latency,
+            "batch_transfers": environment.batch_transfers,
+            "pipeline_unroll": environment.pipeline_unroll,
+        },
     )
-    return min(device_latency, host_latency), max(device_latency, host_latency)
+    return float(raw[0]), float(raw[1])
 
 
 def evaluate(
@@ -230,60 +139,135 @@ def evaluate(
     assignment: Mapping[str, int],
     bandwidth: float,
     latency: float,
-    weight_latency: float,
-    tau_min: Optional[float] = None,
-    tau_max: Optional[float] = None,
+    weight_avg_latency: float = 0.7,
+    weight_max_latency: float = 0.3,
+    weight_device_utilization: float = 0.3,
+    avg_latency_scale: Optional[float] = None,
+    max_latency_scale: Optional[float] = None,
     batch_transfers: bool = False,
     pipeline_unroll: int = 1,
 ) -> EvaluationResult:
-    tau, start_times, finish_times, transfer_records = infer_schedule(
-        graph,
-        assignment,
-        bandwidth,
-        latency,
-        batch_transfers=batch_transfers,
-        pipeline_unroll=pipeline_unroll,
-    )
-    if tau_min is None or tau_max is None:
-        tau_min, tau_max = baseline_bounds(
-            graph,
-            bandwidth,
-            latency,
+    validate_graph(graph, require_dag=True)
+    environment = validate_environment(
+        Environment(
+            bandwidth=bandwidth,
+            latency=latency,
+            weight_avg_latency=weight_avg_latency,
+            weight_max_latency=weight_max_latency,
+            weight_device_utilization=weight_device_utilization,
             batch_transfers=batch_transfers,
             pipeline_unroll=pipeline_unroll,
         )
-
-    denom = tau_max - tau_min
-    normalized_latency = 0.0 if abs(denom) < 1e-12 else (tau - tau_min) / denom
-
-    source_nodes = [node for node in graph.nodes if graph.in_degree(node) == 0]
-    first_release = min(
-        (
-            max(0.0, float(graph.nodes[node].get("source_phase_ms", 0.0)))
-            for node in source_nodes
-        ),
-        default=0.0,
     )
-    pipeline_finish = max(finish_times.values()) if finish_times else first_release
-    pipeline_makespan = max(0.0, pipeline_finish - first_release)
-    used_dev_active_time = sum(
-        finish_times[op_id] - start_times[op_id]
-        for op_id in start_times
-        if int(assignment[base_node_id(op_id)]) == 0
-    )
-    device_utilization = (
-        0.0 if pipeline_makespan <= 0 else used_dev_active_time / pipeline_makespan
-    )
-    utilization_complement = 1.0 - device_utilization
-    weight = min(1.0, max(0.0, float(weight_latency)))
-    loss = weight * normalized_latency + (1.0 - weight) * utilization_complement
+    params: Dict[str, Any] = {
+        "bandwidth": environment.bandwidth,
+        "latency": environment.latency,
+        "weight_avg_latency": environment.weight_avg_latency,
+        "weight_max_latency": environment.weight_max_latency,
+        "weight_device_utilization": environment.weight_device_utilization,
+        "batch_transfers": environment.batch_transfers,
+        "pipeline_unroll": environment.pipeline_unroll,
+        "assignment": assignment_to_core_vector(graph, assignment),
+    }
+    if avg_latency_scale is not None and max_latency_scale is not None:
+        params["avg_latency_scale"] = _finite_float(
+            avg_latency_scale,
+            "avg_latency_scale",
+        )
+        params["max_latency_scale"] = _finite_float(
+            max_latency_scale,
+            "max_latency_scale",
+        )
 
+    raw_metrics = _core_module().evaluate_core(graph_to_core_data(graph), params)
+    return metrics_from_core(raw_metrics)
+
+
+def graph_to_core_data(graph: nx.DiGraph) -> Dict[str, Any]:
+    node_ids = [str(node) for node in graph.nodes]
+    node_index = {node: index for index, node in enumerate(graph.nodes)}
+    return {
+        "ids": node_ids,
+        "c_dev": [float(attrs["c_dev"]) for _, attrs in graph.nodes(data=True)],
+        "c_host": [float(attrs["c_host"]) for _, attrs in graph.nodes(data=True)],
+        "fixed_dev": [bool(attrs.get("fixed_dev", False)) for _, attrs in graph.nodes(data=True)],
+        "source_period_ms": [
+            float(attrs.get("source_period_ms", 0.0)) for _, attrs in graph.nodes(data=True)
+        ],
+        "source_phase_ms": [
+            float(attrs.get("source_phase_ms", 0.0)) for _, attrs in graph.nodes(data=True)
+        ],
+        "x_initial": [
+            0 if attrs.get("fixed_dev", False) else int(attrs.get("x", 1))
+            for _, attrs in graph.nodes(data=True)
+        ],
+        "edge_sources": [node_index[source] for source, _ in graph.edges],
+        "edge_targets": [node_index[target] for _, target in graph.edges],
+        "edge_sizes": [float(attrs.get("size", 0.0)) for _, _, attrs in graph.edges(data=True)],
+    }
+
+
+def assignment_to_core_vector(graph: nx.DiGraph, assignment: Mapping[str, int]) -> list[int]:
+    vector: list[int] = []
+    for node in graph.nodes:
+        if node not in assignment and str(node) not in assignment:
+            raise ValueError(f"Assignment is missing node {node}.")
+        value = assignment[node] if node in assignment else assignment[str(node)]
+        value = int(value)
+        if value not in {0, 1}:
+            raise ValueError(f"Assignment for node {node} must be 0 or 1.")
+        vector.append(value)
+    return vector
+
+
+def metrics_from_core(raw_metrics: Mapping[str, Any]) -> EvaluationResult:
+    transfer_records = tuple(
+        TransferRecord(
+            edges=tuple((str(source), str(target)) for source, target in transfer["edges"]),
+            start=float(transfer["start"]),
+            finish=float(transfer["finish"]),
+            size_mb=float(transfer["size_mb"]),
+            batched=bool(transfer["batched"]),
+        )
+        for transfer in raw_metrics["transfer_records"]
+    )
     return EvaluationResult(
-        latency=tau,
-        device_utilization=device_utilization,
-        loss=loss,
-        start_times=start_times,
-        finish_times=finish_times,
+        latency=float(raw_metrics["latency"]),
+        device_utilization=float(raw_metrics["device_utilization"]),
+        avg_latency_loss=float(raw_metrics["avg_latency_loss"]),
+        max_frame_latency_loss=float(raw_metrics["max_frame_latency_loss"]),
+        device_utilization_loss=float(raw_metrics["device_utilization_loss"]),
+        loss=float(raw_metrics["loss"]),
+        start_times={str(node): float(value) for node, value in raw_metrics["start_times"].items()},
+        finish_times={
+            str(node): float(value) for node, value in raw_metrics["finish_times"].items()
+        },
         transfer_records=transfer_records,
-        pipeline_unroll=max(1, int(pipeline_unroll)),
+        pipeline_unroll=int(raw_metrics["pipeline_unroll"]),
+        max_frame_latency=float(raw_metrics["max_frame_latency"]),
     )
+
+
+def _core_module():
+    try:
+        from . import _core
+    except ImportError as exc:
+        raise RuntimeError(
+            "CoopInfer requires the compiled C++ solver extension. "
+            'Build/install the project with `python -m pip install -e ".[dev]"`.'
+        ) from exc
+    return _core
+
+
+def _finite_float(value: float, label: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{label} must be finite.")
+    return number
+
+
+def _non_negative_float(value: float, label: str) -> float:
+    number = _finite_float(value, label)
+    if number < 0:
+        raise ValueError(f"{label} must be non-negative.")
+    return number

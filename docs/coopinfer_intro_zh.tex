@@ -43,9 +43,9 @@
       \begin{itemize}
         \item DAG 节点及端侧/边侧执行耗时。
         \item 边数据量。
-        \item 带宽、固定时延、优化权重。
+        \item 带宽、固定时延和优化权重。
         \item 串行网络模型以及可选传输批处理。
-        \item 可选端到端时延上限。
+        \item 可选平均端到端时延上限和最大单帧时延上限。
       \end{itemize}
     \end{column}
     \begin{column}{0.48\textwidth}
@@ -100,7 +100,8 @@
       \end{itemize}
     \item 环境参数：
       \begin{itemize}
-        \item \texttt{bandwidth}, \texttt{latency}, \texttt{weight\_latency}, \texttt{latency\_limit}, \texttt{batch\_transfers}
+        \item \texttt{bandwidth}, \texttt{latency}, \texttt{weight\_avg\_latency}, \texttt{weight\_max\_latency}, \texttt{weight\_device\_utilization}
+        \item \texttt{latency\_limit}, \texttt{max\_frame\_latency\_limit}, \texttt{batch\_transfers}
       \end{itemize}
     \item JSON 导入/导出保证实验可复现、可共享。
   \end{itemize}
@@ -167,7 +168,7 @@
   \[
     F_i = S_i + (1-x_i)c_i^{dev} + x_i c_i^{host}
   \]
-  端到端闭环时延为 $\tau=\max_i F_i$。
+  端到端时延从第一个非输入计算或传输事件开始，到最后一个非输入输出节点完成结束。输入源释放会推迟下游工作，但不计入时延窗口内部。
 \end{frame}
 
 \begin{frame}{网络批处理示意}
@@ -225,21 +226,25 @@
   求解器最小化加权目标：
   \[
     J =
-    w \cdot
-    \frac{\tau-\tau_{min}}{\tau_{max}-\tau_{min}}
-    +
-    (1-w)
-    \left(
-      1-\frac{\sum_i(1-x_i)c_i^{dev}}{\sum_i c_i^{dev}}
-    \right)
+    w_{avg} L_{avg}
+    + w_{max} L_{max}
+    + w_{util} L_{util}
   \]
+  其中
+  \[
+    L_{avg}=\frac{\tau}{\max(scale_{avg}, 1)},\quad
+    L_{max}=\frac{\tau_{frame}^{max}}{\max(scale_{max}, 1)},\quad
+    L_{util}=1-\frac{device\_active\_time}{pipeline\_work\_span}
+  \]
+  时延归一化尺度来自全端侧/全边侧基线。
   \vspace{0.5em}
-  \begin{block}{端到端时延上限}
-    正数 \texttt{latency\_limit} 是硬约束：
+  \begin{block}{时延上限}
+    正数上限是硬约束：
     \[
-      \tau \leq latency\_limit
+      \tau \leq latency\_limit,\quad
+      \tau_{frame}^{max} \leq max\_frame\_latency\_limit
     \]
-    超过上限的候选方案会在目标函数比较前被直接拒绝。
+    取值为 0 表示关闭对应约束；超过任一启用上限的候选方案会在目标函数比较前被直接拒绝。
   \end{block}
 \end{frame}
 
@@ -259,14 +264,14 @@
     \end{tabular}
   \end{table}
   \vspace{0.5em}
-  所有模式都会强制固定端侧节点，并执行端到端时延上限过滤。
+  所有模式都会强制固定端侧节点，并执行平均端到端和最大单帧时延上限过滤。
 \end{frame}
 
 \begin{frame}{GUI 使用流程}
   \begin{enumerate}
     \item 编辑节点、名称、计算耗时和固定端侧标记。
     \item 编辑边和传输数据量。
-    \item 配置带宽、固定时延、网络批处理、优化权重、求解模式、迭代次数和端到端时延上限。
+    \item 配置带宽、固定时延、网络批处理、优化权重、求解模式、迭代次数和时延上限。
     \item 点击 \textbf{Solve}。
     \item 查看性能看板、拓扑放置和 profiler 风格时序图。
   \end{enumerate}
@@ -279,19 +284,20 @@
     \begin{column}{0.5\textwidth}
       \textbf{拓扑 SVG}
       \begin{itemize}
-        \item 蓝色：端侧。
-        \item 绿色：边侧。
-        \item 加粗边框：固定端侧节点。
-        \item 红色虚线边：跨设备传输。
-        \item 灰色实线边：同侧依赖。
+        \item 配置 DAG 在求解前展示数据量以及本地/跨设备边样式。
+        \item 求解后的展开流水线使用高对比填充色表示帧编号。
+        \item 蓝色轮廓表示端侧，绿色轮廓表示边侧。
+        \item 加粗或虚线源节点样式表示固定端侧和输入源事件。
+        \item FIFO、传输、本地依赖和释放线都跟随源帧的同一颜色。
       \end{itemize}
     \end{column}
     \begin{column}{0.5\textwidth}
       \textbf{时序 SVG}
       \begin{itemize}
-        \item Host、Transfer、Device 三条泳道。
-        \item 算子条由开始/完成时间决定。
+        \item Input、Host、Transfer、Device 四条泳道。
+        \item 算子条由开始/完成时间决定，并使用与拓扑图一致的帧填充色。
         \item 传输条来自解析器的真实传输记录，可展示串行传输和批处理传输。
+        \item 输入释放点、周期跨度和垂直释放/依赖线都使用对应帧颜色。
         \item 使用浏览器原生滚动和缩放控件。
       \end{itemize}
     \end{column}
@@ -361,6 +367,7 @@
     \item PyQt6 负责桌面控件和布局。
     \item PyQt6-WebEngine 负责 SVG 拓扑图和时序图渲染。
     \item NetworkX 负责 DAG 存储、拓扑排序和环路检测。
+    \item C++/pybind11 原生核心负责调度评估、目标函数计算和求解搜索。
     \item Pytest 覆盖解析器、JSON IO、求解模式和时延上限可行性。
     \item 启动命令：\texttt{python -m coopinfer} 或 \texttt{python -m coopinfer.app}。
   \end{itemize}

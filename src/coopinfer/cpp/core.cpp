@@ -26,12 +26,6 @@ struct Edge {
     double size;
 };
 
-struct ExpandedEdge {
-    int target;
-    double size;
-    bool data;
-};
-
 struct TransferRecord {
     std::vector<std::pair<int, int>> edges;
     double start;
@@ -56,18 +50,94 @@ struct GraphData {
 
 struct Metrics {
     double latency = 0.0;
+    double max_frame_latency = 0.0;
     double utilization = 0.0;
+    double avg_latency_loss = 0.0;
+    double max_frame_latency_loss = 0.0;
+    double device_utilization_loss = 0.0;
     double loss = 0.0;
     std::vector<double> starts;
     std::vector<double> finishes;
     std::vector<TransferRecord> transfers;
 };
 
+struct ObjectiveWeights {
+    double avg_latency = 0.7;
+    double max_latency = 0.3;
+    double device_utilization = 0.3;
+};
+
+struct ObjectiveScales {
+    double avg_latency = 1.0;
+    double max_latency = 1.0;
+};
+
 double transfer_ms(double size_mb, double bandwidth_mb_s, double latency_ms) {
+    if (!std::isfinite(size_mb)) {
+        throw std::runtime_error("Transfer size must be finite.");
+    }
+    if (size_mb < 0.0) {
+        throw std::runtime_error("Transfer size must be non-negative.");
+    }
+    if (!std::isfinite(bandwidth_mb_s)) {
+        throw std::runtime_error("Bandwidth must be finite.");
+    }
     if (bandwidth_mb_s <= 0.0) {
-        throw std::runtime_error("Bandwidth must be greater than zero");
+        throw std::runtime_error("Bandwidth must be greater than zero.");
+    }
+    if (!std::isfinite(latency_ms)) {
+        throw std::runtime_error("Latency must be finite.");
+    }
+    if (latency_ms < 0.0) {
+        throw std::runtime_error("Latency must be non-negative.");
     }
     return latency_ms + (size_mb / bandwidth_mb_s * 1000.0);
+}
+
+double non_negative(double value, const std::string& label) {
+    if (!std::isfinite(value)) {
+        throw std::runtime_error(label + " must be finite.");
+    }
+    if (value < 0.0) {
+        throw std::runtime_error(label + " must be non-negative.");
+    }
+    return value;
+}
+
+double normalized_time_score(double value, double scale) {
+    double safe_scale = std::max(std::abs(scale), 1.0);
+    return std::max(0.0, value) / safe_scale;
+}
+
+double non_negative_param(const py::dict& params, const char* key, double fallback) {
+    if (!params.contains(key)) {
+        return fallback;
+    }
+    return non_negative(params[key].cast<double>(), std::string("Environment ") + key);
+}
+
+ObjectiveWeights parse_objective_weights(const py::dict& params) {
+    bool has_explicit_weights = params.contains("weight_avg_latency") ||
+                                params.contains("weight_max_latency") ||
+                                params.contains("weight_device_utilization");
+    if (has_explicit_weights) {
+        return ObjectiveWeights{
+            non_negative_param(params, "weight_avg_latency", 0.7),
+            non_negative_param(params, "weight_max_latency", 0.3),
+            non_negative_param(params, "weight_device_utilization", 0.3),
+        };
+    }
+
+    if (params.contains("weight_latency")) {
+        double legacy = params["weight_latency"].cast<double>();
+        if (!std::isfinite(legacy)) {
+            throw std::runtime_error("Environment weight_latency must be finite.");
+        }
+        legacy = std::min(1.0, std::max(0.0, legacy));
+        return ObjectiveWeights{legacy, 0.0, 1.0 - legacy};
+    }
+
+    return ObjectiveWeights{};
 }
 
 std::string op_id(const GraphData& graph, int op, int unroll) {
@@ -91,6 +161,10 @@ double source_release_time(const GraphData& graph, int node, int frame) {
     double period = std::max(0.0, graph.source_period_ms[node]);
     double phase = std::max(0.0, graph.source_phase_ms[node]);
     return phase + static_cast<double>(frame) * period;
+}
+
+int frame_index(int op, int node_count) {
+    return op / node_count;
 }
 
 std::vector<int> topo_sort_base(int node_count, const std::vector<Edge>& edges) {
@@ -138,10 +212,41 @@ GraphData parse_graph(const py::dict& data) {
     auto sizes = data["edge_sizes"].cast<std::vector<double>>();
 
     int n = static_cast<int>(graph.ids.size());
+    auto require_size = [&](size_t size, const std::string& label) {
+        if (size != static_cast<size_t>(n)) {
+            throw std::runtime_error(label + " length does not match ids length.");
+        }
+    };
+    require_size(graph.c_dev.size(), "c_dev");
+    require_size(graph.c_host.size(), "c_host");
+    require_size(graph.fixed_dev.size(), "fixed_dev");
+    require_size(graph.source_period_ms.size(), "source_period_ms");
+    require_size(graph.source_phase_ms.size(), "source_phase_ms");
+    require_size(graph.x_initial.size(), "x_initial");
     graph.outgoing.assign(n, {});
     graph.incoming.assign(n, {});
+    for (int node = 0; node < n; ++node) {
+        std::string label = "Node " + graph.ids[node];
+        graph.c_dev[node] = non_negative(graph.c_dev[node], label + " c_dev");
+        graph.c_host[node] = non_negative(graph.c_host[node], label + " c_host");
+        graph.source_period_ms[node] = non_negative(
+            graph.source_period_ms[node], label + " source_period_ms"
+        );
+        graph.source_phase_ms[node] = non_negative(
+            graph.source_phase_ms[node], label + " source_phase_ms"
+        );
+        if (graph.x_initial[node] != 0 && graph.x_initial[node] != 1) {
+            throw std::runtime_error(label + " x must be 0 or 1.");
+        }
+    }
+    if (sources.size() != targets.size() || sources.size() != sizes.size()) {
+        throw std::runtime_error("Edge source, target, and size arrays must have equal length.");
+    }
     for (size_t i = 0; i < sources.size(); ++i) {
-        Edge edge{sources[i], targets[i], sizes[i]};
+        if (sources[i] < 0 || sources[i] >= n || targets[i] < 0 || targets[i] >= n) {
+            throw std::runtime_error("Edge references an unknown node.");
+        }
+        Edge edge{sources[i], targets[i], non_negative(sizes[i], "Edge size")};
         graph.edges.push_back(edge);
         graph.outgoing[edge.source].push_back(edge);
         graph.incoming[edge.target].push_back(edge);
@@ -205,9 +310,8 @@ Metrics schedule(
     const std::vector<int>& assignment,
     double bandwidth,
     double latency,
-    double weight_latency,
-    double tau_min,
-    double tau_max,
+    const ObjectiveWeights& weights,
+    const ObjectiveScales& scales,
     bool batch_transfers,
     int pipeline_unroll
 ) {
@@ -303,39 +407,100 @@ Metrics schedule(
         }
     }
 
-    double makespan = 0.0;
-    for (double finish : metrics.finishes) {
-        makespan = std::max(makespan, finish);
-    }
-    double first_release = 0.0;
-    bool has_source = false;
-    for (int node = 0; node < n; ++node) {
+    std::vector<double> frame_work_start(unroll, std::numeric_limits<double>::infinity());
+    std::vector<bool> frame_has_work(unroll, false);
+    for (int op = 0; op < op_count; ++op) {
+        int frame = op / n;
+        int node = op % n;
         if (graph.incoming[node].empty()) {
-            double release = source_release_time(graph, node, 0);
-            first_release = has_source ? std::min(first_release, release) : release;
-            has_source = true;
+            continue;
+        }
+        frame_work_start[frame] = std::min(frame_work_start[frame], metrics.starts[op]);
+        frame_has_work[frame] = true;
+    }
+    for (const auto& transfer : metrics.transfers) {
+        if (transfer.edges.empty()) {
+            continue;
+        }
+        int frame = frame_index(transfer.edges.front().first, n);
+        if (frame >= 0 && frame < unroll) {
+            frame_work_start[frame] = std::min(frame_work_start[frame], transfer.start);
+            frame_has_work[frame] = true;
         }
     }
-    double pipeline_time = std::max(0.0, makespan - first_release);
+
+    double first_work_start = 0.0;
+    bool has_pipeline_work = false;
+    for (int frame = 0; frame < unroll; ++frame) {
+        if (frame_has_work[frame]) {
+            first_work_start = has_pipeline_work
+                                   ? std::min(first_work_start, frame_work_start[frame])
+                                   : frame_work_start[frame];
+            has_pipeline_work = true;
+        }
+    }
+
+    double pipeline_finish = first_work_start;
+    for (int frame = 0; frame < unroll; ++frame) {
+        if (!frame_has_work[frame]) {
+            continue;
+        }
+        double frame_finish = frame_work_start[frame];
+        bool has_output = false;
+        for (int node = 0; node < n; ++node) {
+            if (graph.outgoing[node].empty() && !graph.incoming[node].empty()) {
+                int op = frame * n + node;
+                frame_finish = has_output ? std::max(frame_finish, metrics.finishes[op])
+                                          : metrics.finishes[op];
+                has_output = true;
+            }
+        }
+        if (!has_output) {
+            for (int node = 0; node < n; ++node) {
+                if (graph.incoming[node].empty()) {
+                    continue;
+                }
+                int op = frame * n + node;
+                frame_finish = std::max(frame_finish, metrics.finishes[op]);
+            }
+        }
+        pipeline_finish = std::max(pipeline_finish, frame_finish);
+        metrics.max_frame_latency = std::max(
+            metrics.max_frame_latency,
+            std::max(0.0, frame_finish - frame_work_start[frame])
+        );
+    }
+
+    double pipeline_time = has_pipeline_work ? std::max(0.0, pipeline_finish - first_work_start)
+                                             : 0.0;
     metrics.latency = pipeline_time / static_cast<double>(unroll);
 
     double dev_active = 0.0;
     for (int op = 0; op < op_count; ++op) {
         int node = op % n;
+        if (graph.incoming[node].empty()) {
+            continue;
+        }
         if (assignment[node] == 0) {
             dev_active += metrics.finishes[op] - metrics.starts[op];
         }
     }
     metrics.utilization = pipeline_time <= 0.0 ? 0.0 : dev_active / pipeline_time;
+    metrics.utilization = std::min(1.0, std::max(0.0, metrics.utilization));
 
-    double denom = tau_max - tau_min;
-    double normalized_latency = std::abs(denom) < 1e-12 ? 0.0 : (metrics.latency - tau_min) / denom;
-    double weight = std::min(1.0, std::max(0.0, weight_latency));
-    metrics.loss = weight * normalized_latency + (1.0 - weight) * (1.0 - metrics.utilization);
+    metrics.avg_latency_loss = normalized_time_score(metrics.latency, scales.avg_latency);
+    metrics.max_frame_latency_loss = normalized_time_score(
+        metrics.max_frame_latency,
+        scales.max_latency
+    );
+    metrics.device_utilization_loss = 1.0 - metrics.utilization;
+    metrics.loss = weights.avg_latency * metrics.avg_latency_loss +
+                   weights.max_latency * metrics.max_frame_latency_loss +
+                   weights.device_utilization * metrics.device_utilization_loss;
     return metrics;
 }
 
-std::pair<double, double> baseline_bounds(
+ObjectiveScales baseline_scales(
     const GraphData& graph,
     double bandwidth,
     double latency,
@@ -350,13 +515,42 @@ std::pair<double, double> baseline_bounds(
             mostly_host[i] = 0;
         }
     }
-    auto dev = schedule(graph, all_device, bandwidth, latency, 1.0, 0.0, 1.0, batch_transfers, pipeline_unroll);
-    auto host = schedule(graph, mostly_host, bandwidth, latency, 1.0, 0.0, 1.0, batch_transfers, pipeline_unroll);
-    return {std::min(dev.latency, host.latency), std::max(dev.latency, host.latency)};
+    ObjectiveWeights weights{1.0, 1.0, 0.0};
+    ObjectiveScales neutral_scales{1.0, 1.0};
+    auto dev = schedule(
+        graph,
+        all_device,
+        bandwidth,
+        latency,
+        weights,
+        neutral_scales,
+        batch_transfers,
+        pipeline_unroll
+    );
+    auto host = schedule(
+        graph,
+        mostly_host,
+        bandwidth,
+        latency,
+        weights,
+        neutral_scales,
+        batch_transfers,
+        pipeline_unroll
+    );
+    return ObjectiveScales{
+        std::max(dev.latency, host.latency),
+        std::max(dev.max_frame_latency, host.max_frame_latency),
+    };
 }
 
-bool exceeds_limit(const Metrics& metrics, double latency_limit) {
-    return latency_limit > 0.0 && metrics.latency > latency_limit;
+bool exceeds_limit(
+    const Metrics& metrics,
+    double latency_limit,
+    double max_frame_latency_limit
+) {
+    return (latency_limit > 0.0 && metrics.latency > latency_limit) ||
+           (max_frame_latency_limit > 0.0 &&
+            metrics.max_frame_latency > max_frame_latency_limit);
 }
 
 std::vector<int> mostly_host_seed(const GraphData& graph, const std::vector<int>& base) {
@@ -394,7 +588,11 @@ py::dict metrics_to_python(const GraphData& graph, const Metrics& metrics, int u
         transfers.append(item);
     }
     out["latency"] = metrics.latency;
+    out["max_frame_latency"] = metrics.max_frame_latency;
     out["device_utilization"] = metrics.utilization;
+    out["avg_latency_loss"] = metrics.avg_latency_loss;
+    out["max_frame_latency_loss"] = metrics.max_frame_latency_loss;
+    out["device_utilization_loss"] = metrics.device_utilization_loss;
     out["loss"] = metrics.loss;
     out["start_times"] = starts;
     out["finish_times"] = finishes;
@@ -406,13 +604,22 @@ py::dict metrics_to_python(const GraphData& graph, const Metrics& metrics, int u
 py::dict solve_core(const py::dict& data, const py::dict& params) {
     GraphData graph = parse_graph(data);
     int n = static_cast<int>(graph.ids.size());
-    double bandwidth = params["bandwidth"].cast<double>();
-    double latency = params["latency"].cast<double>();
-    double weight_latency = params["weight_latency"].cast<double>();
+    double bandwidth = non_negative(params["bandwidth"].cast<double>(), "Environment bandwidth");
+    if (bandwidth <= 0.0) {
+        throw std::runtime_error("Environment bandwidth must be greater than zero.");
+    }
+    double latency = non_negative(params["latency"].cast<double>(), "Environment latency");
+    ObjectiveWeights weights = parse_objective_weights(params);
     std::string algorithm = params["algorithm"].cast<std::string>();
     int heuristic_iterations = params["heuristic_iterations"].cast<int>();
     int seed = params["seed"].cast<int>();
-    double latency_limit = params["latency_limit"].cast<double>();
+    double latency_limit = non_negative(
+        params["latency_limit"].cast<double>(), "Environment latency_limit"
+    );
+    double max_frame_latency_limit = non_negative(
+        params["max_frame_latency_limit"].cast<double>(),
+        "Environment max_frame_latency_limit"
+    );
     bool batch_transfers = params["batch_transfers"].cast<bool>();
     int pipeline_unroll = std::max(1, params["pipeline_unroll"].cast<int>());
 
@@ -434,7 +641,7 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
         }
     }
 
-    auto [tau_min, tau_max] = baseline_bounds(
+    ObjectiveScales scales = baseline_scales(
         graph, bandwidth, latency, batch_transfers, pipeline_unroll
     );
 
@@ -446,7 +653,7 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
 
     auto eval_assignment = [&](const std::vector<int>& assignment) {
         return schedule(
-            graph, assignment, bandwidth, latency, weight_latency, tau_min, tau_max,
+            graph, assignment, bandwidth, latency, weights, scales,
             batch_transfers, pipeline_unroll
         );
     };
@@ -472,7 +679,7 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
                 assignment[free_nodes[bit]] = static_cast<int>((mask >> bit) & 1U);
             }
             Metrics metrics = eval_assignment(assignment);
-            if (exceeds_limit(metrics, latency_limit)) {
+            if (exceeds_limit(metrics, latency_limit, max_frame_latency_limit)) {
                 continue;
             }
             if (!has_best || metrics.loss < best_metrics.loss) {
@@ -487,7 +694,7 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
         std::mt19937 rng(seed);
         best_assignment = mostly_host_seed(graph, base_assignment);
         best_metrics = eval_assignment(best_assignment);
-        has_best = !exceeds_limit(best_metrics, latency_limit);
+        has_best = !exceeds_limit(best_metrics, latency_limit, max_frame_latency_limit);
         if (!has_best) {
             best_assignment.clear();
         }
@@ -508,7 +715,7 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
                     assignment[node] = 1 - assignment[node];
                 }
                 Metrics metrics = eval_assignment(assignment);
-                if (exceeds_limit(metrics, latency_limit)) {
+                if (exceeds_limit(metrics, latency_limit, max_frame_latency_limit)) {
                     continue;
                 }
                 if (!has_best || metrics.loss < best_metrics.loss) {
@@ -525,7 +732,7 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
         std::uniform_real_distribution<double> unit(0.0, 1.0);
         std::vector<int> current = mostly_host_seed(graph, base_assignment);
         Metrics current_metrics = eval_assignment(current);
-        if (!exceeds_limit(current_metrics, latency_limit)) {
+        if (!exceeds_limit(current_metrics, latency_limit, max_frame_latency_limit)) {
             best_assignment = current;
             best_metrics = current_metrics;
             has_best = true;
@@ -545,11 +752,16 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
                 int node = free_nodes[node_dist(rng)];
                 candidate[node] = 1 - candidate[node];
                 Metrics metrics = eval_assignment(candidate);
-                if (exceeds_limit(metrics, latency_limit)) {
+                if (exceeds_limit(metrics, latency_limit, max_frame_latency_limit)) {
                     continue;
                 }
                 double delta = metrics.loss - current_metrics.loss;
-                bool accept = exceeds_limit(current_metrics, latency_limit) || delta <= 0.0 ||
+                bool accept = exceeds_limit(
+                                  current_metrics,
+                                  latency_limit,
+                                  max_frame_latency_limit
+                              ) ||
+                              delta <= 0.0 ||
                               unit(rng) < std::exp(-delta / std::max(temperature, 1e-9));
                 if (accept) {
                     current = candidate;
@@ -567,7 +779,13 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
     }
 
     if (!has_best) {
-        throw std::runtime_error("No feasible assignment satisfies latency limit " + std::to_string(latency_limit) + " ms.");
+        throw std::runtime_error(
+            "No feasible assignment satisfies latency limits: E2E " +
+            std::to_string(latency_limit) +
+            " ms, max-frame " +
+            std::to_string(max_frame_latency_limit) +
+            " ms."
+        );
     }
 
     py::dict result;
@@ -582,9 +800,71 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
     return result;
 }
 
+py::dict evaluate_core(const py::dict& data, const py::dict& params) {
+    GraphData graph = parse_graph(data);
+    int n = static_cast<int>(graph.ids.size());
+    auto assignment = params["assignment"].cast<std::vector<int>>();
+    if (assignment.size() != static_cast<size_t>(n)) {
+        throw std::runtime_error("Assignment length does not match graph nodes.");
+    }
+    for (int node = 0; node < n; ++node) {
+        if (assignment[node] != 0 && assignment[node] != 1) {
+            throw std::runtime_error("Assignment values must be 0 or 1.");
+        }
+    }
+
+    double bandwidth = non_negative(params["bandwidth"].cast<double>(), "Environment bandwidth");
+    if (bandwidth <= 0.0) {
+        throw std::runtime_error("Environment bandwidth must be greater than zero.");
+    }
+    double latency = non_negative(params["latency"].cast<double>(), "Environment latency");
+    ObjectiveWeights weights = parse_objective_weights(params);
+    bool batch_transfers = params["batch_transfers"].cast<bool>();
+    int pipeline_unroll = std::max(1, params["pipeline_unroll"].cast<int>());
+
+    ObjectiveScales scales;
+    if (params.contains("avg_latency_scale") && params.contains("max_latency_scale")) {
+        scales.avg_latency = params["avg_latency_scale"].cast<double>();
+        scales.max_latency = params["max_latency_scale"].cast<double>();
+        if (!std::isfinite(scales.avg_latency) || !std::isfinite(scales.max_latency)) {
+            throw std::runtime_error("Latency scales must be finite.");
+        }
+    } else {
+        scales = baseline_scales(graph, bandwidth, latency, batch_transfers, pipeline_unroll);
+    }
+
+    Metrics metrics = schedule(
+        graph,
+        assignment,
+        bandwidth,
+        latency,
+        weights,
+        scales,
+        batch_transfers,
+        pipeline_unroll
+    );
+    return metrics_to_python(graph, metrics, pipeline_unroll);
+}
+
+py::tuple baseline_scales_core(const py::dict& data, const py::dict& params) {
+    GraphData graph = parse_graph(data);
+    double bandwidth = non_negative(params["bandwidth"].cast<double>(), "Environment bandwidth");
+    if (bandwidth <= 0.0) {
+        throw std::runtime_error("Environment bandwidth must be greater than zero.");
+    }
+    double latency = non_negative(params["latency"].cast<double>(), "Environment latency");
+    bool batch_transfers = params["batch_transfers"].cast<bool>();
+    int pipeline_unroll = std::max(1, params["pipeline_unroll"].cast<int>());
+    auto scales = baseline_scales(graph, bandwidth, latency, batch_transfers, pipeline_unroll);
+    return py::make_tuple(scales.avg_latency, scales.max_latency);
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_core, module) {
     module.doc() = "C++ solver core for CoopInfer";
+    module.def("edge_transfer_ms", &transfer_ms, "Compute serialized transfer duration in ms");
+    module.def("evaluate_core", &evaluate_core, "Evaluate a fixed CoopInfer assignment with the C++ core");
+    module.def("baseline_scales_core", &baseline_scales_core, "Compute objective latency normalization scales");
     module.def("solve_core", &solve_core, "Solve a CoopInfer graph with the C++ core");
 }

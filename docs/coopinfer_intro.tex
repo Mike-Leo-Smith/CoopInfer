@@ -45,9 +45,9 @@
       \begin{itemize}
         \item DAG nodes with device/host compute costs.
         \item Edges with transfer sizes.
-        \item Bandwidth, latency, objective weight.
+        \item Bandwidth, latency, and objective weights.
         \item Serialized network model with optional transfer batching.
-        \item Optional E2E latency limit.
+        \item Optional average E2E and max-frame latency limits.
       \end{itemize}
     \end{column}
     \begin{column}{0.48\textwidth}
@@ -102,7 +102,8 @@
       \end{itemize}
     \item Environment fields:
       \begin{itemize}
-        \item \texttt{bandwidth}, \texttt{latency}, \texttt{weight\_latency}, \texttt{latency\_limit}, \texttt{batch\_transfers}.
+        \item \texttt{bandwidth}, \texttt{latency}, \texttt{weight\_avg\_latency}, \texttt{weight\_max\_latency}, \texttt{weight\_device\_utilization}.
+        \item \texttt{latency\_limit}, \texttt{max\_frame\_latency\_limit}, \texttt{batch\_transfers}.
       \end{itemize}
     \item JSON load/save keeps experiments reproducible and shareable.
   \end{itemize}
@@ -169,7 +170,7 @@
   \[
     F_i = S_i + (1-x_i)c_i^{dev} + x_i c_i^{host}
   \]
-  The E2E latency is $\tau=\max_i F_i$.
+  E2E latency is measured from the first non-input compute or transfer event to the last non-input output finish. Source/input releases can delay work, but they are not counted inside the latency window.
 \end{frame}
 
 \begin{frame}{Network Batching Illustration}
@@ -227,21 +228,25 @@
   The solver minimizes a weighted objective:
   \[
     J =
-    w \cdot
-    \frac{\tau-\tau_{min}}{\tau_{max}-\tau_{min}}
-    +
-    (1-w)
-    \left(
-      1-\frac{\sum_i(1-x_i)c_i^{dev}}{\sum_i c_i^{dev}}
-    \right)
+    w_{avg} L_{avg}
+    + w_{max} L_{max}
+    + w_{util} L_{util}
   \]
+  where
+  \[
+    L_{avg}=\frac{\tau}{\max(scale_{avg}, 1)},\quad
+    L_{max}=\frac{\tau_{frame}^{max}}{\max(scale_{max}, 1)},\quad
+    L_{util}=1-\frac{device\_active\_time}{pipeline\_work\_span}
+  \]
+  The latency scales come from all-device/all-host baselines.
   \vspace{0.5em}
-  \begin{block}{Latency limit}
-    A positive \texttt{latency\_limit} acts as a hard feasibility constraint:
+  \begin{block}{Latency limits}
+    Positive limits act as hard feasibility constraints:
     \[
-      \tau \leq latency\_limit
+      \tau \leq latency\_limit,\quad
+      \tau_{frame}^{max} \leq max\_frame\_latency\_limit
     \]
-    Candidates above the limit are rejected before objective comparison.
+    A zero value disables that limit. Candidates above either enabled limit are rejected before objective comparison.
   \end{block}
 \end{frame}
 
@@ -261,14 +266,14 @@
     \end{tabular}
   \end{table}
   \vspace{0.5em}
-  All modes enforce fixed-device nodes and the E2E latency cap.
+  All modes enforce fixed-device nodes plus the average E2E and max-frame latency caps.
 \end{frame}
 
 \begin{frame}{GUI Workflow}
   \begin{enumerate}
     \item Edit nodes, names, compute costs, fixed-device flags.
     \item Edit edges and transfer sizes in MB.
-    \item Configure bandwidth, latency, network batching, objective weight, solver mode, iterations, and E2E cap.
+    \item Configure bandwidth, latency, network batching, objective weights, solver mode, iterations, and latency caps.
     \item Click \textbf{Solve}.
     \item Inspect metrics, topology placement, and profiler-style timeline.
   \end{enumerate}
@@ -281,19 +286,20 @@
     \begin{column}{0.5\textwidth}
       \textbf{Topology SVG}
       \begin{itemize}
-        \item Blue: \device.
-        \item Green: \host.
-        \item Bold node border: fixed on \device.
-        \item Red dashed edge: cross-device transfer.
-        \item Gray solid edge: local dependency.
+        \item Config DAG shows transfer size and local/cross-device edge style before solving.
+        \item Solved pipeline uses high-contrast node fill color for frame identity.
+        \item Blue outline: \device; green outline: \host.
+        \item Bold or dashed source styling marks fixed-device and input/source events.
+        \item FIFO, transfer, local, and release lines follow the same frame color as the source frame.
       \end{itemize}
     \end{column}
     \begin{column}{0.5\textwidth}
       \textbf{Timeline SVG}
       \begin{itemize}
-        \item Host, Transfer, Device lanes.
-        \item Operator bars use computed start/finish times.
+        \item Input, Host, Transfer, and Device lanes.
+        \item Operator bars use computed start/finish times and the same frame fill color as the solved topology.
         \item Transfer bars use actual evaluator records, including serialized and batched transfers.
+        \item Input release dots, spans, and vertical release/dependency lines use the matching frame color.
         \item Browser-native scroll and scale controls.
       \end{itemize}
     \end{column}
@@ -364,6 +370,7 @@
     \item PyQt6 for desktop controls and layout.
     \item PyQt6-WebEngine for SVG topology and timeline rendering.
     \item NetworkX for DAG storage, topological sort, and validation.
+    \item C++/pybind11 native core for schedule evaluation, objective scoring, and solver search.
     \item Pytest coverage for evaluator, JSON IO, solver modes, and latency-limit feasibility.
     \item Launch commands: \texttt{python -m coopinfer} or \texttt{python -m coopinfer.app}.
   \end{itemize}

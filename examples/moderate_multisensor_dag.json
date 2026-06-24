@@ -145,8 +145,11 @@
   "environment": {
     "bandwidth": 80.0,
     "latency": 4.0,
-    "weight_latency": 0.75,
+    "weight_avg_latency": 0.75,
+    "weight_max_latency": 0.25,
+    "weight_device_utilization": 0.25,
     "latency_limit": 150.0,
+    "max_frame_latency_limit": 0.0,
     "batch_transfers": true,
     "pipeline_unroll": 3
   }
