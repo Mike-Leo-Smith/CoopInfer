@@ -9,6 +9,8 @@ python -m pip install -e ".[dev]"
 python -m coopinfer
 ```
 
+The Python package metadata includes the runtime dependencies and the native build tools used for the C++ extension (`cmake`, `ninja`, `pybind11`, and `scikit-build-core`). A C++ compiler is still required by the platform: MSVC Build Tools on Windows, Xcode Command Line Tools on macOS, or a standard GCC/Clang toolchain on Linux.
+
 You can also launch the GUI module directly:
 
 ```bash
@@ -31,6 +33,7 @@ The application stores graph topology, node/edge costs, environment parameters, 
 - `latency_limit` is an optional E2E latency cap in milliseconds. Use `0` to disable it; assignments above a positive limit are rejected.
 - The GUI has two topology views: the config DAG before solving, and the solved unrolled pipeline with placement, transfer, and FIFO edges.
 - The timeline visualizes the evaluator's actual compute and transfer records, including serialized, batched, and unrolled pipeline transfers.
+- Solver search and repeated schedule evaluation run through a C++ extension built with CMake/scikit-build-core. If the extension is unavailable in a source checkout, the Python implementation is used as a fallback.
 
 ## JSON Environment Fields
 

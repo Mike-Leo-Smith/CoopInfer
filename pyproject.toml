@@ -1,6 +1,11 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = [
+    "cmake>=3.18",
+    "ninja>=1.11",
+    "pybind11>=2.12",
+    "scikit-build-core>=0.10",
+]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "coopinfer"
@@ -16,11 +21,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "cmake>=3.18",
+    "ninja>=1.11",
     "pytest>=7.0",
+    "pybind11>=2.12",
+    "scikit-build-core>=0.10",
 ]
+
+[tool.scikit-build]
+cmake.version = ">=3.18"
+wheel.packages = ["src/coopinfer"]
 
 [project.scripts]
 coopinfer = "coopinfer.app:main"
-
-[tool.setuptools.packages.find]
-where = ["src"]

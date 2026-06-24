@@ -8,7 +8,7 @@ from typing import Dict, List, Optional
 
 import networkx as nx
 
-from .evaluator import EvaluationResult, baseline_bounds, evaluate
+from .evaluator import EvaluationResult, TransferRecord, baseline_bounds, evaluate
 
 
 @dataclass(frozen=True)
@@ -31,6 +31,21 @@ def solve(
     batch_transfers: bool = False,
     pipeline_unroll: int = 1,
 ) -> SolverResult:
+    cpp_result = _try_solve_cpp(
+        graph,
+        bandwidth,
+        latency,
+        weight_latency,
+        algorithm,
+        heuristic_iterations,
+        seed,
+        latency_limit,
+        batch_transfers,
+        pipeline_unroll,
+    )
+    if cpp_result is not None:
+        return cpp_result
+
     free_nodes = [
         node for node, attrs in graph.nodes(data=True) if not attrs.get("fixed_dev", False)
     ]
@@ -109,6 +124,82 @@ def solve(
             pipeline_unroll,
         )
     raise ValueError(f"Unknown solver algorithm: {algorithm}")
+
+
+def _try_solve_cpp(
+    graph: nx.DiGraph,
+    bandwidth: float,
+    latency: float,
+    weight_latency: float,
+    algorithm: str,
+    heuristic_iterations: int,
+    seed: int,
+    latency_limit: float,
+    batch_transfers: bool,
+    pipeline_unroll: int,
+) -> Optional[SolverResult]:
+    try:
+        from . import _core
+    except ImportError:
+        return None
+
+    node_ids = [str(node) for node in graph.nodes]
+    node_index = {node: index for index, node in enumerate(graph.nodes)}
+    data = {
+        "ids": node_ids,
+        "c_dev": [float(attrs["c_dev"]) for _, attrs in graph.nodes(data=True)],
+        "c_host": [float(attrs["c_host"]) for _, attrs in graph.nodes(data=True)],
+        "fixed_dev": [bool(attrs.get("fixed_dev", False)) for _, attrs in graph.nodes(data=True)],
+        "x_initial": [
+            0 if attrs.get("fixed_dev", False) else int(attrs.get("x", 1))
+            for _, attrs in graph.nodes(data=True)
+        ],
+        "edge_sources": [node_index[source] for source, _ in graph.edges],
+        "edge_targets": [node_index[target] for _, target in graph.edges],
+        "edge_sizes": [float(attrs.get("size", 0.0)) for _, _, attrs in graph.edges(data=True)],
+    }
+    params = {
+        "bandwidth": float(bandwidth),
+        "latency": float(latency),
+        "weight_latency": float(weight_latency),
+        "algorithm": algorithm,
+        "heuristic_iterations": int(heuristic_iterations),
+        "seed": int(seed),
+        "latency_limit": float(latency_limit),
+        "batch_transfers": bool(batch_transfers),
+        "pipeline_unroll": int(pipeline_unroll),
+    }
+    try:
+        raw = _core.solve_core(data, params)
+    except Exception as exc:
+        raise ValueError(str(exc)) from exc
+
+    raw_metrics = raw["metrics"]
+    transfer_records = tuple(
+        TransferRecord(
+            edges=tuple((str(source), str(target)) for source, target in transfer["edges"]),
+            start=float(transfer["start"]),
+            finish=float(transfer["finish"]),
+            size_mb=float(transfer["size_mb"]),
+            batched=bool(transfer["batched"]),
+        )
+        for transfer in raw_metrics["transfer_records"]
+    )
+    metrics = EvaluationResult(
+        latency=float(raw_metrics["latency"]),
+        device_utilization=float(raw_metrics["device_utilization"]),
+        loss=float(raw_metrics["loss"]),
+        start_times={str(node): float(value) for node, value in raw_metrics["start_times"].items()},
+        finish_times={str(node): float(value) for node, value in raw_metrics["finish_times"].items()},
+        transfer_records=transfer_records,
+        pipeline_unroll=int(raw_metrics["pipeline_unroll"]),
+    )
+    return SolverResult(
+        assignment={str(node): int(value) for node, value in raw["assignment"].items()},
+        metrics=metrics,
+        mode=str(raw["mode"]),
+        iterations=int(raw["iterations"]),
+    )
 
 
 def _brute_force(
