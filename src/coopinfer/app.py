@@ -53,7 +53,8 @@ class MainWindow(QMainWindow):
 
         self._seed_example()
         self.graph = self._graph_from_tables()
-        self._draw_graph()
+        self._draw_config_graph()
+        self._clear_solved_graph()
 
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
@@ -146,6 +147,9 @@ class MainWindow(QMainWindow):
         self.iterations_spin.setRange(1, 1_000_000)
         self.iterations_spin.setValue(3000)
         self.batch_transfers_check = QCheckBox("Batch successive outgoing transfers")
+        self.pipeline_unroll_spin = QSpinBox()
+        self.pipeline_unroll_spin.setRange(1, 64)
+        self.pipeline_unroll_spin.setValue(1)
 
         layout.addWidget(QLabel("Bandwidth"), 0, 0)
         layout.addWidget(self.bandwidth_spin, 0, 1)
@@ -161,10 +165,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(weight_hint, 4, 1, 1, 2)
         layout.addWidget(QLabel("Network"), 5, 0)
         layout.addWidget(self.batch_transfers_check, 5, 1, 1, 2)
-        layout.addWidget(QLabel("Solver"), 6, 0)
-        layout.addWidget(self.algorithm_combo, 6, 1, 1, 2)
-        layout.addWidget(QLabel("Iterations"), 7, 0)
-        layout.addWidget(self.iterations_spin, 7, 1, 1, 2)
+        layout.addWidget(QLabel("Pipeline Unroll"), 6, 0)
+        layout.addWidget(self.pipeline_unroll_spin, 6, 1, 1, 2)
+        layout.addWidget(QLabel("Solver"), 7, 0)
+        layout.addWidget(self.algorithm_combo, 7, 1, 1, 2)
+        layout.addWidget(QLabel("Iterations"), 8, 0)
+        layout.addWidget(self.iterations_spin, 8, 1, 1, 2)
         return group
 
     def _build_actions(self) -> QHBoxLayout:
@@ -184,11 +190,22 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
 
-        graph_group = QGroupBox("拓扑视图")
-        graph_layout = QVBoxLayout(graph_group)
-        self.graph_view = QWebEngineView()
-        graph_layout.addWidget(self.graph_view)
-        layout.addWidget(graph_group, stretch=4)
+        graph_splitter = QSplitter(Qt.Orientation.Vertical)
+
+        config_graph_group = QGroupBox("配置拓扑 (Config DAG)")
+        config_graph_layout = QVBoxLayout(config_graph_group)
+        self.config_graph_view = QWebEngineView()
+        config_graph_layout.addWidget(self.config_graph_view)
+        graph_splitter.addWidget(config_graph_group)
+
+        solved_graph_group = QGroupBox("求解展开拓扑 (Solved Pipeline)")
+        solved_graph_layout = QVBoxLayout(solved_graph_group)
+        self.solved_graph_view = QWebEngineView()
+        solved_graph_layout.addWidget(self.solved_graph_view)
+        graph_splitter.addWidget(solved_graph_group)
+        graph_splitter.setStretchFactor(0, 1)
+        graph_splitter.setStretchFactor(1, 1)
+        layout.addWidget(graph_splitter, stretch=4)
 
         metrics_group = QGroupBox("性能看板")
         metrics_layout = QGridLayout(metrics_group)
@@ -269,6 +286,7 @@ class MainWindow(QMainWindow):
             self.latency_limit_spin.setValue(environment.latency_limit)
             self.weight_slider.setValue(round(environment.weight_latency * 100))
             self.batch_transfers_check.setChecked(environment.batch_transfers)
+            self.pipeline_unroll_spin.setValue(environment.pipeline_unroll)
         finally:
             self._loading_tables = False
 
@@ -328,7 +346,8 @@ class MainWindow(QMainWindow):
         self.solver_result = None
         self._clear_metrics()
         self._clear_timeline()
-        self._draw_graph()
+        self._clear_solved_graph()
+        self._draw_config_graph()
 
     def _save_config(self) -> None:
         try:
@@ -379,6 +398,7 @@ class MainWindow(QMainWindow):
                 heuristic_iterations=self.iterations_spin.value(),
                 latency_limit=environment.latency_limit,
                 batch_transfers=environment.batch_transfers,
+                pipeline_unroll=environment.pipeline_unroll,
             )
         except Exception as exc:
             QMessageBox.warning(self, "Solve failed", str(exc))
@@ -389,7 +409,8 @@ class MainWindow(QMainWindow):
         self.graph = graph
         self.solver_result = result
         self._update_metrics(result)
-        self._draw_graph()
+        self._draw_config_graph()
+        self._draw_solved_graph()
         self._draw_timeline()
 
     def _graph_from_tables(self) -> nx.DiGraph:
@@ -409,7 +430,8 @@ class MainWindow(QMainWindow):
         self.solver_result = None
         self._clear_metrics()
         self._clear_timeline()
-        self._draw_graph()
+        self._clear_solved_graph()
+        self._draw_config_graph()
 
     def _read_tables(self) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
         nodes: List[Dict[str, object]] = []
@@ -459,7 +481,14 @@ class MainWindow(QMainWindow):
             weight_latency=self.weight_slider.value() / 100.0,
             latency_limit=self.latency_limit_spin.value(),
             batch_transfers=self.batch_transfers_check.isChecked(),
+            pipeline_unroll=self.pipeline_unroll_spin.value(),
         )
+
+    def _op_id(self, node: str, frame: int, unroll: int) -> str:
+        return node if unroll == 1 else f"{node}[f{frame}]"
+
+    def _base_node_id(self, op_id: str) -> str:
+        return op_id.split("[f", 1)[0] if "[f" in op_id else op_id
 
     def _cell_text(self, table: QTableWidget, row: int, column: int) -> str:
         item = table.item(row, column)
@@ -494,12 +523,30 @@ class MainWindow(QMainWindow):
         ]
         return nodes, edges
 
-    def _draw_graph(self) -> None:
+    def _draw_config_graph(self) -> None:
         if self.graph.number_of_nodes() == 0:
-            self.graph_view.setHtml(self._placeholder_html("No graph to display"))
+            self.config_graph_view.setHtml(self._placeholder_html("No graph to display"))
             return
+        self.config_graph_view.setHtml(
+            self._graph_svg_html(self.graph.copy(), solved=False, title="Config DAG")
+        )
 
-        graph = self.graph.copy()
+    def _clear_solved_graph(self) -> None:
+        self.solved_graph_view.setHtml(self._placeholder_html("Click Solve to render unrolled pipeline"))
+
+    def _draw_solved_graph(self) -> None:
+        if self.solver_result is None:
+            self._clear_solved_graph()
+            return
+        self.solved_graph_view.setHtml(
+            self._graph_svg_html(
+                self._unrolled_solution_graph(),
+                solved=True,
+                title="Solved Pipeline",
+            )
+        )
+
+    def _graph_svg_html(self, graph: nx.DiGraph, solved: bool, title: str) -> str:
         raw_pos = self._layered_layout(graph)
         x_values = [xy[0] for xy in raw_pos.values()]
         y_values = [xy[1] for xy in raw_pos.values()]
@@ -523,13 +570,24 @@ class MainWindow(QMainWindow):
         environment = self._environment_from_controls()
         rows = [
             '<defs><marker id="arrow-gray" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="#6b7280"/></marker>',
-            '<marker id="arrow-red" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="#dc2626"/></marker></defs>',
+            '<marker id="arrow-red" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="#dc2626"/></marker>',
+            '<marker id="arrow-purple" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="#7c3aed"/></marker></defs>',
         ]
         for source, target, attrs in graph.edges(data=True):
             sx, sy = pos[source]
             tx, ty = pos[target]
             size_mb = float(attrs.get("size", 0.0))
-            if int(graph.nodes[source].get("x", 0)) == int(graph.nodes[target].get("x", 0)):
+            if attrs.get("kind") == "fifo":
+                color = "#7c3aed"
+                dash = ' stroke-dasharray="3 5"'
+                marker = "arrow-purple"
+                label = "FIFO"
+            elif not solved:
+                color = "#6b7280"
+                dash = ""
+                marker = "arrow-gray"
+                label = f"{size_mb:g} MB"
+            elif int(graph.nodes[source].get("x", 0)) == int(graph.nodes[target].get("x", 0)):
                 color = "#6b7280"
                 dash = ""
                 marker = "arrow-gray"
@@ -559,22 +617,74 @@ class MainWindow(QMainWindow):
             x_pos, y_pos = pos[node]
             x_value = int(attrs.get("x", 0))
             fill = "#2563eb" if x_value == 0 else "#16a34a"
+            if not solved:
+                fill = "#f8fafc"
             place = "Dev" if x_value == 0 else "Host"
             compute = float(attrs["c_dev"]) if x_value == 0 else float(attrs["c_host"])
             stroke_width = 4 if attrs.get("fixed_dev", False) else 1.5
+            display_id = str(attrs.get("display_id", node))
+            node_name = str(attrs.get("name", node))
+            meta = f"{place}: {compute:g} ms" if solved else f"D:{float(attrs['c_dev']):g} / H:{float(attrs['c_host']):g} ms"
             rows.append(
-                f'<g><title>{html.escape(str(node))} {html.escape(str(attrs.get("name", node)))} - {place}: {compute:g} ms</title>'
-                f'<text class="node-name" x="{x_pos:.1f}" y="{y_pos - 43:.1f}">{html.escape(str(attrs.get("name", node)))}</text>'
+                f'<g><title>{html.escape(str(node))} {html.escape(node_name)} - {html.escape(meta)}</title>'
+                f'<text class="node-name" x="{x_pos:.1f}" y="{y_pos - 43:.1f}">{html.escape(node_name)}</text>'
                 f'<circle cx="{x_pos:.1f}" cy="{y_pos:.1f}" r="24" fill="{fill}" stroke="#111827" stroke-width="{stroke_width}" />'
-                f'<text class="node-id" x="{x_pos:.1f}" y="{y_pos + 5:.1f}">{html.escape(str(node))}</text>'
-                f'<text class="compute" x="{x_pos:.1f}" y="{y_pos + 48:.1f}">{place}: {compute:g} ms</text></g>'
+                f'<text class="node-id" x="{x_pos:.1f}" y="{y_pos + 5:.1f}">{html.escape(display_id)}</text>'
+                f'<text class="compute" x="{x_pos:.1f}" y="{y_pos + 48:.1f}">{html.escape(meta)}</text></g>'
             )
-        self.graph_view.setHtml(
-            self._svg_page("Topology", "\n".join(rows), width, height, scale_axis="xy")
-        )
+        return self._svg_page(title, "\n".join(rows), width, height, scale_axis="xy")
+
+    def _unrolled_solution_graph(self) -> nx.DiGraph:
+        assert self.solver_result is not None
+        result = self.solver_result
+        unroll = max(1, result.metrics.pipeline_unroll)
+        base_layers = {
+            node: layer
+            for layer, generation in enumerate(nx.topological_generations(self.graph))
+            for node in generation
+        }
+        graph = nx.DiGraph()
+        for frame in range(unroll):
+            for node, attrs in self.graph.nodes(data=True):
+                op_id = self._op_id(str(node), frame, unroll)
+                graph.add_node(
+                    op_id,
+                    name=f'{attrs.get("name", node)} f{frame}' if unroll > 1 else attrs.get("name", node),
+                    display_id=f"{node}/f{frame}" if unroll > 1 else str(node),
+                    base_node=str(node),
+                    frame=frame,
+                    layer=base_layers[node] + frame * (len(set(base_layers.values())) + 1),
+                    c_dev=attrs["c_dev"],
+                    c_host=attrs["c_host"],
+                    fixed_dev=attrs.get("fixed_dev", False),
+                    x=result.assignment[node],
+                )
+            for source, target, attrs in self.graph.edges(data=True):
+                graph.add_edge(
+                    self._op_id(str(source), frame, unroll),
+                    self._op_id(str(target), frame, unroll),
+                    size=float(attrs.get("size", 0.0)),
+                    kind="data",
+                )
+        if unroll > 1:
+            for frame in range(1, unroll):
+                for node in self.graph.nodes:
+                    graph.add_edge(
+                        self._op_id(str(node), frame - 1, unroll),
+                        self._op_id(str(node), frame, unroll),
+                        size=0.0,
+                        kind="fifo",
+                    )
+        return graph
 
     def _layered_layout(self, graph: nx.DiGraph) -> Dict[str, Tuple[float, float]]:
-        generations = [list(generation) for generation in nx.topological_generations(graph)]
+        if all("layer" in attrs for _, attrs in graph.nodes(data=True)):
+            by_layer: Dict[int, List[str]] = {}
+            for node, attrs in graph.nodes(data=True):
+                by_layer.setdefault(int(attrs["layer"]), []).append(node)
+            generations = [by_layer[layer] for layer in sorted(by_layer)]
+        else:
+            generations = [list(generation) for generation in nx.topological_generations(graph)]
         x_gap = 2.9
         y_gap = 1.65
         pos: Dict[str, Tuple[float, float]] = {}
@@ -591,7 +701,13 @@ class MainWindow(QMainWindow):
         return pos
 
     def _update_metrics(self, result: SolverResult) -> None:
-        self.latency_label.setText(f"端到端时延: {result.metrics.latency:.1f} ms")
+        if result.metrics.pipeline_unroll > 1:
+            self.latency_label.setText(
+                f"平均端到端时延: {result.metrics.latency:.1f} ms/frame "
+                f"(unroll {result.metrics.pipeline_unroll})"
+            )
+        else:
+            self.latency_label.setText(f"端到端时延: {result.metrics.latency:.1f} ms")
         self.util_label.setText(
             f"端侧算力利用率: {result.metrics.device_utilization * 100.0:.1f} %"
         )
@@ -653,15 +769,16 @@ class MainWindow(QMainWindow):
             tick += tick_step
 
         for node in sorted(metrics.start_times, key=lambda n: metrics.start_times[n]):
+            base_node = self._base_node_id(node)
             start = metrics.start_times[node]
             finish = metrics.finish_times[node]
             duration = max(0.1, finish - start)
-            x_value = int(assignment[node])
+            x_value = int(assignment[base_node])
             y_center = lane_y[x_value]
             x_pos = x_at(start)
             bar_width = max(6.0, duration * px_per_ms)
             color = "#2563eb" if x_value == 0 else "#16a34a"
-            node_name = esc(self.graph.nodes[node].get("name", node))
+            node_name = esc(self.graph.nodes[base_node].get("name", base_node))
             rows.append(
                 f'<g><title>{esc(node)} {node_name}: {start:.1f}-{finish:.1f} ms</title>'
                 f'<rect class="op" data-start="{start:.6f}" data-duration="{duration:.6f}" x="{x_pos:.1f}" y="{y_center - 16:.1f}" width="{bar_width:.1f}" '
@@ -701,8 +818,8 @@ class MainWindow(QMainWindow):
                 f'{esc(label)}</text>'
             )
             for source, target in transfer.edges:
-                source_y = lane_y[int(assignment[source])]
-                target_y = lane_y[int(assignment[target])]
+                source_y = lane_y[int(assignment[self._base_node_id(source)])]
+                target_y = lane_y[int(assignment[self._base_node_id(target)])]
                 rows.append(
                     f'<line class="dep" data-ms="{start:.6f}" x1="{x_pos:.1f}" y1="{source_y:.1f}" x2="{x_pos:.1f}" y2="{y_center:.1f}" />'
                     f'<line class="dep" data-ms="{finish:.6f}" x1="{end_x:.1f}" y1="{y_center:.1f}" x2="{end_x:.1f}" y2="{target_y:.1f}" />'
@@ -719,6 +836,7 @@ class MainWindow(QMainWindow):
             height,
             extra_info=(
                 f"<span>Total: {total_ms:.1f} ms</span>"
+                f"<span>Unroll: {environment.pipeline_unroll}</span>"
                 f"<span>Network: {'batched' if environment.batch_transfers else 'serialized'}</span>"
             ),
             scale_axis="timeline",

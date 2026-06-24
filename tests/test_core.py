@@ -123,6 +123,24 @@ def test_infer_latency_batches_successive_outgoing_transfers():
     assert latency == 208.0
 
 
+def test_pipeline_unroll_preserves_same_label_fifo():
+    graph = sample_graph()
+    latency, starts, finishes = infer_latency(
+        graph,
+        {"v1": 0, "v2": 1},
+        bandwidth=1000.0,
+        latency=0.0,
+        pipeline_unroll=2,
+    )
+
+    assert starts["v1[f0]"] == 0.0
+    assert finishes["v1[f0]"] == 10.0
+    assert starts["v1[f1]"] == 10.0
+    assert starts["v2[f0]"] == 11.0
+    assert starts["v2[f1]"] == 21.0
+    assert latency == 11.5
+
+
 def test_evaluate_reports_device_utilization():
     graph = sample_graph()
     result = evaluate(graph, {"v1": 0, "v2": 1}, bandwidth=10.0, latency=5.0, weight_latency=0.7)
@@ -192,10 +210,10 @@ def test_solver_supports_explicit_random_and_annealing_modes():
 def test_json_round_trip(tmp_path):
     graph = sample_graph()
     path = tmp_path / "config.json"
-    save_to_json(ProjectState(graph, Environment(50.0, 5.0, 0.7, 120.0, True)), path)
+    save_to_json(ProjectState(graph, Environment(50.0, 5.0, 0.7, 120.0, True, 3)), path)
 
     loaded = load_from_json(path)
-    assert loaded.environment == Environment(50.0, 5.0, 0.7, 120.0, True)
+    assert loaded.environment == Environment(50.0, 5.0, 0.7, 120.0, True, 3)
     assert set(loaded.graph.nodes) == {"v1", "v2"}
     assert loaded.graph.nodes["v1"]["name"] == "Input"
     assert loaded.graph.edges["v1", "v2"]["size"] == 1.0
@@ -204,6 +222,7 @@ def test_json_round_trip(tmp_path):
     assert data["version"] == "1.0"
     assert data["environment"]["latency_limit"] == 120.0
     assert data["environment"]["batch_transfers"] is True
+    assert data["environment"]["pipeline_unroll"] == 3
 
 
 def test_graph_from_records_can_be_checked_for_cycles():

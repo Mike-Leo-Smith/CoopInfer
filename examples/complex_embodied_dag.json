@@ -371,6 +371,7 @@
     "latency": 4.0,
     "weight_latency": 0.75,
     "latency_limit": 420.0,
-    "batch_transfers": true
+    "batch_transfers": true,
+    "pipeline_unroll": 3
   }
 }

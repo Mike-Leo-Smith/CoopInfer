@@ -18,6 +18,7 @@ class Environment:
     weight_latency: float = 0.7
     latency_limit: float = 0.0
     batch_transfers: bool = False
+    pipeline_unroll: int = 1
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,7 @@ def load_from_json(path: Union[str, Path]) -> ProjectState:
         weight_latency=float(environment_data.get("weight_latency", 0.7)),
         latency_limit=float(environment_data.get("latency_limit", 0.0)),
         batch_transfers=bool(environment_data.get("batch_transfers", False)),
+        pipeline_unroll=max(1, int(environment_data.get("pipeline_unroll", 1))),
     )
     graph = graph_from_records(data.get("nodes", []), data.get("edges", []))
     return ProjectState(graph=graph, environment=environment)
@@ -107,6 +109,7 @@ def save_to_json(state: ProjectState, path: Union[str, Path]) -> None:
             "weight_latency": float(state.environment.weight_latency),
             "latency_limit": float(state.environment.latency_limit),
             "batch_transfers": bool(state.environment.batch_transfers),
+            "pipeline_unroll": int(state.environment.pipeline_unroll),
         },
     }
     with Path(path).open("w", encoding="utf-8") as file:
