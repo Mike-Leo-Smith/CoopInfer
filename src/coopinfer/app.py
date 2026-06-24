@@ -59,16 +59,19 @@ class MainWindow(QMainWindow):
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
-
-        layout.addWidget(self._build_nodes_group())
-        layout.addWidget(self._build_edges_group())
-        layout.addWidget(self._build_environment_group())
-        layout.addLayout(self._build_actions())
-        layout.addStretch(1)
+        data_splitter = QSplitter(Qt.Orientation.Vertical)
+        data_splitter.addWidget(self._build_nodes_group())
+        data_splitter.addWidget(self._build_edges_group())
+        data_splitter.setStretchFactor(0, 3)
+        data_splitter.setStretchFactor(1, 2)
+        layout.addWidget(data_splitter, stretch=1)
+        layout.addWidget(self._build_environment_group(), stretch=0)
+        layout.addWidget(self._build_actions_group(), stretch=0)
         return panel
 
     def _build_nodes_group(self) -> QGroupBox:
         group = QGroupBox("节点配置 (Nodes)")
+        group.setMinimumHeight(120)
         layout = QVBoxLayout(group)
 
         self.nodes_table = QTableWidget(0, 5)
@@ -91,6 +94,7 @@ class MainWindow(QMainWindow):
 
     def _build_edges_group(self) -> QGroupBox:
         group = QGroupBox("边配置 (Edges)")
+        group.setMinimumHeight(100)
         layout = QVBoxLayout(group)
 
         self.edges_table = QTableWidget(0, 3)
@@ -111,6 +115,7 @@ class MainWindow(QMainWindow):
 
     def _build_environment_group(self) -> QGroupBox:
         group = QGroupBox("环境与策略 (Environment)")
+        group.setMinimumHeight(190)
         layout = QGridLayout(group)
 
         self.bandwidth_spin = QDoubleSpinBox()
@@ -173,8 +178,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.iterations_spin, 8, 1, 1, 2)
         return group
 
-    def _build_actions(self) -> QHBoxLayout:
-        layout = QHBoxLayout()
+    def _build_actions_group(self) -> QGroupBox:
+        group = QGroupBox("操作 (Actions)")
+        group.setMinimumHeight(72)
+        layout = QHBoxLayout(group)
         load_button = QPushButton("📂 加载配置 (Load)")
         save_button = QPushButton("💾 保存配置 (Save)")
         solve_button = QPushButton("🚀 求解切分预案 (Solve)")
@@ -184,7 +191,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(load_button)
         layout.addWidget(save_button)
         layout.addWidget(solve_button)
-        return layout
+        return group
 
     def _build_right_panel(self) -> QWidget:
         panel = QWidget()
@@ -193,21 +200,26 @@ class MainWindow(QMainWindow):
         graph_splitter = QSplitter(Qt.Orientation.Vertical)
 
         config_graph_group = QGroupBox("配置拓扑 (Config DAG)")
+        config_graph_group.setMinimumHeight(150)
         config_graph_layout = QVBoxLayout(config_graph_group)
         self.config_graph_view = QWebEngineView()
         config_graph_layout.addWidget(self.config_graph_view)
         graph_splitter.addWidget(config_graph_group)
 
         solved_graph_group = QGroupBox("求解展开拓扑 (Solved Pipeline)")
+        solved_graph_group.setMinimumHeight(150)
         solved_graph_layout = QVBoxLayout(solved_graph_group)
         self.solved_graph_view = QWebEngineView()
         solved_graph_layout.addWidget(self.solved_graph_view)
         graph_splitter.addWidget(solved_graph_group)
         graph_splitter.setStretchFactor(0, 1)
         graph_splitter.setStretchFactor(1, 1)
-        layout.addWidget(graph_splitter, stretch=4)
+        schedule_splitter = QSplitter(Qt.Orientation.Vertical)
+        schedule_splitter.addWidget(graph_splitter)
 
         metrics_group = QGroupBox("性能看板")
+        metrics_group.setMinimumHeight(82)
+        metrics_group.setMaximumHeight(96)
         metrics_layout = QGridLayout(metrics_group)
         self.latency_label = QLabel("端到端时延: -- ms")
         self.util_label = QLabel("端侧算力利用率: -- %")
@@ -217,13 +229,17 @@ class MainWindow(QMainWindow):
         metrics_layout.addWidget(self.util_label, 0, 1)
         metrics_layout.addWidget(self.loss_label, 1, 0)
         metrics_layout.addWidget(self.mode_label, 1, 1)
-        layout.addWidget(metrics_group, stretch=0)
 
         timeline_group = QGroupBox("时序图 (Solved Schedule)")
+        timeline_group.setMinimumHeight(150)
         timeline_layout = QVBoxLayout(timeline_group)
         self.timeline_view = QWebEngineView()
         timeline_layout.addWidget(self.timeline_view)
-        layout.addWidget(timeline_group, stretch=3)
+        schedule_splitter.addWidget(timeline_group)
+        schedule_splitter.setStretchFactor(0, 5)
+        schedule_splitter.setStretchFactor(1, 4)
+        layout.addWidget(schedule_splitter, stretch=1)
+        layout.addWidget(metrics_group, stretch=0)
         self._clear_timeline()
         return panel
 
@@ -625,11 +641,12 @@ class MainWindow(QMainWindow):
             display_id = str(attrs.get("display_id", node))
             node_name = str(attrs.get("name", node))
             meta = f"{place}: {compute:g} ms" if solved else f"D:{float(attrs['c_dev']):g} / H:{float(attrs['c_host']):g} ms"
+            id_fill = "#ffffff" if solved else "#111827"
             rows.append(
                 f'<g><title>{html.escape(str(node))} {html.escape(node_name)} - {html.escape(meta)}</title>'
                 f'<text class="node-name" x="{x_pos:.1f}" y="{y_pos - 43:.1f}">{html.escape(node_name)}</text>'
                 f'<circle cx="{x_pos:.1f}" cy="{y_pos:.1f}" r="24" fill="{fill}" stroke="#111827" stroke-width="{stroke_width}" />'
-                f'<text class="node-id" x="{x_pos:.1f}" y="{y_pos + 5:.1f}">{html.escape(display_id)}</text>'
+                f'<text class="node-id" style="fill:{id_fill}" x="{x_pos:.1f}" y="{y_pos + 5:.1f}">{html.escape(display_id)}</text>'
                 f'<text class="compute" x="{x_pos:.1f}" y="{y_pos + 48:.1f}">{html.escape(meta)}</text></g>'
             )
         return self._svg_page(title, "\n".join(rows), width, height, scale_axis="xy")

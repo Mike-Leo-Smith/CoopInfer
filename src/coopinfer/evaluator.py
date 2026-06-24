@@ -32,6 +32,10 @@ def edge_transfer_ms(size_mb: float, bandwidth_mb_s: float, latency_ms: float) -
     return latency_ms + (size_mb / bandwidth_mb_s * 1000.0)
 
 
+def base_node_id(op_id: str) -> str:
+    return op_id.split("[f", 1)[0] if "[f" in op_id else op_id
+
+
 def infer_latency(
     graph: nx.DiGraph,
     assignment: Mapping[str, int],
@@ -231,11 +235,15 @@ def evaluate(
     denom = tau_max - tau_min
     normalized_latency = 0.0 if abs(denom) < 1e-12 else (tau - tau_min) / denom
 
-    total_dev_cost = sum(float(attrs["c_dev"]) for _, attrs in graph.nodes(data=True))
-    used_dev_cost = sum(
-        float(graph.nodes[node]["c_dev"]) for node, x_value in assignment.items() if int(x_value) == 0
+    pipeline_makespan = max(finish_times.values()) if finish_times else 0.0
+    used_dev_active_time = sum(
+        finish_times[op_id] - start_times[op_id]
+        for op_id in start_times
+        if int(assignment[base_node_id(op_id)]) == 0
     )
-    device_utilization = 0.0 if total_dev_cost <= 0 else used_dev_cost / total_dev_cost
+    device_utilization = (
+        0.0 if pipeline_makespan <= 0 else used_dev_active_time / pipeline_makespan
+    )
     utilization_complement = 1.0 - device_utilization
     weight = min(1.0, max(0.0, float(weight_latency)))
     loss = weight * normalized_latency + (1.0 - weight) * utilization_complement

@@ -2,7 +2,7 @@ import json
 
 import networkx as nx
 
-from coopinfer.evaluator import evaluate, infer_latency
+from coopinfer.evaluator import base_node_id, evaluate, infer_latency
 from coopinfer.model import Environment, ProjectState, graph_from_records, load_from_json, save_to_json
 from coopinfer.solver import solve
 
@@ -141,11 +141,25 @@ def test_pipeline_unroll_preserves_same_label_fifo():
     assert latency == 11.5
 
 
+def test_evaluate_reports_pipeline_device_active_utilization():
+    graph = sample_graph()
+    result = evaluate(
+        graph,
+        {"v1": 0, "v2": 1},
+        bandwidth=1000.0,
+        latency=0.0,
+        weight_latency=0.7,
+        pipeline_unroll=2,
+    )
+
+    assert result.device_utilization == 20.0 / 23.0
+
+
 def test_evaluate_reports_device_utilization():
     graph = sample_graph()
     result = evaluate(graph, {"v1": 0, "v2": 1}, bandwidth=10.0, latency=5.0, weight_latency=0.7)
 
-    assert result.device_utilization == 10.0 / 30.0
+    assert result.device_utilization == 10.0 / 117.0
     assert result.loss >= 0.0
 
 
@@ -205,6 +219,21 @@ def test_solver_supports_explicit_random_and_annealing_modes():
     assert anneal_result.mode == "Simulated Annealing"
     assert random_result.assignment["v1"] == 0
     assert anneal_result.assignment["v1"] == 0
+
+
+def test_unrolled_operations_resolve_to_consistent_base_placement():
+    graph = sample_graph()
+    result = solve(
+        graph,
+        bandwidth=1000.0,
+        latency=0.0,
+        weight_latency=1.0,
+        pipeline_unroll=3,
+    )
+
+    assert set(result.assignment) == {"v1", "v2"}
+    for op_id in result.metrics.start_times:
+        assert result.assignment[base_node_id(op_id)] in {0, 1}
 
 
 def test_json_round_trip(tmp_path):

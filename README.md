@@ -26,6 +26,7 @@ The application stores graph topology, node/edge costs, environment parameters, 
 - Each cross-device transfer costs `latency_ms + size_mb / bandwidth_mb_s * 1000`.
 - The optional `batch_transfers` environment flag groups multiple outgoing cross-device transfers from the same source node into one network transaction. The batch pays fixed latency once and still pays bandwidth time for the summed payload size.
 - `pipeline_unroll` repeats the same DAG for multiple frames to model pipeline parallelism across consecutive inputs. The evaluator enforces FIFO ordering for the same logical node label across frames, while device, host, and network queues can overlap different labels from different frames.
+- Device utilization is reported as `device_active_time / total_pipeline_makespan`, not as a static sum of assigned node costs.
 - The solver can run Auto, Enumerate, Random Search, or Simulated Annealing. Auto uses enumeration for up to 12 free nodes and random search beyond that.
 - `latency_limit` is an optional E2E latency cap in milliseconds. Use `0` to disable it; assignments above a positive limit are rejected.
 - The GUI has two topology views: the config DAG before solving, and the solved unrolled pipeline with placement, transfer, and FIFO edges.
