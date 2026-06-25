@@ -13,8 +13,8 @@
 \author{CoopInfer 项目}
 \date{\today}
 
-\newcommand{\device}{\textsc{Device}}
-\newcommand{\host}{\textsc{Host}}
+\newcommand{\device}{\textsf{Device}}
+\newcommand{\host}{\textsf{Host}}
 
 \begin{document}
 
@@ -69,7 +69,7 @@
     \node[block, fill=blue!12] (edit) at (0,0) {GUI 编辑\\节点、边、环境};
     \node[data, fill=gray!12, right=1.8cm of edit] (json) {JSON\\状态};
     \node[block, fill=green!12, right=1.8cm of json] (graph) {NetworkX\\DAG};
-    \node[block, fill=orange!18, below=1.25cm of graph] (eval) {原生解析器\\列表调度};
+    \node[block, fill=orange!18, below=1.25cm of graph] (eval) {原生解析器\\调度集成};
     \node[block, fill=purple!14, left=1.8cm of eval] (solver) {求解器\\搜索 $x$};
     \node[block, fill=red!10, left=1.8cm of solver] (viz) {SVG 视图\\拓扑 + 时序};
 
@@ -157,50 +157,63 @@
 \end{frame}
 
 \begin{frame}{内层解析器步骤 2：就绪列表事件循环}
-  仿真器维护剩余依赖数量、最早数据就绪时间，以及三类串行资源的空闲时间：
+  \small
+  仿真器维护剩余依赖数、任务就绪时间，以及三类串行资源队列时钟：
   \[
-    time\_dev\_ready,\quad time\_host\_ready,\quad time\_network\_ready
+    S_t=\max(ready_t,\ release_t,\ resource\_ready_t)
   \]
-  就绪任务的开始时刻为：
-  \[
-    S_t =
-    \begin{cases}
-      ready_t, & resource(t)=source \\
-      \max(ready_t, time\_dev\_ready), & resource(t)=device \\
-      \max(ready_t, time\_host\_ready), & resource(t)=host \\
-      \max(ready_t, time\_network\_ready), & resource(t)=network
-    \end{cases}
-  \]
-  主循环：
-  \begin{enumerate}
-    \item 把剩余依赖数为 0 的任务加入就绪集合。
-    \item 选择可行开始时间最早的就绪任务。
-    \item 若开始时间相同，则用当前启发式规则打破平局。
-    \item 记录开始/结束时间，更新资源队列，并释放后继任务。
-  \end{enumerate}
-  贪心模式每步提交一个选择；lookahead 模式保留宽度为 4 的 beam，
-  对前三个 ready 候选分支，并用串行资源完成时间下界裁剪部分调度。
+  Source 任务的资源时钟为 0；Device、Host、Network 使用各自的串行队列时钟。
+
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.49\textwidth}
+      \textbf{贪心循环}
+      \begin{enumerate}
+        \item 零 pending 任务进入 ready。
+        \item 选择最早可行开始时间。
+        \item 用当前规则打破平局。
+        \item 记录区间并释放后继。
+      \end{enumerate}
+    \end{column}
+    \begin{column}{0.49\textwidth}
+      \textbf{Lookahead 分支}
+      \begin{itemize}
+        \item 按开始时间、规则优先级、任务 id 排序。
+        \item 对前三个 ready 候选分支。
+        \item 用串行资源完成下界保留宽度为 4 的 beam。
+        \item 完整调度仍用同一个全局 Loss 评分。
+      \end{itemize}
+    \end{column}
+  \end{columns}
 \end{frame}
 
 \begin{frame}{内层解析器步骤 3：多规则集成}
+  \small
   每个候选方案只构建一次任务 DAG 和向上 rank：
   \[
     rank(t)=duration(t)+\max_{u \in succ(t)} rank(u)
   \]
-  解析器会仿真七种确定性规则：
-  \begin{itemize}
-    \item \textbf{CriticalPath}：优先级为 rank 加老帧加成
-      \[
-        rank(t)+10^6\max(0, unroll-1-frame(t)).
-      \]
-    \item \textbf{DeviceFirst}：Source、端侧、Network、边侧依次优先；同类用耗时和 rank 打破平局。
-    \item \textbf{HostFirst}：Source、边侧、Network、端侧依次优先。
-    \item \textbf{NetworkFirst}：Source、Network、端侧、边侧依次优先。
-    \item \textbf{OutputFirst}：输出计算任务优先，然后按老帧加成和 rank 排序。
-    \item \textbf{Throughput}：年轻帧加成和 rank，用于测试稳态流水调度。
-    \item \textbf{FifoReady}：在相同可行开始时间下按任务创建顺序稳定排序。
-  \end{itemize}
-  贪心模式通过最早可行开始时间保持资源不无谓空转；lookahead 使用同一排序来选择有限分支候选。
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.49\textwidth}
+      \textbf{时延导向}
+      \begin{itemize}
+        \item \textbf{CriticalPath}：rank 加老帧加成。
+        \item \textbf{OutputFirst}：输出任务、老帧、rank。
+        \item \textbf{FifoReady}：可行开始后按创建顺序。
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.49\textwidth}
+      \textbf{资源导向}
+      \begin{itemize}
+        \item \textbf{DeviceFirst}：Source、端侧、Network、边侧。
+        \item \textbf{HostFirst}：Source、边侧、Network、端侧。
+        \item \textbf{NetworkFirst}：Source、Network、端侧、边侧。
+        \item \textbf{Throughput}：年轻帧优先，然后 rank。
+      \end{itemize}
+    \end{column}
+  \end{columns}
+  \vspace{0.4em}
+
+  贪心模式只在最早开始时间相同后使用该排序；lookahead 用它选择有限分支候选。
 \end{frame}
 
 \begin{frame}{内层解析器步骤 4：尾帧时延重排}
@@ -356,7 +369,7 @@
         \item 配置 DAG 在求解前展示数据量以及本地/跨设备边样式。
         \item 求解后的展开流水线使用高对比填充色表示帧编号。
         \item 蓝色轮廓表示端侧，绿色轮廓表示边侧。
-        \item 加粗或虚线源节点样式表示固定端侧和输入源事件。
+        \item 配置图用加粗轮廓表示固定端侧节点；求解图用虚线轮廓表示输入源事件。
         \item FIFO、传输、本地依赖和释放线都跟随源帧的同一颜色。
       \end{itemize}
     \end{column}
@@ -376,21 +389,21 @@
 \begin{frame}{拓扑图与时序图读法}
   \centering
   \begin{tikzpicture}[
-      node/.style={circle, draw=black, minimum size=0.82cm, font=\bfseries\scriptsize},
+      node/.style={circle, draw=black, line width=1.3pt, minimum size=0.82cm, font=\bfseries\scriptsize},
       arrow/.style={-{Latex[length=2.4mm]}, thick},
       lane/.style={draw=gray!35},
       op/.style={rounded corners=2pt, minimum height=0.32cm, font=\scriptsize},
       x=1cm, y=1cm
     ]
-    \node[node, fill=blue!65, text=white] (a) at (0,2.9) {v1};
-    \node[node, fill=green!65, text=white] (b) at (1.8,3.35) {v2};
-    \node[node, fill=green!65, text=white] (c) at (1.8,2.45) {v3};
-    \node[node, fill=blue!65, text=white, line width=1.2pt] (d) at (3.6,2.9) {v4};
+    \node[node, fill=blue!25, draw=blue!70!black] (a) at (0,2.9) {v1};
+    \node[node, fill=orange!30, draw=green!60!black] (b) at (1.8,3.35) {v2};
+    \node[node, fill=orange!30, draw=green!60!black] (c) at (1.8,2.45) {v3};
+    \node[node, fill=blue!25, draw=blue!70!black] (d) at (3.6,2.9) {v4};
     \draw[arrow, red, dashed] (a) -- node[above, font=\tiny] {2 MB} (b);
     \draw[arrow, red, dashed] (a) -- node[below, font=\tiny] {1 MB} (c);
     \draw[arrow, gray] (b) -- (d);
     \draw[arrow, red, dashed] (c) -- (d);
-    \node[font=\scriptsize] at (1.8,1.75) {拓扑图：颜色表示放置位置，边样式表示通信关系};
+    \node[font=\scriptsize] at (1.8,1.75) {拓扑图：填充表示帧，轮廓表示放置，虚线边表示传输};
 
     \begin{scope}[shift={(5.2,2.0)}, x=0.045cm, y=0.7cm]
       \draw[lane] (0,2.0) -- (135,2.0);
@@ -399,11 +412,11 @@
       \node[left, font=\scriptsize] at (0,2.0) {Host};
       \node[left, font=\scriptsize] at (0,1.1) {Net};
       \node[left, font=\scriptsize] at (0,0.2) {Dev};
-      \node[op, fill=blue!65, text=white, minimum width=22*0.045cm] at (11,0.2) {v1};
+      \node[op, fill=blue!25, draw=blue!70!black, minimum width=22*0.045cm] at (11,0.2) {v1};
       \node[op, fill=orange!55, minimum width=52*0.045cm] at (48,1.1) {batch};
-      \node[op, fill=green!65, text=white, minimum width=22*0.045cm] at (85,2.0) {v2};
-      \node[op, fill=green!65, text=white, minimum width=18*0.045cm] at (105,2.0) {v3};
-      \node[op, fill=blue!65, text=white, minimum width=24*0.045cm] at (122,0.2) {v4};
+      \node[op, fill=orange!30, draw=green!60!black, minimum width=22*0.045cm] at (85,2.0) {v2};
+      \node[op, fill=orange!30, draw=green!60!black, minimum width=18*0.045cm] at (105,2.0) {v3};
+      \node[op, fill=blue!25, draw=blue!70!black, minimum width=24*0.045cm] at (122,0.2) {v4};
     \end{scope}
     \node[font=\scriptsize] at (8.2,1.05) {时序图：条形位置来自解析器计算出的开始/完成时间};
   \end{tikzpicture}

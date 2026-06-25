@@ -3,8 +3,6 @@
 \usetheme{Madrid}
 \usecolortheme{default}
 
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
 \usepackage{amsmath}
 \usepackage{booktabs}
 \usepackage{tikz}
@@ -15,8 +13,8 @@
 \author{CoopInfer Project}
 \date{\today}
 
-\newcommand{\device}{\textsc{Device}}
-\newcommand{\host}{\textsc{Host}}
+\newcommand{\device}{\textsf{Device}}
+\newcommand{\host}{\textsf{Host}}
 
 \begin{document}
 
@@ -71,7 +69,7 @@
     \node[block, fill=blue!12] (edit) at (0,0) {GUI Editor\\Nodes, Edges, Env};
     \node[data, fill=gray!12, right=1.8cm of edit] (json) {JSON\\State};
     \node[block, fill=green!12, right=1.8cm of json] (graph) {NetworkX\\DAG};
-    \node[block, fill=orange!18, below=1.25cm of graph] (eval) {Native Evaluator\\List Scheduling};
+    \node[block, fill=orange!18, below=1.25cm of graph] (eval) {Native Evaluator\\Schedule Ensemble};
     \node[block, fill=purple!14, left=1.8cm of eval] (solver) {Solver\\Search over $x$};
     \node[block, fill=red!10, left=1.8cm of solver] (viz) {SVG Views\\Topology + Timeline};
 
@@ -159,51 +157,65 @@
 \end{frame}
 
 \begin{frame}{Evaluator Step 2: Ready-List Event Loop}
-  The simulator maintains pending dependencies, earliest ready times, and one serialized ready time per resource:
+  \small
+  The simulator maintains pending dependencies, per-task ready times, and one serialized queue clock per resource:
   \[
-    time\_dev\_ready,\quad time\_host\_ready,\quad time\_network\_ready
+    S_t=\max(ready_t,\ release_t,\ resource\_ready_t)
   \]
-  A ready task starts at:
-  \[
-    S_t =
-    \begin{cases}
-      ready_t, & resource(t)=source \\
-      \max(ready_t, time\_dev\_ready), & resource(t)=device \\
-      \max(ready_t, time\_host\_ready), & resource(t)=host \\
-      \max(ready_t, time\_network\_ready), & resource(t)=network
-    \end{cases}
-  \]
-  Main loop:
-  \begin{enumerate}
-    \item Put zero-pending tasks into the ready set.
-    \item Pick the ready task with the earliest feasible start time.
-    \item Break ties with the active rule priority.
-    \item Record start/finish, update the resource queue, and release successors.
-  \end{enumerate}
-  Greedy mode commits to one choice per step. Lookahead mode keeps a width-4 beam,
-  branches on the first three ready candidates, and prunes partial schedules by a
-  serialized-resource completion lower bound.
+  For source tasks, the resource clock is zero. Device, Host, and Network tasks
+  use their serialized queue clocks.
+
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.49\textwidth}
+      \textbf{Greedy loop}
+      \begin{enumerate}
+        \item Add zero-pending tasks to ready.
+        \item Pick the earliest feasible start.
+        \item Use the active rule as tie-breaker.
+        \item Record the interval and release successors.
+      \end{enumerate}
+    \end{column}
+    \begin{column}{0.49\textwidth}
+      \textbf{Lookahead brancher}
+      \begin{itemize}
+        \item Sort ready candidates by start, rule priority, and task id.
+        \item Branch on the first three candidates.
+        \item Keep a width-4 beam using a serialized-resource completion bound.
+        \item Score completed schedules with the same global loss.
+      \end{itemize}
+    \end{column}
+  \end{columns}
 \end{frame}
 
 \begin{frame}{Evaluator Step 3: Ensemble Rules}
+  \small
   The task DAG and upward ranks are built once per assignment:
   \[
     rank(t)=duration(t)+\max_{u \in succ(t)} rank(u)
   \]
-  The evaluator simulates seven deterministic rules:
-  \begin{itemize}
-    \item \textbf{CriticalPath}: higher rank first, with older-frame aging
-      \[
-        rank(t)+10^6\max(0, unroll-1-frame(t)).
-      \]
-    \item \textbf{DeviceFirst}: source tasks, then Device, then Network, then Host; duration and rank break ties.
-    \item \textbf{HostFirst}: source tasks, then Host, then Network, then Device.
-    \item \textbf{NetworkFirst}: source tasks, then Network, then Device, then Host.
-    \item \textbf{OutputFirst}: output compute tasks first, then older-frame aging and rank.
-    \item \textbf{Throughput}: younger-frame aging and rank to test steady-state pipeline schedules.
-    \item \textbf{FifoReady}: stable creation order after earliest feasible start time.
-  \end{itemize}
-  Greedy mode remains work-conserving through earliest-start selection; lookahead uses the same ordering to choose bounded branch candidates.
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.49\textwidth}
+      \textbf{Latency-oriented}
+      \begin{itemize}
+        \item \textbf{CriticalPath}: rank plus older-frame aging.
+        \item \textbf{OutputFirst}: output tasks, older frames, then rank.
+        \item \textbf{FifoReady}: stable creation order after feasible start.
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.49\textwidth}
+      \textbf{Resource-oriented}
+      \begin{itemize}
+        \item \textbf{DeviceFirst}: Source, Device, Network, Host.
+        \item \textbf{HostFirst}: Source, Host, Network, Device.
+        \item \textbf{NetworkFirst}: Source, Network, Device, Host.
+        \item \textbf{Throughput}: younger frames before rank.
+      \end{itemize}
+    \end{column}
+  \end{columns}
+  \vspace{0.4em}
+
+  Greedy mode uses this ordering only after earliest-start comparison; lookahead
+  uses it to choose bounded branch candidates.
 \end{frame}
 
 \begin{frame}{Evaluator Step 4: Tail-Latency Retiming}
@@ -358,7 +370,7 @@
         \item Config DAG shows transfer size and local/cross-device edge style before solving.
         \item Solved pipeline uses high-contrast node fill color for frame identity.
         \item Blue outline: \device; green outline: \host.
-        \item Bold or dashed source styling marks fixed-device and input/source events.
+        \item Config views use a bold outline for fixed-device nodes; solved source events use dashed outlines.
         \item FIFO, transfer, local, and release lines follow the same frame color as the source frame.
       \end{itemize}
     \end{column}
@@ -378,21 +390,21 @@
 \begin{frame}{Topology and Timeline Reading Guide}
   \centering
   \begin{tikzpicture}[
-      node/.style={circle, draw=black, minimum size=0.82cm, font=\bfseries\scriptsize},
+      node/.style={circle, draw=black, line width=1.3pt, minimum size=0.82cm, font=\bfseries\scriptsize},
       arrow/.style={-{Latex[length=2.4mm]}, thick},
       lane/.style={draw=gray!35},
       op/.style={rounded corners=2pt, minimum height=0.32cm, font=\scriptsize},
       x=1cm, y=1cm
     ]
-    \node[node, fill=blue!65, text=white] (a) at (0,2.9) {v1};
-    \node[node, fill=green!65, text=white] (b) at (1.8,3.35) {v2};
-    \node[node, fill=green!65, text=white] (c) at (1.8,2.45) {v3};
-    \node[node, fill=blue!65, text=white, line width=1.2pt] (d) at (3.6,2.9) {v4};
+    \node[node, fill=blue!25, draw=blue!70!black] (a) at (0,2.9) {v1};
+    \node[node, fill=orange!30, draw=green!60!black] (b) at (1.8,3.35) {v2};
+    \node[node, fill=orange!30, draw=green!60!black] (c) at (1.8,2.45) {v3};
+    \node[node, fill=blue!25, draw=blue!70!black] (d) at (3.6,2.9) {v4};
     \draw[arrow, red, dashed] (a) -- node[above, font=\tiny] {2 MB} (b);
     \draw[arrow, red, dashed] (a) -- node[below, font=\tiny] {1 MB} (c);
     \draw[arrow, gray] (b) -- (d);
     \draw[arrow, red, dashed] (c) -- (d);
-    \node[font=\scriptsize] at (1.8,1.75) {Topology: colors show placement; edge style shows communication};
+    \node[font=\scriptsize] at (1.8,1.75) {Topology: fill = frame, outline = placement, dashed edge = transfer};
 
     \begin{scope}[shift={(5.2,2.0)}, x=0.045cm, y=0.7cm]
       \draw[lane] (0,2.0) -- (135,2.0);
@@ -401,11 +413,11 @@
       \node[left, font=\scriptsize] at (0,2.0) {Host};
       \node[left, font=\scriptsize] at (0,1.1) {Net};
       \node[left, font=\scriptsize] at (0,0.2) {Dev};
-      \node[op, fill=blue!65, text=white, minimum width=22*0.045cm] at (11,0.2) {v1};
+      \node[op, fill=blue!25, draw=blue!70!black, minimum width=22*0.045cm] at (11,0.2) {v1};
       \node[op, fill=orange!55, minimum width=52*0.045cm] at (48,1.1) {batch};
-      \node[op, fill=green!65, text=white, minimum width=22*0.045cm] at (85,2.0) {v2};
-      \node[op, fill=green!65, text=white, minimum width=18*0.045cm] at (105,2.0) {v3};
-      \node[op, fill=blue!65, text=white, minimum width=24*0.045cm] at (122,0.2) {v4};
+      \node[op, fill=orange!30, draw=green!60!black, minimum width=22*0.045cm] at (85,2.0) {v2};
+      \node[op, fill=orange!30, draw=green!60!black, minimum width=18*0.045cm] at (105,2.0) {v3};
+      \node[op, fill=blue!25, draw=blue!70!black, minimum width=24*0.045cm] at (122,0.2) {v4};
     \end{scope}
     \node[font=\scriptsize] at (8.2,1.05) {Timeline: bars show actual evaluator start/finish times};
   \end{tikzpicture}

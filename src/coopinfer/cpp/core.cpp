@@ -1420,7 +1420,9 @@ int solver_thread_count(std::uint64_t work_items, int requested_threads) {
     if (threads <= 0) {
         threads = 1;
     }
-    threads = std::min(threads, static_cast<int>(work_items));
+    if (work_items < static_cast<std::uint64_t>(threads)) {
+        threads = static_cast<int>(work_items);
+    }
     return std::max(1, threads);
 }
 
@@ -1778,7 +1780,8 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
                     for (int worker = 0; worker < threads; ++worker) {
                         int begin = total_iterations * worker / threads;
                         int end = total_iterations * (worker + 1) / threads;
-                        workers.emplace_back([&, worker, begin, end]() {
+                        int local_iterations = std::max(1, end - begin);
+                        workers.emplace_back([&, worker, begin, end, local_iterations]() {
                             try {
                                 std::mt19937 rng(mix_seed(seed, worker));
                                 std::uniform_real_distribution<double> unit(0.0, 1.0);
@@ -1797,8 +1800,8 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
                                     keep_search_result(local, current, current_metrics, 0);
                                 }
                                 for (int step = begin; step < end; ++step) {
-                                    double progress = static_cast<double>(step) /
-                                                      std::max(1, total_iterations - 1);
+                                    double progress = static_cast<double>(step - begin) /
+                                                      std::max(1, local_iterations - 1);
                                     double temperature = anneal_initial_temp * std::pow(
                                         anneal_final_temp / anneal_initial_temp,
                                         progress

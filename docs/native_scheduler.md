@@ -14,8 +14,11 @@ For a fixed assignment `x`, the evaluator receives:
 - Source cadence fields `source_period_ms` and `source_phase_ms`.
 - Environment bandwidth, fixed transfer latency, batching flag, and
   `pipeline_unroll`.
-- Objective weights for average E2E latency, max-frame E2E latency, and device
-  utilization.
+- Objective weights for average E2E latency, max-frame E2E latency, initiation
+  interval, and device utilization. The public GUI/model path exposes average
+  E2E, max-frame E2E, and device-utilization weights; the native parser accepts
+  `weight_initiation_interval` for direct/internal callers and otherwise
+  defaults it to zero.
 
 Placement values are binary: `x=0` means Device and `x=1` means Host. Fixed
 device nodes are enforced by the solver before evaluation.
@@ -285,7 +288,9 @@ loss =
 ```
 
 `L_avg`, `L_max`, and `L_ii` are normalized by all-device/all-host baseline
-scales. `L_util` is `1 - device_utilization`.
+scales. `L_util` is `1 - device_utilization`. Public GUI/model calls leave
+`weight_initiation_interval` at zero while still reporting the initiation
+interval metric and loss term.
 
 The schedule with the lowest loss wins, so the inner evaluator follows the same
 global split objective used by the solver. If losses tie, the evaluator picks
