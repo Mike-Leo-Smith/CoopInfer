@@ -83,11 +83,12 @@ The FIFO dependency prevents younger frames from overtaking older frames at the
 same logical operator. This protects frame order and avoids schedules that look
 good in aggregate but produce pathological control-tail latency.
 
-## Tail-Latency Variants
+## Tail-Latency Retiming
 
 The evaluator simulates several deterministic variants for the same assignment
-and chooses the one with the best configured loss. Two variants specifically
-target long tail-frame latency.
+and chooses the one with the best configured loss. It also applies a conservative
+postprocess sweep to reduce artificial tail-frame latency without blocking
+legitimate inter-frame pipeline overlap.
 
 ### Deferred Blocked Transfers
 
@@ -107,17 +108,30 @@ release, then wait a long time for the compute queue. The new variant waits
 until that compute slot is actually reachable, reducing max-frame E2E without
 changing the output finish time.
 
-### Frame-Drain Gate
+### Postprocess Right-Shift Sweep
 
 Fast side branches can also start very early and then wait at a join for a slow
-branch. The frame-drain variant adds a dependency from the previous frame's
-output task(s) to younger-frame non-source work. That makes the schedule drain
-older frame outputs before starting younger-frame side work that cannot complete
-the frame yet.
+branch. A frame-wide gate fixes that symptom but breaks pipeline parallelism by
+forcing younger frames to wait for older frame outputs. CoopInfer does not add
+that gate.
 
-This variant is useful when max-frame latency matters more than exposing every
-possible early side-branch operation. It may trade some apparent overlap for
-more stable per-frame E2E latency.
+Instead, after the work-conserving list schedule is built, the native core runs a
+backward right-shift sweep over the scheduled task order:
+
+1. Output compute tasks are anchored; their finish times are not moved.
+2. Source tasks are anchored at their release times.
+3. Network tasks and same-frame join side-branch compute tasks may move later.
+4. A moved task must still finish before every successor starts.
+5. A moved task must still finish before the next task on the same serialized
+   resource starts.
+6. A moved task must still start after its release time and all predecessor
+   finishes.
+
+The sweep is a tiling/compaction pass over the already feasible schedule: it
+removes idle gaps that only make a frame appear to have started earlier, but it
+does not change output completion times, resource order, or data dependencies.
+Linear feeder stages remain left-packed, so a Device stage from frame `f+1` can
+overlap a Host output from frame `f`.
 
 ## Scheduling Rules
 
@@ -198,11 +212,11 @@ ready task can start earlier.
 The evaluator currently tests all combinations of:
 
 - `defer_blocked_transfers = false/true`
-- `gate_next_frame_work = false/true`
 - `CriticalPath`, `DeviceFirst`, `FifoReady`
 
-That gives twelve deterministic schedules per candidate assignment. The native
-core extracts metrics and computes the configured split loss for each schedule:
+That gives six deterministic list schedules per candidate assignment. Each one
+is then passed through the right-shift sweep before metric extraction. The
+native core computes the configured split loss for each retimed schedule:
 
 ```text
 loss =

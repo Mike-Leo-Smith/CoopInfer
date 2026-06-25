@@ -363,8 +363,43 @@ def test_evaluator_delays_fast_join_branch_to_reduce_tail_frame_latency():
 
     assert result.latency == 51.0
     assert result.max_frame_latency == 51.0
-    assert result.start_times["fast_branch[f1]"] == 51.0
-    assert result.start_times["fast_branch[f2]"] == 102.0
+    assert result.start_times["fast_branch[f0]"] == 49.0
+    assert result.start_times["fast_branch[f1]"] == 100.0
+    assert result.start_times["fast_branch[f2]"] == 151.0
+    assert result.start_times["slow_branch[f1]"] == 51.0
+    assert result.start_times["slow_branch[f2]"] == 102.0
+
+
+def test_evaluator_preserves_inter_frame_pipeline_overlap():
+    graph = graph_from_records(
+        [
+            {"id": "input", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": True},
+            {"id": "stage", "c_dev": 50.0, "c_host": 50.0, "fixed_dev": True},
+            {"id": "head", "c_dev": 100.0, "c_host": 100.0, "fixed_dev": False},
+        ],
+        [
+            {"source": "input", "target": "stage", "size": 0.0},
+            {"source": "stage", "target": "head", "size": 0.0},
+        ],
+    )
+
+    result = evaluate(
+        graph,
+        {"input": 0, "stage": 0, "head": 1},
+        bandwidth=1000.0,
+        latency=0.0,
+        **LATENCY_ONLY_WEIGHTS,
+        pipeline_unroll=3,
+    )
+
+    assert result.start_times["stage[f0]"] == 0.0
+    assert result.start_times["stage[f1]"] == 50.0
+    assert result.start_times["stage[f2]"] == 100.0
+    assert result.start_times["stage[f1]"] < result.finish_times["head[f0]"]
+    assert result.start_times["stage[f2]"] < result.finish_times["head[f0]"]
+    assert result.start_times["head[f0]"] == 50.0
+    assert result.start_times["head[f1]"] == 150.0
+    assert result.latency == 350.0 / 3.0
 
 
 def test_solver_accounts_for_source_period_in_pipeline_result():

@@ -199,20 +199,20 @@
   The earliest-start selection keeps the scheduler work-conserving; priorities decide only among tasks that can start at the same time.
 \end{frame}
 
-\begin{frame}{Evaluator Step 4: Tail-Latency Variants}
-  The evaluator also simulates timing variants that reduce artificial long tail-frame E2E windows:
+\begin{frame}{Evaluator Step 4: Tail-Latency Retiming}
+  The evaluator reduces artificial long tail-frame E2E windows without adding frame-wide gates:
   \begin{itemize}
     \item \textbf{Deferred blocked transfers}: if a cross-device target is still blocked by other prerequisites, delay the transfer until those prerequisites finish.
-    \item \textbf{Frame-drain gate}: for younger frames, wait for the previous frame output before starting non-source side-branch work.
+    \item \textbf{Right-shift sweep}: after list scheduling, move slack network tasks and join-side branch work later, as long as successors, resource order, releases, and output finish times remain unchanged.
   \end{itemize}
-  These variants avoid counting early work that cannot help output completion as the frame's first non-input event.
+  This avoids counting early work that cannot help output completion as the frame's first non-input event, while preserving true inter-frame overlap.
   \vspace{0.5em}
 
   Per assignment, the native core evaluates:
   \[
-    2 \times 2 \times 3 = 12
+    2 \times 3 = 6
   \]
-  deterministic schedules: two transfer timings, two frame-drain modes, and three ready-list rules.
+  deterministic list schedules: two transfer timings and three ready-list rules. Each schedule is then retimed by the conservative sweep before metric extraction.
 \end{frame}
 
 \begin{frame}{Evaluator Step 5: Metrics and Winner Selection}

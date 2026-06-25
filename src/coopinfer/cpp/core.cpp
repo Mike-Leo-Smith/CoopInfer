@@ -295,7 +295,6 @@ std::vector<ScheduleTask> build_schedule_tasks(
     double latency,
     bool batch_transfers,
     bool defer_blocked_transfers,
-    bool gate_next_frame_work,
     int unroll
 ) {
     int n = static_cast<int>(graph.ids.size());
@@ -406,41 +405,6 @@ std::vector<ScheduleTask> build_schedule_tasks(
         }
     }
 
-    if (gate_next_frame_work && unroll > 1) {
-        std::vector<int> output_nodes;
-        for (int node = 0; node < n; ++node) {
-            if (graph.outgoing[node].empty() && !graph.incoming[node].empty()) {
-                output_nodes.push_back(node);
-            }
-        }
-        if (output_nodes.empty()) {
-            for (int node = 0; node < n; ++node) {
-                if (!graph.incoming[node].empty()) {
-                    output_nodes.push_back(node);
-                }
-            }
-        }
-
-        for (int frame = 1; frame < unroll; ++frame) {
-            std::vector<int> previous_outputs;
-            previous_outputs.reserve(output_nodes.size());
-            for (int output_node : output_nodes) {
-                previous_outputs.push_back((frame - 1) * n + output_node);
-            }
-            for (int task_id = 0; task_id < static_cast<int>(tasks.size()); ++task_id) {
-                const auto& task = tasks[task_id];
-                if (task.frame != frame || task.resource == ResourceKind::None) {
-                    continue;
-                }
-                for (int previous_output : previous_outputs) {
-                    if (previous_output != task_id) {
-                        add_task_dependency(tasks, previous_output, task_id);
-                    }
-                }
-            }
-        }
-    }
-
     return tasks;
 }
 
@@ -527,6 +491,156 @@ double task_priority(
         return 1'000'000.0 + task.duration + ranks[task_id] * 1e-6;
     }
     return -static_cast<double>(task_id);
+}
+
+int resource_bucket(ResourceKind resource) {
+    if (resource == ResourceKind::Device) {
+        return 0;
+    }
+    if (resource == ResourceKind::Host) {
+        return 1;
+    }
+    if (resource == ResourceKind::Network) {
+        return 2;
+    }
+    return -1;
+}
+
+bool is_output_compute_task(const GraphData& graph, const ScheduleTask& task) {
+    return task.resource != ResourceKind::None &&
+           task.resource != ResourceKind::Network &&
+           !graph.incoming[task.node].empty() &&
+           graph.outgoing[task.node].empty();
+}
+
+bool predecessor_is_same_frame_data_from_other_node(
+    const std::vector<ScheduleTask>& tasks,
+    int predecessor,
+    int target,
+    int task_id
+) {
+    const auto& pred = tasks[predecessor];
+    const auto& task = tasks[task_id];
+    if (predecessor == task_id || predecessor == target || pred.frame != task.frame) {
+        return false;
+    }
+    if (pred.resource == ResourceKind::None) {
+        return false;
+    }
+    if (pred.resource == ResourceKind::Network) {
+        for (auto [source, network_target] : pred.edges) {
+            if (network_target == target && tasks[source].node != task.node) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return pred.node != task.node;
+}
+
+bool compute_feeds_same_frame_join(
+    const std::vector<ScheduleTask>& tasks,
+    int task_id
+) {
+    const auto& task = tasks[task_id];
+    if (task.resource == ResourceKind::None || task.resource == ResourceKind::Network) {
+        return false;
+    }
+    for (int successor : task.successors) {
+        const auto& succ = tasks[successor];
+        std::vector<int> targets;
+        if (succ.resource == ResourceKind::Network) {
+            for (auto [_, target] : succ.edges) {
+                targets.push_back(target);
+            }
+        } else {
+            targets.push_back(successor);
+        }
+
+        for (int target : targets) {
+            for (int predecessor : tasks[target].predecessors) {
+                if (predecessor == successor) {
+                    continue;
+                }
+                if (predecessor_is_same_frame_data_from_other_node(
+                        tasks, predecessor, target, task_id
+                    )) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+bool can_right_shift_task(
+    const GraphData& graph,
+    const std::vector<ScheduleTask>& tasks,
+    int task_id
+) {
+    const auto& task = tasks[task_id];
+    if (task.resource == ResourceKind::None || is_output_compute_task(graph, task)) {
+        return false;
+    }
+    if (task.resource == ResourceKind::Network) {
+        return true;
+    }
+    return compute_feeds_same_frame_join(tasks, task_id);
+}
+
+void right_shift_non_output_work(
+    const GraphData& graph,
+    const std::vector<ScheduleTask>& tasks,
+    const std::vector<int>& scheduled_order,
+    std::vector<double>& starts,
+    std::vector<double>& finishes
+) {
+    std::vector<int> next_same_resource(tasks.size(), -1);
+    std::vector<int> last_on_resource(3, -1);
+    for (auto iter = scheduled_order.rbegin(); iter != scheduled_order.rend(); ++iter) {
+        int task_id = *iter;
+        int bucket = resource_bucket(tasks[task_id].resource);
+        if (bucket < 0) {
+            continue;
+        }
+        next_same_resource[task_id] = last_on_resource[bucket];
+        last_on_resource[bucket] = task_id;
+    }
+
+    constexpr double eps = 1e-9;
+    for (auto iter = scheduled_order.rbegin(); iter != scheduled_order.rend(); ++iter) {
+        int task_id = *iter;
+        const auto& task = tasks[task_id];
+        if (!can_right_shift_task(graph, tasks, task_id)) {
+            continue;
+        }
+
+        double latest_finish = std::numeric_limits<double>::infinity();
+        bool has_bound = false;
+        for (int successor : task.successors) {
+            latest_finish = std::min(latest_finish, starts[successor]);
+            has_bound = true;
+        }
+        int next = next_same_resource[task_id];
+        if (next >= 0) {
+            latest_finish = std::min(latest_finish, starts[next]);
+            has_bound = true;
+        }
+        if (!has_bound || !std::isfinite(latest_finish)) {
+            continue;
+        }
+
+        double earliest_start = task.release;
+        for (int predecessor : task.predecessors) {
+            earliest_start = std::max(earliest_start, finishes[predecessor]);
+        }
+        double shifted_start = latest_finish - task.duration;
+        if (shifted_start > starts[task_id] + eps &&
+            shifted_start + eps >= earliest_start) {
+            starts[task_id] = shifted_start;
+            finishes[task_id] = shifted_start + task.duration;
+        }
+    }
 }
 
 Metrics finalize_metrics(
@@ -632,6 +746,44 @@ Metrics finalize_metrics(
     return metrics;
 }
 
+Metrics materialize_metrics(
+    const GraphData& graph,
+    const std::vector<int>& assignment,
+    const ObjectiveWeights& weights,
+    const ObjectiveScales& scales,
+    const std::vector<ScheduleTask>& tasks,
+    const std::vector<int>& scheduled_order,
+    const std::vector<double>& task_starts,
+    const std::vector<double>& task_finishes,
+    int unroll
+) {
+    int n = static_cast<int>(graph.ids.size());
+    int op_count = n * unroll;
+    Metrics metrics;
+    metrics.starts.assign(op_count, 0.0);
+    metrics.finishes.assign(op_count, 0.0);
+
+    for (int task_id : scheduled_order) {
+        const auto& task = tasks[task_id];
+        if (task.resource == ResourceKind::Network) {
+            metrics.transfers.push_back(
+                TransferRecord{
+                    task.edges,
+                    task_starts[task_id],
+                    task_finishes[task_id],
+                    task.size,
+                    task.batched,
+                }
+            );
+        } else if (task.op >= 0 && task.op < op_count) {
+            metrics.starts[task.op] = task_starts[task_id];
+            metrics.finishes[task.op] = task_finishes[task_id];
+        }
+    }
+
+    return finalize_metrics(graph, assignment, weights, scales, unroll, std::move(metrics));
+}
+
 Metrics simulate_schedule(
     const GraphData& graph,
     const std::vector<int>& assignment,
@@ -659,6 +811,10 @@ Metrics simulate_schedule(
     Metrics metrics;
     metrics.starts.assign(op_count, 0.0);
     metrics.finishes.assign(op_count, 0.0);
+    std::vector<double> task_starts(tasks.size(), 0.0);
+    std::vector<double> task_finishes(tasks.size(), 0.0);
+    std::vector<int> scheduled_order;
+    scheduled_order.reserve(tasks.size());
     double dev_ready = 0.0;
     double host_ready = 0.0;
     double network_ready = 0.0;
@@ -698,15 +854,9 @@ Metrics simulate_schedule(
         const auto& task = tasks[best_task];
         double finish = best_start + task.duration;
         set_resource_ready(task.resource, finish, dev_ready, host_ready, network_ready);
-
-        if (task.resource == ResourceKind::Network) {
-            metrics.transfers.push_back(
-                TransferRecord{task.edges, best_start, finish, task.size, task.batched}
-            );
-        } else if (task.op >= 0 && task.op < op_count) {
-            metrics.starts[task.op] = best_start;
-            metrics.finishes[task.op] = finish;
-        }
+        task_starts[best_task] = best_start;
+        task_finishes[best_task] = finish;
+        scheduled_order.push_back(best_task);
 
         for (int successor : task.successors) {
             ready_time[successor] = std::max(ready_time[successor], finish);
@@ -717,7 +867,18 @@ Metrics simulate_schedule(
         }
     }
 
-    return finalize_metrics(graph, assignment, weights, scales, unroll, std::move(metrics));
+    right_shift_non_output_work(graph, tasks, scheduled_order, task_starts, task_finishes);
+    return materialize_metrics(
+        graph,
+        assignment,
+        weights,
+        scales,
+        tasks,
+        scheduled_order,
+        task_starts,
+        task_finishes,
+        unroll
+    );
 }
 
 bool is_better_metrics(const Metrics& candidate, const Metrics& best) {
@@ -763,33 +924,30 @@ Metrics schedule(
     Metrics best;
     const bool binary_variants[] = {false, true};
     for (bool defer_blocked_transfers : binary_variants) {
-        for (bool gate_next_frame_work : binary_variants) {
-            auto tasks = build_schedule_tasks(
+        auto tasks = build_schedule_tasks(
+            graph,
+            assignment,
+            bandwidth,
+            latency,
+            batch_transfers,
+            defer_blocked_transfers,
+            unroll
+        );
+        auto ranks = task_ranks(tasks);
+        for (ScheduleRule rule : rules) {
+            Metrics candidate = simulate_schedule(
                 graph,
                 assignment,
-                bandwidth,
-                latency,
-                batch_transfers,
-                defer_blocked_transfers,
-                gate_next_frame_work,
-                unroll
+                weights,
+                scales,
+                tasks,
+                ranks,
+                unroll,
+                rule
             );
-            auto ranks = task_ranks(tasks);
-            for (ScheduleRule rule : rules) {
-                Metrics candidate = simulate_schedule(
-                    graph,
-                    assignment,
-                    weights,
-                    scales,
-                    tasks,
-                    ranks,
-                    unroll,
-                    rule
-                );
-                if (!has_best || is_better_metrics(candidate, best)) {
-                    best = std::move(candidate);
-                    has_best = true;
-                }
+            if (!has_best || is_better_metrics(candidate, best)) {
+                best = std::move(candidate);
+                has_best = true;
             }
         }
     }
