@@ -31,6 +31,9 @@ def solve(
     batch_transfers: bool = False,
     pipeline_unroll: int = 1,
     max_frame_latency_limit: float = 0.0,
+    solver_threads: int = 0,
+    anneal_initial_temp: float = 1.0,
+    anneal_final_temp: float = 0.01,
 ) -> SolverResult:
     validate_graph(graph, require_dag=True)
     environment = validate_environment(
@@ -44,6 +47,9 @@ def solve(
             batch_transfers=batch_transfers,
             pipeline_unroll=pipeline_unroll,
             max_frame_latency_limit=max_frame_latency_limit,
+            solver_threads=solver_threads,
+            anneal_initial_temp=anneal_initial_temp,
+            anneal_final_temp=anneal_final_temp,
         )
     )
 
@@ -69,6 +75,9 @@ def solve(
         "max_frame_latency_limit": environment.max_frame_latency_limit,
         "batch_transfers": environment.batch_transfers,
         "pipeline_unroll": environment.pipeline_unroll,
+        "solver_threads": environment.solver_threads,
+        "anneal_initial_temp": environment.anneal_initial_temp,
+        "anneal_final_temp": environment.anneal_final_temp,
     }
 
     try:

@@ -26,6 +26,9 @@ class Environment:
     batch_transfers: bool = False
     pipeline_unroll: int = 1
     max_frame_latency_limit: float = 0.0
+    solver_threads: int = 0
+    anneal_initial_temp: float = 1.0
+    anneal_final_temp: float = 0.01
 
 
 @dataclass(frozen=True)
@@ -73,6 +76,9 @@ def environment_from_mapping(data: Mapping[str, Any]) -> Environment:
             max_frame_latency_limit=data.get("max_frame_latency_limit", 0.0),
             batch_transfers=data.get("batch_transfers", False),
             pipeline_unroll=data.get("pipeline_unroll", 1),
+            solver_threads=data.get("solver_threads", 0),
+            anneal_initial_temp=data.get("anneal_initial_temp", 1.0),
+            anneal_final_temp=data.get("anneal_final_temp", 0.01),
         )
     )
 
@@ -100,6 +106,17 @@ def validate_environment(environment: Environment) -> Environment:
     pipeline_unroll = _integer(environment.pipeline_unroll, "Environment pipeline_unroll")
     if pipeline_unroll < 1:
         raise ValueError("Environment pipeline_unroll must be at least 1.")
+    solver_threads = _integer(environment.solver_threads, "Environment solver_threads")
+    if solver_threads < 0:
+        raise ValueError("Environment solver_threads must be non-negative.")
+    anneal_initial_temp = _positive_float(
+        environment.anneal_initial_temp,
+        "Environment anneal_initial_temp",
+    )
+    anneal_final_temp = _positive_float(
+        environment.anneal_final_temp,
+        "Environment anneal_final_temp",
+    )
 
     return Environment(
         bandwidth=bandwidth,
@@ -111,6 +128,9 @@ def validate_environment(environment: Environment) -> Environment:
         max_frame_latency_limit=max_frame_latency_limit,
         batch_transfers=_bool(environment.batch_transfers, "Environment batch_transfers"),
         pipeline_unroll=pipeline_unroll,
+        solver_threads=solver_threads,
+        anneal_initial_temp=anneal_initial_temp,
+        anneal_final_temp=anneal_final_temp,
     )
 
 
@@ -250,6 +270,9 @@ def save_to_json(state: ProjectState, path: Union[str, Path]) -> None:
             "max_frame_latency_limit": float(environment.max_frame_latency_limit),
             "batch_transfers": bool(environment.batch_transfers),
             "pipeline_unroll": int(environment.pipeline_unroll),
+            "solver_threads": int(environment.solver_threads),
+            "anneal_initial_temp": float(environment.anneal_initial_temp),
+            "anneal_final_temp": float(environment.anneal_final_temp),
         },
     }
     with Path(path).open("w", encoding="utf-8") as file:

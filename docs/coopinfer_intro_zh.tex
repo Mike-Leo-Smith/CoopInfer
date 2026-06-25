@@ -52,7 +52,7 @@
       \textbf{输出}
       \begin{itemize}
         \item 节点放置决策：$x_i=0$ 表示端侧，$x_i=1$ 表示边侧。
-        \item 端到端时延和端侧算力利用率。
+        \item 端到端时延和资源利用率。
         \item SVG 拓扑图和 profiler 风格时序图。
       \end{itemize}
     \end{column}
@@ -185,13 +185,17 @@
   \[
     rank(t)=duration(t)+\max_{u \in succ(t)} rank(u)
   \]
-  解析器会仿真三种确定性规则：
+  解析器会仿真七种确定性规则：
   \begin{itemize}
     \item \textbf{CriticalPath}：优先级为 rank 加老帧加成
       \[
         rank(t)+10^6\max(0, unroll-1-frame(t)).
       \]
     \item \textbf{DeviceFirst}：Source、端侧、Network、边侧依次优先；同类用耗时和 rank 打破平局。
+    \item \textbf{HostFirst}：Source、边侧、Network、端侧依次优先。
+    \item \textbf{NetworkFirst}：Source、Network、端侧、边侧依次优先。
+    \item \textbf{OutputFirst}：输出计算任务优先，然后按老帧加成和 rank 排序。
+    \item \textbf{Throughput}：年轻帧加成和 rank，用于测试稳态流水调度。
     \item \textbf{FifoReady}：在相同可行开始时间下按任务创建顺序稳定排序。
   \end{itemize}
   先选最早可行开始时间保证资源不无谓空转；规则只负责同一开始时刻的优先级选择。
@@ -208,9 +212,9 @@
 
   每个候选方案共评估：
   \[
-    2 \times 3 = 6
+    2 \times 2 \times 7 = 28
   \]
-  套确定性列表调度：两种传输时序、三种就绪列表规则。每套调度在提取指标前都会经过保守右移重排。
+  套确定性列表调度：两种传输时序、是否右移重排，以及七种就绪列表规则。
 \end{frame}
 
 \begin{frame}{内层解析器步骤 5：指标提取与胜者选择}
@@ -230,7 +234,7 @@
     \tau_{max}=\max_f \tau_{frame}(f),\quad
     \tau_{avg}=\frac{pipeline\_finish-pipeline\_start}{pipeline\_unroll}
   \]
-  最终保留 Loss 最低的调度；若 Loss 相同，依次选择最大单帧时延更低、平均时延更低、端侧利用率更高的方案。
+  最终保留 Loss 最低的调度；若 Loss 相同，依次选择最大单帧时延更低、平均时延更低、启动间隔更低、端侧利用率更高的方案。
 \end{frame}
 
 \begin{frame}{网络批处理示意}
@@ -320,23 +324,23 @@
       模式 & 适用场景 & 行为 \\
       \midrule
       Auto & 默认模式 & 自由节点 $\leq 12$ 时枚举，否则随机搜索 \\
-      Enumerate & 小规模 DAG & 遍历所有方案，返回全局最优可行解 \\
-      Random Search & 较大 DAG & 随机扰动放置方案，保留最佳可行候选 \\
-      Simulated Annealing & 跳出局部最优 & 按温度接受部分更差移动 \\
+      Enumerate & 小规模 DAG & 将 assignment mask 按线程切分，返回精确全局最优可行解 \\
+      Random Search & 较大 DAG & 多线程独立扰动链，保留最佳可行候选 \\
+      Simulated Annealing & 跳出局部最优 & 多线程独立退火链，支持配置初始/最终温度 \\
       \bottomrule
     \end{tabular}
   \end{table}
   \vspace{0.5em}
-  所有模式都会强制固定端侧节点，并执行平均端到端和最大单帧时延上限过滤。
+  \texttt{solver\_threads}=0 表示使用硬件线程数。所有模式都会强制固定端侧节点，并执行平均端到端和最大单帧时延上限过滤。
 \end{frame}
 
 \begin{frame}{GUI 使用流程}
   \begin{enumerate}
     \item 编辑节点、名称、计算耗时和固定端侧标记。
     \item 编辑边和传输数据量。
-    \item 配置带宽、固定时延、网络批处理、优化权重、求解模式、迭代次数和时延上限。
+    \item 配置带宽、固定时延、网络批处理、优化权重、求解模式、线程数、迭代次数、退火温度和时延上限。
     \item 点击 \textbf{Solve}。
-    \item 查看性能看板、拓扑放置和 profiler 风格时序图。
+    \item 查看时延、资源利用率、拓扑放置和 profiler 风格时序图。
   \end{enumerate}
   \vspace{0.5em}
   系统会校验重名节点、非法边端点以及非 DAG 拓扑。

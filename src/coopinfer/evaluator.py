@@ -31,6 +31,10 @@ class EvaluationResult:
     transfer_records: Tuple[TransferRecord, ...]
     pipeline_unroll: int = 1
     max_frame_latency: float = 0.0
+    initiation_interval: float = 0.0
+    initiation_interval_loss: float = 0.0
+    host_utilization: float = 0.0
+    network_utilization: float = 0.0
 
 
 def edge_transfer_ms(size_mb: float, bandwidth_mb_s: float, latency_ms: float) -> float:
@@ -233,9 +237,15 @@ def metrics_from_core(raw_metrics: Mapping[str, Any]) -> EvaluationResult:
     )
     return EvaluationResult(
         latency=float(raw_metrics["latency"]),
+        initiation_interval=float(
+            raw_metrics.get("initiation_interval", raw_metrics["latency"])
+        ),
         device_utilization=float(raw_metrics["device_utilization"]),
+        host_utilization=float(raw_metrics.get("host_utilization", 0.0)),
+        network_utilization=float(raw_metrics.get("network_utilization", 0.0)),
         avg_latency_loss=float(raw_metrics["avg_latency_loss"]),
         max_frame_latency_loss=float(raw_metrics["max_frame_latency_loss"]),
+        initiation_interval_loss=float(raw_metrics.get("initiation_interval_loss", 0.0)),
         device_utilization_loss=float(raw_metrics["device_utilization_loss"]),
         loss=float(raw_metrics["loss"]),
         start_times={str(node): float(value) for node, value in raw_metrics["start_times"].items()},

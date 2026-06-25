@@ -183,9 +183,22 @@ class MainWindow(QMainWindow):
         self.algorithm_combo.addItems(
             ["Auto", "Enumerate", "Random Search", "Simulated Annealing"]
         )
+        self.algorithm_combo.currentTextChanged.connect(self._update_sa_controls_enabled)
         self.iterations_spin = QSpinBox()
         self.iterations_spin.setRange(1, 1_000_000)
         self.iterations_spin.setValue(3000)
+        self.solver_threads_spin = QSpinBox()
+        self.solver_threads_spin.setRange(0, 256)
+        self.solver_threads_spin.setSpecialValueText("Auto")
+        self.solver_threads_spin.setValue(0)
+        self.anneal_initial_temp_spin = QDoubleSpinBox()
+        self.anneal_initial_temp_spin.setRange(0.000001, 1_000_000.0)
+        self.anneal_initial_temp_spin.setDecimals(6)
+        self.anneal_initial_temp_spin.setValue(1.0)
+        self.anneal_final_temp_spin = QDoubleSpinBox()
+        self.anneal_final_temp_spin.setRange(0.000001, 1_000_000.0)
+        self.anneal_final_temp_spin.setDecimals(6)
+        self.anneal_final_temp_spin.setValue(0.01)
         self.batch_transfers_check = QCheckBox("Batch successive outgoing transfers")
         self.pipeline_unroll_spin = QSpinBox()
         self.pipeline_unroll_spin.setRange(1, 64)
@@ -219,7 +232,26 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.algorithm_combo, 10, 1, 1, 2)
         layout.addWidget(QLabel("Iterations"), 11, 0)
         layout.addWidget(self.iterations_spin, 11, 1, 1, 2)
+        layout.addWidget(QLabel("Threads"), 12, 0)
+        layout.addWidget(self.solver_threads_spin, 12, 1, 1, 2)
+        self.anneal_initial_temp_label = QLabel("SA Initial Temp")
+        self.anneal_final_temp_label = QLabel("SA Final Temp")
+        layout.addWidget(self.anneal_initial_temp_label, 13, 0)
+        layout.addWidget(self.anneal_initial_temp_spin, 13, 1, 1, 2)
+        layout.addWidget(self.anneal_final_temp_label, 14, 0)
+        layout.addWidget(self.anneal_final_temp_spin, 14, 1, 1, 2)
+        self._update_sa_controls_enabled(self.algorithm_combo.currentText())
         return group
+
+    def _update_sa_controls_enabled(self, algorithm: str) -> None:
+        enabled = algorithm == "Simulated Annealing"
+        for widget in (
+            self.anneal_initial_temp_label,
+            self.anneal_initial_temp_spin,
+            self.anneal_final_temp_label,
+            self.anneal_final_temp_spin,
+        ):
+            widget.setEnabled(enabled)
 
     def _objective_weight_slider(self, default: float) -> Tuple[QSlider, QLabel]:
         slider = QSlider(Qt.Orientation.Horizontal)
@@ -280,7 +312,8 @@ class MainWindow(QMainWindow):
         metrics_group.setMaximumHeight(128)
         metrics_layout = QGridLayout(metrics_group)
         self.latency_label = QLabel("端到端时延: -- ms")
-        self.util_label = QLabel("端侧算力利用率: -- %")
+        self.util_label = QLabel("利用率: 端侧 -- %, 边侧 -- %, 网络 -- %")
+        self.util_label.setWordWrap(True)
         self.loss_label = QLabel("最优 Loss: --")
         self.loss_terms_label = QLabel("Loss terms: --")
         self.mode_label = QLabel("求解模式: --")
@@ -383,6 +416,10 @@ class MainWindow(QMainWindow):
             )
             self.batch_transfers_check.setChecked(environment.batch_transfers)
             self.pipeline_unroll_spin.setValue(environment.pipeline_unroll)
+            self.solver_threads_spin.setValue(environment.solver_threads)
+            self.anneal_initial_temp_spin.setValue(environment.anneal_initial_temp)
+            self.anneal_final_temp_spin.setValue(environment.anneal_final_temp)
+            self._update_sa_controls_enabled(self.algorithm_combo.currentText())
         finally:
             self._loading_tables = False
 
@@ -503,6 +540,9 @@ class MainWindow(QMainWindow):
                 batch_transfers=environment.batch_transfers,
                 pipeline_unroll=environment.pipeline_unroll,
                 max_frame_latency_limit=environment.max_frame_latency_limit,
+                solver_threads=environment.solver_threads,
+                anneal_initial_temp=environment.anneal_initial_temp,
+                anneal_final_temp=environment.anneal_final_temp,
             )
         except Exception as exc:
             QMessageBox.warning(self, "Solve failed", str(exc))
@@ -602,6 +642,9 @@ class MainWindow(QMainWindow):
                 batch_transfers=self.batch_transfers_check.isChecked(),
                 pipeline_unroll=self.pipeline_unroll_spin.value(),
                 max_frame_latency_limit=self.max_frame_latency_limit_spin.value(),
+                solver_threads=self.solver_threads_spin.value(),
+                anneal_initial_temp=self.anneal_initial_temp_spin.value(),
+                anneal_final_temp=self.anneal_final_temp_spin.value(),
             )
         )
 
@@ -932,26 +975,30 @@ class MainWindow(QMainWindow):
         if result.metrics.pipeline_unroll > 1:
             self.latency_label.setText(
                 f"平均时延: {result.metrics.latency:.1f} ms/frame; "
+                f"启动间隔: {result.metrics.initiation_interval:.1f} ms; "
                 f"最大E2E: {result.metrics.max_frame_latency:.1f} ms "
                 f"(unroll {result.metrics.pipeline_unroll})"
             )
         else:
             self.latency_label.setText(f"端到端时延: {result.metrics.latency:.1f} ms")
         self.util_label.setText(
-            f"端侧算力利用率: {result.metrics.device_utilization * 100.0:.1f} %"
+            f"利用率: 端侧 {result.metrics.device_utilization * 100.0:.1f} %, "
+            f"边侧 {result.metrics.host_utilization * 100.0:.1f} %, "
+            f"网络 {result.metrics.network_utilization * 100.0:.1f} %"
         )
         self.loss_label.setText(f"最优 Loss: {result.metrics.loss:.3f}")
         self.loss_terms_label.setText(
             "Loss terms: "
             f"L_avg={result.metrics.avg_latency_loss:.3f}, "
             f"L_max={result.metrics.max_frame_latency_loss:.3f}, "
+            f"L_ii={result.metrics.initiation_interval_loss:.3f}, "
             f"L_util={result.metrics.device_utilization_loss:.3f}"
         )
         self.mode_label.setText(f"求解模式: {result.mode} ({result.iterations})")
 
     def _clear_metrics(self) -> None:
         self.latency_label.setText("端到端时延: -- ms")
-        self.util_label.setText("端侧算力利用率: -- %")
+        self.util_label.setText("利用率: 端侧 -- %, 边侧 -- %, 网络 -- %")
         self.loss_label.setText("最优 Loss: --")
         self.loss_terms_label.setText("Loss terms: --")
         self.mode_label.setText("求解模式: --")

@@ -29,14 +29,15 @@ The application stores graph topology, node/edge costs, environment parameters, 
 - Each cross-device transfer costs `latency_ms + size_mb / bandwidth_mb_s * 1000`.
 - The optional `batch_transfers` environment flag groups multiple outgoing cross-device transfers from the same source node into one network transaction. The batch pays fixed latency once and still pays bandwidth time for the summed payload size.
 - `pipeline_unroll` repeats the same DAG for multiple frames to model pipeline parallelism across consecutive inputs. The evaluator enforces FIFO ordering for the same logical node label across frames, while device, host, and network queues can overlap different labels from different frames.
-- For each candidate assignment, the native core builds the task DAG and critical-path ranks once, simulates `CriticalPath`, `DeviceFirst`, and `FifoReady` scheduling rules, and keeps the schedule with the lowest configured split loss.
+- For each candidate assignment, the native core builds the task DAG and critical-path ranks once, simulates a best-of-candidates ensemble of transfer timing, slack retiming, and ready-list priority rules, and keeps the schedule with the lowest configured split loss.
 - The evaluator also applies tail-latency-oriented retiming: blocked transfers can be made just-in-time, and a conservative postprocess right-shifts slack work without moving output completions or adding frame-wide gates. This avoids counting early no-op work as the start of a long tail-frame E2E window while preserving inter-frame pipeline overlap.
 - Source nodes can define `source_period_ms` and `source_phase_ms`. For unrolled pipelines, frame `f` of that input is released at `source_phase_ms + f * source_period_ms`. These nodes are independent zero-duration input events: they do not consume device/host compute queues and their successive frames may overlap downstream work.
 - End-to-end latency excludes source/input events. It is measured from the first non-input compute or transfer event to the last non-input output node finish, then amortized over `pipeline_unroll`.
 - Max-frame latency is the worst per-frame version of the same input-excluded window.
-- Device utilization is reported as active device compute time over the same input-excluded pipeline span, not as a static sum of assigned node costs.
-- The objective is an explicit weighted sum: `weight_avg_latency * L_avg + weight_max_latency * L_max + weight_device_utilization * L_util`. Each weight is in `[0, 1]`. `L_avg` and `L_max` are normalized by all-device/all-host baseline scales; `L_util` is `1 - device_utilization`.
+- Device, Host, and Network utilization are reported as active time over the same input-excluded pipeline span, not as static sums of assigned costs.
+- The objective is an explicit weighted sum: `weight_avg_latency * L_avg + weight_max_latency * L_max + weight_device_utilization * L_util`. Each public weight is in `[0, 1]`. `L_avg` and `L_max` are normalized by all-device/all-host baseline scales; `L_util` is `1 - device_utilization`.
 - The solver can run Auto, Enumerate, Random Search, or Simulated Annealing. Auto uses enumeration for up to 12 free nodes and random search beyond that.
+- Candidate evaluation is parallelized in the native core. `solver_threads=0` uses the hardware thread count; Simulated Annealing runs independent chains and keeps the best feasible chain result.
 - `latency_limit` is an optional amortized E2E latency cap in milliseconds. `max_frame_latency_limit` is an optional worst-frame E2E cap. Use `0` to disable either limit; assignments above a positive limit are rejected.
 - The GUI has two topology views: the config DAG before solving, and the solved unrolled pipeline with placement, transfer, and FIFO edges. In solved views, node fill color identifies the frame; device/host placement is shown by the node outline.
 - The timeline visualizes the evaluator's actual compute and transfer records, including serialized, batched, and unrolled pipeline transfers. Input releases, transfer bars, and vertical dependency/release lines reuse the same high-contrast frame colors as the filled pipeline nodes.
@@ -56,7 +57,10 @@ For the full evaluator algorithm, see [docs/native_scheduler.md](docs/native_sch
   "latency_limit": 120.0,
   "max_frame_latency_limit": 180.0,
   "batch_transfers": false,
-  "pipeline_unroll": 1
+  "pipeline_unroll": 1,
+  "solver_threads": 0,
+  "anneal_initial_temp": 1.0,
+  "anneal_final_temp": 0.01
 }
 ```
 

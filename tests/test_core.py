@@ -400,6 +400,7 @@ def test_evaluator_preserves_inter_frame_pipeline_overlap():
     assert result.start_times["head[f0]"] == 50.0
     assert result.start_times["head[f1]"] == 150.0
     assert result.latency == 350.0 / 3.0
+    assert result.initiation_interval == 100.0
 
 
 def test_solver_accounts_for_source_period_in_pipeline_result():
@@ -456,6 +457,8 @@ def test_evaluate_reports_device_utilization():
     )
 
     assert result.device_utilization == 0.0
+    assert math.isclose(result.host_utilization, 2.0 / 107.0)
+    assert math.isclose(result.network_utilization, 105.0 / 107.0)
     assert result.loss >= 0.0
 
 
@@ -690,12 +693,49 @@ def test_solver_supports_explicit_random_and_annealing_modes():
         **LATENCY_ONLY_WEIGHTS,
         algorithm="Simulated Annealing",
         heuristic_iterations=10,
+        solver_threads=2,
+        anneal_initial_temp=2.0,
+        anneal_final_temp=0.05,
     )
 
     assert random_result.mode == "Random Search"
     assert anneal_result.mode == "Simulated Annealing"
     assert random_result.assignment["v1"] == 0
     assert anneal_result.assignment["v1"] == 0
+
+
+def test_parallel_enumerate_matches_single_thread_result():
+    graph = graph_from_records(
+        [
+            {"id": "input", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": True},
+            {"id": "a", "c_dev": 2.0, "c_host": 1.0, "fixed_dev": False},
+            {"id": "b", "c_dev": 1.0, "c_host": 2.0, "fixed_dev": False},
+        ],
+        [
+            {"source": "input", "target": "a", "size": 0.0},
+            {"source": "a", "target": "b", "size": 0.0},
+        ],
+    )
+
+    serial = solve(
+        graph,
+        bandwidth=1000.0,
+        latency=0.0,
+        **LATENCY_ONLY_WEIGHTS,
+        algorithm="Enumerate",
+        solver_threads=1,
+    )
+    parallel = solve(
+        graph,
+        bandwidth=1000.0,
+        latency=0.0,
+        **LATENCY_ONLY_WEIGHTS,
+        algorithm="Enumerate",
+        solver_threads=2,
+    )
+
+    assert parallel.assignment == serial.assignment
+    assert parallel.metrics.loss == serial.metrics.loss
 
 
 def test_unrolled_operations_resolve_to_consistent_base_placement():
@@ -725,6 +765,9 @@ def test_json_round_trip(tmp_path):
         batch_transfers=True,
         pipeline_unroll=3,
         max_frame_latency_limit=180.0,
+        solver_threads=2,
+        anneal_initial_temp=2.5,
+        anneal_final_temp=0.05,
     )
     save_to_json(ProjectState(graph, environment), path)
 
@@ -744,6 +787,9 @@ def test_json_round_trip(tmp_path):
     assert data["environment"]["max_frame_latency_limit"] == 180.0
     assert data["environment"]["batch_transfers"] is True
     assert data["environment"]["pipeline_unroll"] == 3
+    assert data["environment"]["solver_threads"] == 2
+    assert data["environment"]["anneal_initial_temp"] == 2.5
+    assert data["environment"]["anneal_final_temp"] == 0.05
     assert data["nodes"][0]["source_period_ms"] == 0.0
     assert data["nodes"][0]["source_phase_ms"] == 0.0
 
@@ -819,6 +865,10 @@ def test_environment_validation_rejects_invalid_values():
         (Environment(max_frame_latency_limit=-1.0), "non-negative"),
         (Environment(pipeline_unroll=0), "at least 1"),
         (Environment(pipeline_unroll=1.5), "integer"),
+        (Environment(solver_threads=-1), "non-negative"),
+        (Environment(solver_threads=1.5), "integer"),
+        (Environment(anneal_initial_temp=0.0), "greater than zero"),
+        (Environment(anneal_final_temp=0.0), "greater than zero"),
         (Environment(batch_transfers="false"), "boolean"),
     ]
 

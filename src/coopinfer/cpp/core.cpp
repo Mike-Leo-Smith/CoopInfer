@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <numeric>
@@ -12,6 +13,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -50,9 +52,13 @@ struct GraphData {
 struct Metrics {
     double latency = 0.0;
     double max_frame_latency = 0.0;
+    double initiation_interval = 0.0;
     double utilization = 0.0;
+    double host_utilization = 0.0;
+    double network_utilization = 0.0;
     double avg_latency_loss = 0.0;
     double max_frame_latency_loss = 0.0;
+    double initiation_interval_loss = 0.0;
     double device_utilization_loss = 0.0;
     double loss = 0.0;
     std::vector<double> starts;
@@ -63,12 +69,14 @@ struct Metrics {
 struct ObjectiveWeights {
     double avg_latency = 0.7;
     double max_latency = 0.3;
+    double initiation_interval = 0.0;
     double device_utilization = 0.3;
 };
 
 struct ObjectiveScales {
     double avg_latency = 1.0;
     double max_latency = 1.0;
+    double initiation_interval = 1.0;
 };
 
 double transfer_ms(double size_mb, double bandwidth_mb_s, double latency_ms) {
@@ -118,11 +126,13 @@ double non_negative_param(const py::dict& params, const char* key, double fallba
 ObjectiveWeights parse_objective_weights(const py::dict& params) {
     bool has_explicit_weights = params.contains("weight_avg_latency") ||
                                 params.contains("weight_max_latency") ||
+                                params.contains("weight_initiation_interval") ||
                                 params.contains("weight_device_utilization");
     if (has_explicit_weights) {
         return ObjectiveWeights{
             non_negative_param(params, "weight_avg_latency", 0.7),
             non_negative_param(params, "weight_max_latency", 0.3),
+            non_negative_param(params, "weight_initiation_interval", 0.0),
             non_negative_param(params, "weight_device_utilization", 0.3),
         };
     }
@@ -133,7 +143,7 @@ ObjectiveWeights parse_objective_weights(const py::dict& params) {
             throw std::runtime_error("Environment weight_latency must be finite.");
         }
         legacy = std::min(1.0, std::max(0.0, legacy));
-        return ObjectiveWeights{legacy, 0.0, 1.0 - legacy};
+        return ObjectiveWeights{legacy, 0.0, 0.0, 1.0 - legacy};
     }
 
     return ObjectiveWeights{};
@@ -260,6 +270,10 @@ enum class ResourceKind {
 enum class ScheduleRule {
     CriticalPath,
     DeviceFirst,
+    HostFirst,
+    NetworkFirst,
+    OutputFirst,
+    Throughput,
     FifoReady,
 };
 
@@ -467,7 +481,10 @@ void set_resource_ready(
     }
 }
 
+bool is_output_compute_task(const GraphData& graph, const ScheduleTask& task);
+
 double task_priority(
+    const GraphData& graph,
     const ScheduleTask& task,
     const std::vector<double>& ranks,
     int task_id,
@@ -489,6 +506,39 @@ double task_priority(
             return 2'000'000.0 + ranks[task_id] * 1e-6;
         }
         return 1'000'000.0 + task.duration + ranks[task_id] * 1e-6;
+    }
+    if (rule == ScheduleRule::HostFirst) {
+        if (task.resource == ResourceKind::None) {
+            return 4'000'000.0 - static_cast<double>(task.frame);
+        }
+        if (task.resource == ResourceKind::Host) {
+            return 3'000'000.0 + task.duration + ranks[task_id] * 1e-6;
+        }
+        if (task.resource == ResourceKind::Network) {
+            return 2'000'000.0 + ranks[task_id] * 1e-6;
+        }
+        return 1'000'000.0 + task.duration + ranks[task_id] * 1e-6;
+    }
+    if (rule == ScheduleRule::NetworkFirst) {
+        if (task.resource == ResourceKind::None) {
+            return 4'000'000.0 - static_cast<double>(task.frame);
+        }
+        if (task.resource == ResourceKind::Network) {
+            return 3'000'000.0 + ranks[task_id] * 1e-6;
+        }
+        if (task.resource == ResourceKind::Device) {
+            return 2'000'000.0 + task.duration + ranks[task_id] * 1e-6;
+        }
+        return 1'000'000.0 + task.duration + ranks[task_id] * 1e-6;
+    }
+    if (rule == ScheduleRule::OutputFirst) {
+        double output_bonus = is_output_compute_task(graph, task) ? 2'000'000.0 : 0.0;
+        double aging = 1'000'000.0 * static_cast<double>(std::max(0, unroll - 1 - task.frame));
+        return output_bonus + aging + ranks[task_id];
+    }
+    if (rule == ScheduleRule::Throughput) {
+        double younger_frame_bonus = 1'000'000.0 * static_cast<double>(task.frame);
+        return younger_frame_bonus + ranks[task_id];
     }
     return -static_cast<double>(task_id);
 }
@@ -687,6 +737,8 @@ Metrics finalize_metrics(
     }
 
     double pipeline_finish = first_work_start;
+    std::vector<double> frame_finishes(unroll, 0.0);
+    std::vector<bool> frame_has_finish(unroll, false);
     for (int frame = 0; frame < unroll; ++frame) {
         if (!frame_has_work[frame]) {
             continue;
@@ -710,6 +762,8 @@ Metrics finalize_metrics(
                 frame_finish = std::max(frame_finish, metrics.finishes[op]);
             }
         }
+        frame_finishes[frame] = frame_finish;
+        frame_has_finish[frame] = true;
         pipeline_finish = std::max(pipeline_finish, frame_finish);
         metrics.max_frame_latency = std::max(
             metrics.max_frame_latency,
@@ -720,8 +774,24 @@ Metrics finalize_metrics(
     double pipeline_time = has_pipeline_work ? std::max(0.0, pipeline_finish - first_work_start)
                                              : 0.0;
     metrics.latency = pipeline_time / static_cast<double>(unroll);
+    if (unroll <= 1) {
+        metrics.initiation_interval = metrics.latency;
+    } else {
+        double total_delta = 0.0;
+        int delta_count = 0;
+        for (int frame = 1; frame < unroll; ++frame) {
+            if (frame_has_finish[frame - 1] && frame_has_finish[frame]) {
+                total_delta += std::max(0.0, frame_finishes[frame] - frame_finishes[frame - 1]);
+                delta_count += 1;
+            }
+        }
+        metrics.initiation_interval = delta_count > 0
+                                          ? total_delta / static_cast<double>(delta_count)
+                                          : metrics.latency;
+    }
 
     double dev_active = 0.0;
+    double host_active = 0.0;
     for (int op = 0; op < op_count; ++op) {
         int node = op % n;
         if (graph.incoming[node].empty()) {
@@ -729,19 +799,34 @@ Metrics finalize_metrics(
         }
         if (assignment[node] == 0) {
             dev_active += metrics.finishes[op] - metrics.starts[op];
+        } else {
+            host_active += metrics.finishes[op] - metrics.starts[op];
         }
+    }
+    double network_active = 0.0;
+    for (const auto& transfer : metrics.transfers) {
+        network_active += transfer.finish - transfer.start;
     }
     metrics.utilization = pipeline_time <= 0.0 ? 0.0 : dev_active / pipeline_time;
     metrics.utilization = std::min(1.0, std::max(0.0, metrics.utilization));
+    metrics.host_utilization = pipeline_time <= 0.0 ? 0.0 : host_active / pipeline_time;
+    metrics.host_utilization = std::min(1.0, std::max(0.0, metrics.host_utilization));
+    metrics.network_utilization = pipeline_time <= 0.0 ? 0.0 : network_active / pipeline_time;
+    metrics.network_utilization = std::min(1.0, std::max(0.0, metrics.network_utilization));
 
     metrics.avg_latency_loss = normalized_time_score(metrics.latency, scales.avg_latency);
     metrics.max_frame_latency_loss = normalized_time_score(
         metrics.max_frame_latency,
         scales.max_latency
     );
+    metrics.initiation_interval_loss = normalized_time_score(
+        metrics.initiation_interval,
+        scales.initiation_interval
+    );
     metrics.device_utilization_loss = 1.0 - metrics.utilization;
     metrics.loss = weights.avg_latency * metrics.avg_latency_loss +
                    weights.max_latency * metrics.max_frame_latency_loss +
+                   weights.initiation_interval * metrics.initiation_interval_loss +
                    weights.device_utilization * metrics.device_utilization_loss;
     return metrics;
 }
@@ -792,7 +877,8 @@ Metrics simulate_schedule(
     const std::vector<ScheduleTask>& tasks,
     const std::vector<double>& ranks,
     int unroll,
-    ScheduleRule rule
+    ScheduleRule rule,
+    bool right_shift_slack
 ) {
     int n = static_cast<int>(graph.ids.size());
     int op_count = n * unroll;
@@ -836,7 +922,7 @@ Metrics simulate_schedule(
                 resource_ready_at(task.resource, dev_ready, host_ready, network_ready)
             );
             start = std::max(start, task.release);
-            double priority = task_priority(task, ranks, task_id, unroll, rule);
+            double priority = task_priority(graph, task, ranks, task_id, unroll, rule);
             bool better = start + eps < best_start;
             if (!better && std::abs(start - best_start) <= eps) {
                 better = priority > best_priority + eps ||
@@ -867,7 +953,9 @@ Metrics simulate_schedule(
         }
     }
 
-    right_shift_non_output_work(graph, tasks, scheduled_order, task_starts, task_finishes);
+    if (right_shift_slack) {
+        right_shift_non_output_work(graph, tasks, scheduled_order, task_starts, task_finishes);
+    }
     return materialize_metrics(
         graph,
         assignment,
@@ -901,6 +989,12 @@ bool is_better_metrics(const Metrics& candidate, const Metrics& best) {
     if (candidate.latency > best.latency + eps) {
         return false;
     }
+    if (candidate.initiation_interval < best.initiation_interval - eps) {
+        return true;
+    }
+    if (candidate.initiation_interval > best.initiation_interval + eps) {
+        return false;
+    }
     return candidate.utilization > best.utilization + eps;
 }
 
@@ -918,6 +1012,10 @@ Metrics schedule(
     const ScheduleRule rules[] = {
         ScheduleRule::CriticalPath,
         ScheduleRule::DeviceFirst,
+        ScheduleRule::HostFirst,
+        ScheduleRule::NetworkFirst,
+        ScheduleRule::OutputFirst,
+        ScheduleRule::Throughput,
         ScheduleRule::FifoReady,
     };
     bool has_best = false;
@@ -934,20 +1032,23 @@ Metrics schedule(
             unroll
         );
         auto ranks = task_ranks(tasks);
-        for (ScheduleRule rule : rules) {
-            Metrics candidate = simulate_schedule(
-                graph,
-                assignment,
-                weights,
-                scales,
-                tasks,
-                ranks,
-                unroll,
-                rule
-            );
-            if (!has_best || is_better_metrics(candidate, best)) {
-                best = std::move(candidate);
-                has_best = true;
+        for (bool right_shift_slack : binary_variants) {
+            for (ScheduleRule rule : rules) {
+                Metrics candidate = simulate_schedule(
+                    graph,
+                    assignment,
+                    weights,
+                    scales,
+                    tasks,
+                    ranks,
+                    unroll,
+                    rule,
+                    right_shift_slack
+                );
+                if (!has_best || is_better_metrics(candidate, best)) {
+                    best = std::move(candidate);
+                    has_best = true;
+                }
             }
         }
     }
@@ -969,8 +1070,8 @@ ObjectiveScales baseline_scales(
             mostly_host[i] = 0;
         }
     }
-    ObjectiveWeights weights{1.0, 1.0, 0.0};
-    ObjectiveScales neutral_scales{1.0, 1.0};
+    ObjectiveWeights weights{1.0, 1.0, 1.0, 0.0};
+    ObjectiveScales neutral_scales{1.0, 1.0, 1.0};
     auto dev = schedule(
         graph,
         all_device,
@@ -994,6 +1095,7 @@ ObjectiveScales baseline_scales(
     return ObjectiveScales{
         std::max(dev.latency, host.latency),
         std::max(dev.max_frame_latency, host.max_frame_latency),
+        std::max(dev.initiation_interval, host.initiation_interval),
     };
 }
 
@@ -1015,6 +1117,64 @@ std::vector<int> mostly_host_seed(const GraphData& graph, const std::vector<int>
         }
     }
     return assignment;
+}
+
+int solver_thread_count(std::uint64_t work_items, int requested_threads) {
+    if (work_items <= 1) {
+        return 1;
+    }
+    int hardware_threads = static_cast<int>(std::thread::hardware_concurrency());
+    int threads = requested_threads > 0 ? requested_threads : hardware_threads;
+    if (threads <= 0) {
+        threads = 1;
+    }
+    threads = std::min(threads, static_cast<int>(work_items));
+    return std::max(1, threads);
+}
+
+std::uint32_t mix_seed(int seed, int worker) {
+    std::uint32_t value = static_cast<std::uint32_t>(seed);
+    value ^= 0x9e3779b9U + static_cast<std::uint32_t>(worker) +
+             (value << 6U) + (value >> 2U);
+    return value;
+}
+
+struct AssignmentSearchResult {
+    bool has_best = false;
+    std::uint64_t order = 0;
+    std::vector<int> assignment;
+    Metrics metrics;
+};
+
+bool is_better_search_result(
+    const Metrics& candidate_metrics,
+    std::uint64_t candidate_order,
+    const AssignmentSearchResult& best
+) {
+    if (!best.has_best) {
+        return true;
+    }
+    if (candidate_metrics.loss < best.metrics.loss) {
+        return true;
+    }
+    if (candidate_metrics.loss > best.metrics.loss) {
+        return false;
+    }
+    return candidate_order < best.order;
+}
+
+void keep_search_result(
+    AssignmentSearchResult& best,
+    std::vector<int> assignment,
+    Metrics metrics,
+    std::uint64_t order
+) {
+    if (is_better_search_result(metrics, order, best)) {
+        best.assignment = std::move(assignment);
+        best.metrics = std::move(metrics);
+        best.order = order;
+        best.has_best = true;
+    }
 }
 
 py::dict metrics_to_python(const GraphData& graph, const Metrics& metrics, int unroll) {
@@ -1043,9 +1203,13 @@ py::dict metrics_to_python(const GraphData& graph, const Metrics& metrics, int u
     }
     out["latency"] = metrics.latency;
     out["max_frame_latency"] = metrics.max_frame_latency;
+    out["initiation_interval"] = metrics.initiation_interval;
     out["device_utilization"] = metrics.utilization;
+    out["host_utilization"] = metrics.host_utilization;
+    out["network_utilization"] = metrics.network_utilization;
     out["avg_latency_loss"] = metrics.avg_latency_loss;
     out["max_frame_latency_loss"] = metrics.max_frame_latency_loss;
+    out["initiation_interval_loss"] = metrics.initiation_interval_loss;
     out["device_utilization_loss"] = metrics.device_utilization_loss;
     out["loss"] = metrics.loss;
     out["start_times"] = starts;
@@ -1076,160 +1240,339 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
     );
     bool batch_transfers = params["batch_transfers"].cast<bool>();
     int pipeline_unroll = std::max(1, params["pipeline_unroll"].cast<int>());
-
-    std::transform(algorithm.begin(), algorithm.end(), algorithm.begin(), [](unsigned char c) {
-        if (c == ' ' || c == '-') {
-            return '_';
-        }
-        return static_cast<char>(std::tolower(c));
-    });
-
-    std::vector<int> free_nodes;
-    std::vector<int> base_assignment(n, 1);
-    for (int i = 0; i < n; ++i) {
-        if (graph.fixed_dev[i]) {
-            base_assignment[i] = 0;
-        } else {
-            base_assignment[i] = graph.x_initial[i];
-            free_nodes.push_back(i);
-        }
+    int requested_threads = params.contains("solver_threads")
+                                ? params["solver_threads"].cast<int>()
+                                : 0;
+    if (requested_threads < 0) {
+        throw std::runtime_error("Environment solver_threads must be non-negative.");
+    }
+    double anneal_initial_temp = non_negative_param(
+        params, "anneal_initial_temp", 1.0
+    );
+    double anneal_final_temp = non_negative_param(
+        params, "anneal_final_temp", 0.01
+    );
+    if (anneal_initial_temp <= 0.0 || anneal_final_temp <= 0.0) {
+        throw std::runtime_error("Simulated annealing temperatures must be greater than zero.");
     }
 
-    ObjectiveScales scales = baseline_scales(
-        graph, bandwidth, latency, batch_transfers, pipeline_unroll
-    );
-
     std::string mode;
-    int iterations = 0;
+    std::uint64_t iterations = 0;
     std::vector<int> best_assignment;
     Metrics best_metrics;
     bool has_best = false;
 
-    auto eval_assignment = [&](const std::vector<int>& assignment) {
-        return schedule(
-            graph, assignment, bandwidth, latency, weights, scales,
-            batch_transfers, pipeline_unroll
-        );
-    };
+    {
+        py::gil_scoped_release release;
 
-    bool use_brute = false;
-    if ((algorithm == "auto" || algorithm.empty()) && free_nodes.size() <= 12) {
-        use_brute = true;
-        mode = "Enumerate";
-    } else if (algorithm == "enumerate" || algorithm == "brute" || algorithm == "brute_force") {
-        use_brute = true;
-        mode = "Enumerate";
-    }
+        std::transform(algorithm.begin(), algorithm.end(), algorithm.begin(), [](unsigned char c) {
+            if (c == ' ' || c == '-') {
+                return '_';
+            }
+            return static_cast<char>(std::tolower(c));
+        });
 
-    if (use_brute) {
-        if (free_nodes.size() >= 63) {
-            throw std::runtime_error("Enumerate has too many free nodes.");
+        std::vector<int> free_nodes;
+        std::vector<int> base_assignment(n, 1);
+        for (int i = 0; i < n; ++i) {
+            if (graph.fixed_dev[i]) {
+                base_assignment[i] = 0;
+            } else {
+                base_assignment[i] = graph.x_initial[i];
+                free_nodes.push_back(i);
+            }
         }
-        std::uint64_t total = static_cast<std::uint64_t>(1) << free_nodes.size();
-        for (std::uint64_t mask = 0; mask < total; ++mask) {
-            iterations += 1;
-            std::vector<int> assignment = base_assignment;
-            for (size_t bit = 0; bit < free_nodes.size(); ++bit) {
-                assignment[free_nodes[bit]] = static_cast<int>((mask >> bit) & 1U);
+
+        ObjectiveScales scales = baseline_scales(
+            graph, bandwidth, latency, batch_transfers, pipeline_unroll
+        );
+
+        auto eval_assignment = [&](const std::vector<int>& assignment) {
+            return schedule(
+                graph, assignment, bandwidth, latency, weights, scales,
+                batch_transfers, pipeline_unroll
+            );
+        };
+
+        bool use_brute = false;
+        if ((algorithm == "auto" || algorithm.empty()) && free_nodes.size() <= 12) {
+            use_brute = true;
+            mode = "Enumerate";
+        } else if (algorithm == "enumerate" || algorithm == "brute" || algorithm == "brute_force") {
+            use_brute = true;
+            mode = "Enumerate";
+        }
+
+        if (use_brute) {
+            if (free_nodes.size() >= 63) {
+                throw std::runtime_error("Enumerate has too many free nodes.");
             }
-            Metrics metrics = eval_assignment(assignment);
-            if (exceeds_limit(metrics, latency_limit, max_frame_latency_limit)) {
-                continue;
+            std::uint64_t total = static_cast<std::uint64_t>(1) << free_nodes.size();
+            iterations = total;
+            int threads = solver_thread_count(total, requested_threads);
+            std::vector<AssignmentSearchResult> partials(threads);
+            std::vector<std::exception_ptr> errors(threads);
+            std::vector<std::thread> workers;
+            workers.reserve(threads);
+            for (int worker = 0; worker < threads; ++worker) {
+                std::uint64_t begin = total * static_cast<std::uint64_t>(worker) /
+                                      static_cast<std::uint64_t>(threads);
+                std::uint64_t end = total * static_cast<std::uint64_t>(worker + 1) /
+                                    static_cast<std::uint64_t>(threads);
+                workers.emplace_back([&, worker, begin, end]() {
+                    try {
+                        AssignmentSearchResult local;
+                        for (std::uint64_t mask = begin; mask < end; ++mask) {
+                            std::vector<int> assignment = base_assignment;
+                            for (size_t bit = 0; bit < free_nodes.size(); ++bit) {
+                                assignment[free_nodes[bit]] =
+                                    static_cast<int>((mask >> bit) & 1U);
+                            }
+                            Metrics metrics = eval_assignment(assignment);
+                            if (exceeds_limit(metrics, latency_limit, max_frame_latency_limit)) {
+                                continue;
+                            }
+                            keep_search_result(
+                                local,
+                                std::move(assignment),
+                                std::move(metrics),
+                                mask
+                            );
+                        }
+                        partials[worker] = std::move(local);
+                    } catch (...) {
+                        errors[worker] = std::current_exception();
+                    }
+                });
             }
-            if (!has_best || metrics.loss < best_metrics.loss) {
-                best_assignment = std::move(assignment);
-                best_metrics = std::move(metrics);
+            for (auto& worker : workers) {
+                worker.join();
+            }
+            for (const auto& error : errors) {
+                if (error) {
+                    std::rethrow_exception(error);
+                }
+            }
+            AssignmentSearchResult combined;
+            for (auto& partial : partials) {
+                if (partial.has_best &&
+                    is_better_search_result(partial.metrics, partial.order, combined)) {
+                    combined = std::move(partial);
+                }
+            }
+            if (combined.has_best) {
+                best_assignment = std::move(combined.assignment);
+                best_metrics = std::move(combined.metrics);
                 has_best = true;
             }
-        }
-    } else if (algorithm == "auto" || algorithm.empty() || algorithm == "random" ||
-               algorithm == "random_search" || algorithm == "random_n") {
-        mode = (algorithm == "auto" || algorithm.empty()) ? "Auto Random" : "Random Search";
-        std::mt19937 rng(seed);
-        best_assignment = mostly_host_seed(graph, base_assignment);
-        best_metrics = eval_assignment(best_assignment);
-        has_best = !exceeds_limit(best_metrics, latency_limit, max_frame_latency_limit);
-        if (!has_best) {
-            best_assignment.clear();
-        }
-        if (free_nodes.empty()) {
-            iterations = 1;
-        } else {
-            int total_iterations = std::max(0, heuristic_iterations);
-            iterations = total_iterations;
-            for (int step = 0; step < total_iterations; ++step) {
-                std::vector<int> assignment = has_best ? best_assignment : mostly_host_seed(graph, base_assignment);
-                int max_flips = std::max(1, std::min(3, static_cast<int>(free_nodes.size())));
-                std::uniform_int_distribution<int> flip_dist(1, max_flips);
-                int flips = flip_dist(rng);
-                std::vector<int> pool = free_nodes;
-                std::shuffle(pool.begin(), pool.end(), rng);
-                for (int i = 0; i < flips; ++i) {
-                    int node = pool[i];
-                    assignment[node] = 1 - assignment[node];
-                }
-                Metrics metrics = eval_assignment(assignment);
-                if (exceeds_limit(metrics, latency_limit, max_frame_latency_limit)) {
-                    continue;
-                }
-                if (!has_best || metrics.loss < best_metrics.loss) {
-                    best_assignment = std::move(assignment);
-                    best_metrics = std::move(metrics);
-                    has_best = true;
+        } else if (algorithm == "auto" || algorithm.empty() || algorithm == "random" ||
+                   algorithm == "random_search" || algorithm == "random_n") {
+            mode = (algorithm == "auto" || algorithm.empty()) ? "Auto Random" : "Random Search";
+            std::vector<int> seed_assignment = mostly_host_seed(graph, base_assignment);
+            Metrics seed_metrics = eval_assignment(seed_assignment);
+            AssignmentSearchResult combined;
+            if (!exceeds_limit(seed_metrics, latency_limit, max_frame_latency_limit)) {
+                keep_search_result(combined, seed_assignment, seed_metrics, 0);
+            }
+            if (free_nodes.empty()) {
+                iterations = 1;
+            } else {
+                int total_iterations = std::max(0, heuristic_iterations);
+                iterations = static_cast<std::uint64_t>(total_iterations);
+                if (total_iterations > 0) {
+                    int threads = solver_thread_count(
+                        static_cast<std::uint64_t>(total_iterations),
+                        requested_threads
+                    );
+                    std::vector<AssignmentSearchResult> partials(threads);
+                    std::vector<std::exception_ptr> errors(threads);
+                    std::vector<std::thread> workers;
+                    workers.reserve(threads);
+                    for (int worker = 0; worker < threads; ++worker) {
+                        int begin = total_iterations * worker / threads;
+                        int end = total_iterations * (worker + 1) / threads;
+                        workers.emplace_back([&, worker, begin, end]() {
+                            try {
+                                std::mt19937 rng(mix_seed(seed, worker));
+                                AssignmentSearchResult local;
+                                if (!exceeds_limit(
+                                        seed_metrics,
+                                        latency_limit,
+                                        max_frame_latency_limit
+                                    )) {
+                                    keep_search_result(local, seed_assignment, seed_metrics, 0);
+                                }
+                                int max_flips = std::max(
+                                    1,
+                                    std::min(3, static_cast<int>(free_nodes.size()))
+                                );
+                                std::uniform_int_distribution<int> flip_dist(1, max_flips);
+                                for (int step = begin; step < end; ++step) {
+                                    std::vector<int> assignment = local.has_best
+                                                                      ? local.assignment
+                                                                      : seed_assignment;
+                                    int flips = flip_dist(rng);
+                                    std::vector<int> pool = free_nodes;
+                                    std::shuffle(pool.begin(), pool.end(), rng);
+                                    for (int i = 0; i < flips; ++i) {
+                                        int node = pool[i];
+                                        assignment[node] = 1 - assignment[node];
+                                    }
+                                    Metrics metrics = eval_assignment(assignment);
+                                    if (exceeds_limit(
+                                            metrics,
+                                            latency_limit,
+                                            max_frame_latency_limit
+                                        )) {
+                                        continue;
+                                    }
+                                    keep_search_result(
+                                        local,
+                                        std::move(assignment),
+                                        std::move(metrics),
+                                        static_cast<std::uint64_t>(step + 1)
+                                    );
+                                }
+                                partials[worker] = std::move(local);
+                            } catch (...) {
+                                errors[worker] = std::current_exception();
+                            }
+                        });
+                    }
+                    for (auto& worker : workers) {
+                        worker.join();
+                    }
+                    for (const auto& error : errors) {
+                        if (error) {
+                            std::rethrow_exception(error);
+                        }
+                    }
+                    for (auto& partial : partials) {
+                        if (partial.has_best &&
+                            is_better_search_result(partial.metrics, partial.order, combined)) {
+                            combined = std::move(partial);
+                        }
+                    }
                 }
             }
-        }
-    } else if (algorithm == "simulated_annealing" || algorithm == "annealing" ||
-               algorithm == "sim_anneal" || algorithm == "sim_aneal") {
-        mode = "Simulated Annealing";
-        std::mt19937 rng(seed);
-        std::uniform_real_distribution<double> unit(0.0, 1.0);
-        std::vector<int> current = mostly_host_seed(graph, base_assignment);
-        Metrics current_metrics = eval_assignment(current);
-        if (!exceeds_limit(current_metrics, latency_limit, max_frame_latency_limit)) {
-            best_assignment = current;
-            best_metrics = current_metrics;
-            has_best = true;
-        }
-        if (free_nodes.empty()) {
-            iterations = 1;
-        } else {
-            int total_iterations = std::max(0, heuristic_iterations);
-            iterations = total_iterations;
-            double initial_temp = 1.0;
-            double final_temp = 0.01;
-            std::uniform_int_distribution<int> node_dist(0, static_cast<int>(free_nodes.size()) - 1);
-            for (int step = 0; step < total_iterations; ++step) {
-                double progress = static_cast<double>(step) / std::max(1, total_iterations - 1);
-                double temperature = initial_temp * std::pow(final_temp / initial_temp, progress);
-                std::vector<int> candidate = current;
-                int node = free_nodes[node_dist(rng)];
-                candidate[node] = 1 - candidate[node];
-                Metrics metrics = eval_assignment(candidate);
-                if (exceeds_limit(metrics, latency_limit, max_frame_latency_limit)) {
-                    continue;
-                }
-                double delta = metrics.loss - current_metrics.loss;
-                bool accept = exceeds_limit(
-                                  current_metrics,
-                                  latency_limit,
-                                  max_frame_latency_limit
-                              ) ||
-                              delta <= 0.0 ||
-                              unit(rng) < std::exp(-delta / std::max(temperature, 1e-9));
-                if (accept) {
-                    current = candidate;
-                    current_metrics = metrics;
-                }
-                if (!has_best || metrics.loss < best_metrics.loss) {
-                    best_assignment = std::move(candidate);
-                    best_metrics = std::move(metrics);
-                    has_best = true;
+            if (combined.has_best) {
+                best_assignment = std::move(combined.assignment);
+                best_metrics = std::move(combined.metrics);
+                has_best = true;
+            }
+        } else if (algorithm == "simulated_annealing" || algorithm == "annealing" ||
+                   algorithm == "sim_anneal" || algorithm == "sim_aneal") {
+            mode = "Simulated Annealing";
+            std::vector<int> seed_assignment = mostly_host_seed(graph, base_assignment);
+            Metrics seed_metrics = eval_assignment(seed_assignment);
+            AssignmentSearchResult combined;
+            if (!exceeds_limit(seed_metrics, latency_limit, max_frame_latency_limit)) {
+                keep_search_result(combined, seed_assignment, seed_metrics, 0);
+            }
+            if (free_nodes.empty()) {
+                iterations = 1;
+            } else {
+                int total_iterations = std::max(0, heuristic_iterations);
+                iterations = static_cast<std::uint64_t>(total_iterations);
+                if (total_iterations > 0) {
+                    int threads = solver_thread_count(
+                        static_cast<std::uint64_t>(total_iterations),
+                        requested_threads
+                    );
+                    std::vector<AssignmentSearchResult> partials(threads);
+                    std::vector<std::exception_ptr> errors(threads);
+                    std::vector<std::thread> workers;
+                    workers.reserve(threads);
+                    for (int worker = 0; worker < threads; ++worker) {
+                        int begin = total_iterations * worker / threads;
+                        int end = total_iterations * (worker + 1) / threads;
+                        workers.emplace_back([&, worker, begin, end]() {
+                            try {
+                                std::mt19937 rng(mix_seed(seed, worker));
+                                std::uniform_real_distribution<double> unit(0.0, 1.0);
+                                std::uniform_int_distribution<int> node_dist(
+                                    0,
+                                    static_cast<int>(free_nodes.size()) - 1
+                                );
+                                std::vector<int> current = seed_assignment;
+                                Metrics current_metrics = seed_metrics;
+                                AssignmentSearchResult local;
+                                if (!exceeds_limit(
+                                        current_metrics,
+                                        latency_limit,
+                                        max_frame_latency_limit
+                                    )) {
+                                    keep_search_result(local, current, current_metrics, 0);
+                                }
+                                for (int step = begin; step < end; ++step) {
+                                    double progress = static_cast<double>(step) /
+                                                      std::max(1, total_iterations - 1);
+                                    double temperature = anneal_initial_temp * std::pow(
+                                        anneal_final_temp / anneal_initial_temp,
+                                        progress
+                                    );
+                                    std::vector<int> candidate = current;
+                                    int node = free_nodes[node_dist(rng)];
+                                    candidate[node] = 1 - candidate[node];
+                                    Metrics metrics = eval_assignment(candidate);
+                                    if (exceeds_limit(
+                                            metrics,
+                                            latency_limit,
+                                            max_frame_latency_limit
+                                        )) {
+                                        continue;
+                                    }
+                                    double delta = metrics.loss - current_metrics.loss;
+                                    bool accept = exceeds_limit(
+                                                      current_metrics,
+                                                      latency_limit,
+                                                      max_frame_latency_limit
+                                                  ) ||
+                                                  delta <= 0.0 ||
+                                                  unit(rng) < std::exp(
+                                                      -delta / std::max(temperature, 1e-9)
+                                                  );
+                                    if (accept) {
+                                        current = candidate;
+                                        current_metrics = metrics;
+                                    }
+                                    keep_search_result(
+                                        local,
+                                        std::move(candidate),
+                                        std::move(metrics),
+                                        static_cast<std::uint64_t>(step + 1)
+                                    );
+                                }
+                                partials[worker] = std::move(local);
+                            } catch (...) {
+                                errors[worker] = std::current_exception();
+                            }
+                        });
+                    }
+                    for (auto& worker : workers) {
+                        worker.join();
+                    }
+                    for (const auto& error : errors) {
+                        if (error) {
+                            std::rethrow_exception(error);
+                        }
+                    }
+                    for (auto& partial : partials) {
+                        if (partial.has_best &&
+                            is_better_search_result(partial.metrics, partial.order, combined)) {
+                            combined = std::move(partial);
+                        }
+                    }
                 }
             }
+            if (combined.has_best) {
+                best_assignment = std::move(combined.assignment);
+                best_metrics = std::move(combined.metrics);
+                has_best = true;
+            }
+        } else {
+            throw std::runtime_error("Unknown solver algorithm: " + algorithm);
         }
-    } else {
-        throw std::runtime_error("Unknown solver algorithm: " + algorithm);
     }
 
     if (!has_best) {
@@ -1280,7 +1623,12 @@ py::dict evaluate_core(const py::dict& data, const py::dict& params) {
     if (params.contains("avg_latency_scale") && params.contains("max_latency_scale")) {
         scales.avg_latency = params["avg_latency_scale"].cast<double>();
         scales.max_latency = params["max_latency_scale"].cast<double>();
-        if (!std::isfinite(scales.avg_latency) || !std::isfinite(scales.max_latency)) {
+        if (params.contains("initiation_interval_scale")) {
+            scales.initiation_interval = params["initiation_interval_scale"].cast<double>();
+        }
+        if (!std::isfinite(scales.avg_latency) ||
+            !std::isfinite(scales.max_latency) ||
+            !std::isfinite(scales.initiation_interval)) {
             throw std::runtime_error("Latency scales must be finite.");
         }
     } else {

@@ -54,7 +54,7 @@
       \textbf{Outputs}
       \begin{itemize}
         \item Node placement: $x_i=0$ for \device, $x_i=1$ for \host.
-        \item End-to-end latency and device utilization.
+        \item End-to-end latency and resource utilization.
         \item SVG topology and profiler-style schedule timeline.
       \end{itemize}
     \end{column}
@@ -187,13 +187,17 @@
   \[
     rank(t)=duration(t)+\max_{u \in succ(t)} rank(u)
   \]
-  The evaluator simulates three deterministic rules:
+  The evaluator simulates seven deterministic rules:
   \begin{itemize}
     \item \textbf{CriticalPath}: higher rank first, with older-frame aging
       \[
         rank(t)+10^6\max(0, unroll-1-frame(t)).
       \]
     \item \textbf{DeviceFirst}: source tasks, then Device, then Network, then Host; duration and rank break ties.
+    \item \textbf{HostFirst}: source tasks, then Host, then Network, then Device.
+    \item \textbf{NetworkFirst}: source tasks, then Network, then Device, then Host.
+    \item \textbf{OutputFirst}: output compute tasks first, then older-frame aging and rank.
+    \item \textbf{Throughput}: younger-frame aging and rank to test steady-state pipeline schedules.
     \item \textbf{FifoReady}: stable creation order after earliest feasible start time.
   \end{itemize}
   The earliest-start selection keeps the scheduler work-conserving; priorities decide only among tasks that can start at the same time.
@@ -210,9 +214,9 @@
 
   Per assignment, the native core evaluates:
   \[
-    2 \times 3 = 6
+    2 \times 2 \times 7 = 28
   \]
-  deterministic list schedules: two transfer timings and three ready-list rules. Each schedule is then retimed by the conservative sweep before metric extraction.
+  deterministic list schedules: two transfer timings, retiming on/off, and seven ready-list rules.
 \end{frame}
 
 \begin{frame}{Evaluator Step 5: Metrics and Winner Selection}
@@ -232,7 +236,7 @@
     \tau_{max}=\max_f \tau_{frame}(f),\quad
     \tau_{avg}=\frac{pipeline\_finish-pipeline\_start}{pipeline\_unroll}
   \]
-  The winner is the schedule with lowest split loss. Ties prefer lower max-frame latency, then lower average latency, then higher Device utilization.
+  The winner is the schedule with lowest split loss. Ties prefer lower max-frame latency, then lower average latency, then lower initiation interval, then higher Device utilization.
 \end{frame}
 
 \begin{frame}{Network Batching Illustration}
@@ -321,23 +325,23 @@
       Mode & Use case & Behavior \\
       \midrule
       Auto & Default & Enumerates if $\leq 12$ free nodes; otherwise random search \\
-      Enumerate & Small DAGs & Tests every assignment and returns the feasible global best \\
-      Random Search & Larger DAGs & Perturbs placements and keeps the best feasible candidate \\
-      Simulated Annealing & Escaping local minima & Accepts some worse moves according to temperature \\
+      Enumerate & Small DAGs & Splits assignment masks across threads; returns the exact feasible global best \\
+      Random Search & Larger DAGs & Runs independent threaded perturbation chains and keeps the best feasible candidate \\
+      Simulated Annealing & Escaping local minima & Runs independent threaded annealing chains with configurable initial/final temperatures \\
       \bottomrule
     \end{tabular}
   \end{table}
   \vspace{0.5em}
-  All modes enforce fixed-device nodes plus the average E2E and max-frame latency caps.
+  \texttt{solver\_threads}=0 selects the hardware thread count. All modes enforce fixed-device nodes plus the average E2E and max-frame latency caps.
 \end{frame}
 
 \begin{frame}{GUI Workflow}
   \begin{enumerate}
     \item Edit nodes, names, compute costs, fixed-device flags.
     \item Edit edges and transfer sizes in MB.
-    \item Configure bandwidth, latency, network batching, objective weights, solver mode, iterations, and latency caps.
+    \item Configure bandwidth, latency, network batching, objective weights, solver mode, threads, iterations, SA temperatures, and latency caps.
     \item Click \textbf{Solve}.
-    \item Inspect metrics, topology placement, and profiler-style timeline.
+    \item Inspect latency, resource utilization, topology placement, and profiler-style timeline.
   \end{enumerate}
   \vspace{0.5em}
   Validation catches duplicate node IDs, unknown edge endpoints, and non-DAG topologies.

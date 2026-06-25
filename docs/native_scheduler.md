@@ -135,8 +135,8 @@ overlap a Host output from frame `f`.
 
 ## Scheduling Rules
 
-For every timing variant, the evaluator runs three deterministic ready-task
-rules over the same expanded task graph.
+For every timing and retiming variant, the evaluator runs seven deterministic
+ready-task rules over the same expanded task graph.
 
 ### CriticalPath
 
@@ -167,6 +167,30 @@ The DeviceFirst rule prefers:
 Within each class it uses task duration and rank as deterministic tie-breakers.
 This rule is useful when the objective rewards Device utilization and when
 keeping the on-device queue occupied is beneficial.
+
+### HostFirst
+
+The HostFirst rule mirrors DeviceFirst for host-heavy placements: source tasks
+come first, then Host compute, then Network, then Device compute.
+
+### NetworkFirst
+
+The NetworkFirst rule prioritizes serialized cross-device transfers when they
+tie with other ready work. This helps the ensemble test schedules that drain the
+network queue early instead of letting same-time compute decisions hide transfer
+contention.
+
+### OutputFirst
+
+The OutputFirst rule gives output compute tasks a large bonus, then applies the
+same older-frame aging used by CriticalPath. This favors schedules that close
+frames promptly when the objective is sensitive to worst-frame latency.
+
+### Throughput
+
+The Throughput rule gives younger frames a large tie-break bonus before rank.
+This lets the ensemble test schedules that favor steady-state pipeline
+initiation interval over strictly draining older frames first.
 
 ### FifoReady
 
@@ -212,24 +236,27 @@ ready task can start earlier.
 The evaluator currently tests all combinations of:
 
 - `defer_blocked_transfers = false/true`
-- `CriticalPath`, `DeviceFirst`, `FifoReady`
+- `right_shift_slack = false/true`
+- `CriticalPath`, `DeviceFirst`, `HostFirst`, `NetworkFirst`, `OutputFirst`,
+  `Throughput`, `FifoReady`
 
-That gives six deterministic list schedules per candidate assignment. Each one
-is then passed through the right-shift sweep before metric extraction. The
-native core computes the configured split loss for each retimed schedule:
+That gives 28 deterministic list schedules per candidate assignment. The native
+core computes the configured split loss for each schedule:
 
 ```text
 loss =
   weight_avg_latency * L_avg
 + weight_max_latency * L_max
++ weight_initiation_interval * L_ii
 + weight_device_utilization * L_util
 ```
 
-`L_avg` and `L_max` are normalized by all-device/all-host baseline scales.
-`L_util` is `1 - device_utilization`.
+`L_avg`, `L_max`, and `L_ii` are normalized by all-device/all-host baseline
+scales. `L_util` is `1 - device_utilization`.
 
 The schedule with the lowest loss wins. If losses tie, the evaluator picks lower
-max-frame latency, then lower average latency, then higher Device utilization.
+max-frame latency, then lower average latency, then lower initiation interval,
+then higher Device utilization.
 
 ## Metric Extraction
 
@@ -258,14 +285,22 @@ For `pipeline_unroll = 1`, this is exactly the wall-clock E2E window from the
 first non-input work to the last output finish. For larger unroll factors, it is
 the amortized pipeline latency per frame.
 
-Device utilization is active Device compute time over the same input-excluded
-pipeline span.
+Device, Host, and Network utilization are active time over the same
+input-excluded pipeline span. Device utilization also remains the utilization
+term used by the current objective.
 
 ## Solver Integration
 
 The solver calls the evaluator for each candidate assignment. Enumeration,
 random search, and simulated annealing all use the same native evaluator and the
 same objective/constraint logic.
+
+Candidate evaluation is parallelized inside the native core. Enumeration splits
+the assignment mask space across worker threads and then reduces the exact best
+feasible result. Random search and simulated annealing run independent per-thread
+chains with deterministic mixed seeds; simulated annealing uses the configured
+initial and final temperatures for each chain schedule. `solver_threads = 0`
+selects the hardware thread count.
 
 Positive `latency_limit` rejects assignments whose amortized E2E latency exceeds
 the limit. Positive `max_frame_latency_limit` rejects assignments whose worst
