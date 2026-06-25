@@ -71,7 +71,7 @@
     \node[block, fill=blue!12] (edit) at (0,0) {GUI Editor\\Nodes, Edges, Env};
     \node[data, fill=gray!12, right=1.8cm of edit] (json) {JSON\\State};
     \node[block, fill=green!12, right=1.8cm of json] (graph) {NetworkX\\DAG};
-    \node[block, fill=orange!18, below=1.25cm of graph] (eval) {Evaluator\\Queues + Transfers};
+    \node[block, fill=orange!18, below=1.25cm of graph] (eval) {Native Evaluator\\List Scheduling};
     \node[block, fill=purple!14, left=1.8cm of eval] (solver) {Solver\\Search over $x$};
     \node[block, fill=red!10, left=1.8cm of solver] (viz) {SVG Views\\Topology + Timeline};
 
@@ -103,7 +103,7 @@
     \item Environment fields:
       \begin{itemize}
         \item \texttt{bandwidth}, \texttt{latency}, \texttt{weight\_avg\_latency}, \texttt{weight\_max\_latency}, \texttt{weight\_device\_utilization}.
-        \item \texttt{latency\_limit}, \texttt{max\_frame\_latency\_limit}, \texttt{batch\_transfers}.
+        \item \texttt{latency\_limit}, \texttt{max\_frame\_latency\_limit}, \texttt{batch\_transfers}, \texttt{pipeline\_unroll}.
       \end{itemize}
     \item JSON load/save keeps experiments reproducible and shareable.
   \end{itemize}
@@ -142,35 +142,97 @@
   A node starts only after all data is ready and its assigned worker queue is available.
 \end{frame}
 
-\begin{frame}{Evaluator: Data Dependency + Resource Queues}
-  For each node $i$ in topological order:
+\begin{frame}{Evaluator Step 1: Expanded Task DAG}
+  For a candidate assignment $x$, the C++ core expands the unrolled pipeline into a task DAG.
+  \begin{itemize}
+    \item Source tasks: zero-duration releases at $phase_i+f\cdot period_i$.
+    \item Compute tasks: one task per non-source node and frame.
+    \item Cross-device edges: explicit Network tasks with cost $L+s/B$.
+    \item Batched outgoing transfers: one Network task with $L+\sum_k s_k/B$.
+  \end{itemize}
+  Dependency classes:
+  \begin{itemize}
+    \item Same-device data edge: source compute/source task $\rightarrow$ target compute task.
+    \item Cross-device data edge: source task $\rightarrow$ Network task $\rightarrow$ target task.
+    \item Same non-input operator across frames: FIFO edges from frame $f$ to $f+1$.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Evaluator Step 2: Ready-List Event Loop}
+  The simulator maintains pending dependencies, earliest ready times, and one serialized ready time per resource:
   \[
-    DataReady_i =
-    \max\left(
-      release_i(f),
-      \max_{j \in pred(i)}
-      \left[
-        F_j +
-        \mathbb{I}(x_j \neq x_i)
-        \left(L + \frac{s_{ji}}{B}\right)
-      \right]
-    \right)
+    time\_dev\_ready,\quad time\_host\_ready,\quad time\_network\_ready
   \]
-  where input/source nodes may use $release_i(f)=phase_i+f\cdot period_i$ for frame $f$.
-  Source nodes are zero-duration external events: they do not occupy the device or host worker queues, and later releases may occur while older frames are still being processed downstream.
-  \vspace{0.5em}
-  The evaluator then waits for the selected worker queue:
+  A ready task starts at:
   \[
-    S_i =
+    S_t =
     \begin{cases}
-      \max(DataReady_i, time\_dev\_ready), & x_i=0 \\
-      \max(DataReady_i, time\_host\_ready), & x_i=1
+      ready_t, & resource(t)=source \\
+      \max(ready_t, time\_dev\_ready), & resource(t)=device \\
+      \max(ready_t, time\_host\_ready), & resource(t)=host \\
+      \max(ready_t, time\_network\_ready), & resource(t)=network
     \end{cases}
   \]
+  Main loop:
+  \begin{enumerate}
+    \item Put zero-pending tasks into the ready set.
+    \item Pick the ready task with the earliest feasible start time.
+    \item Break ties with the active rule priority.
+    \item Record start/finish, update the resource queue, and release successors.
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}{Evaluator Step 3: Ensemble Rules}
+  The task DAG and upward ranks are built once per assignment:
   \[
-    F_i = S_i + (1-x_i)c_i^{dev} + x_i c_i^{host}
+    rank(t)=duration(t)+\max_{u \in succ(t)} rank(u)
   \]
-  E2E latency is measured from the first non-input compute or transfer event to the last non-input output finish. Source/input releases can delay work, but they are not counted inside the latency window.
+  The evaluator simulates three deterministic rules:
+  \begin{itemize}
+    \item \textbf{CriticalPath}: higher rank first, with older-frame aging
+      \[
+        rank(t)+10^6\max(0, unroll-1-frame(t)).
+      \]
+    \item \textbf{DeviceFirst}: source tasks, then Device, then Network, then Host; duration and rank break ties.
+    \item \textbf{FifoReady}: stable creation order after earliest feasible start time.
+  \end{itemize}
+  The earliest-start selection keeps the scheduler work-conserving; priorities decide only among tasks that can start at the same time.
+\end{frame}
+
+\begin{frame}{Evaluator Step 4: Tail-Latency Variants}
+  The evaluator also simulates timing variants that reduce artificial long tail-frame E2E windows:
+  \begin{itemize}
+    \item \textbf{Deferred blocked transfers}: if a cross-device target is still blocked by other prerequisites, delay the transfer until those prerequisites finish.
+    \item \textbf{Frame-drain gate}: for younger frames, wait for the previous frame output before starting non-source side-branch work.
+  \end{itemize}
+  These variants avoid counting early work that cannot help output completion as the frame's first non-input event.
+  \vspace{0.5em}
+
+  Per assignment, the native core evaluates:
+  \[
+    2 \times 2 \times 3 = 12
+  \]
+  deterministic schedules: two transfer timings, two frame-drain modes, and three ready-list rules.
+\end{frame}
+
+\begin{frame}{Evaluator Step 5: Metrics and Winner Selection}
+  Latency excludes source/input events.
+  For each frame:
+  \[
+    frame\_start=\min(\text{non-input compute starts, transfer starts})
+  \]
+  \[
+    frame\_finish=\max(\text{non-input output finishes})
+  \]
+  \[
+    \tau_{frame}=frame\_finish-frame\_start
+  \]
+  Reported metrics:
+  \[
+    \tau_{max}=\max_f \tau_{frame}(f),\quad
+    \tau_{avg}=\frac{pipeline\_finish-pipeline\_start}{pipeline\_unroll}
+  \]
+  The winner is the schedule with lowest split loss. Ties prefer lower max-frame latency, then lower average latency, then higher Device utilization.
 \end{frame}
 
 \begin{frame}{Network Batching Illustration}
@@ -381,9 +443,9 @@
     \item Add richer solver diagnostics: rejected candidates, constraint slack, convergence history.
     \item Add exportable SVG/PNG reports for topology and timeline.
     \item Add batch evaluation over bandwidth/latency sweeps.
-    \item Consider more advanced schedulers for larger DAGs.
+    \item Expose selected scheduling rule, queue slack, and ready-task diagnostics.
     \item Improve timeline semantics with explicit queue-wait and data-ready intervals.
-    \item Explore network reordering policies beyond deterministic topological-source FIFO.
+    \item Explore additional network reordering policies and transfer-priority rules.
   \end{itemize}
 \end{frame}
 

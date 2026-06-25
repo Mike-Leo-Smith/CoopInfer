@@ -23,11 +23,14 @@ The application stores graph topology, node/edge costs, environment parameters, 
 
 - Nodes are stored in a `networkx.DiGraph`; scheduling assignment `x=0` means Device and `x=1` means Host.
 - Node IDs remain the stable edge references; optional node names are used as topology display labels.
-- The evaluator walks the DAG in topological order and enforces one execution queue per device through `time_dev_ready` and `time_host_ready`.
-- Cross-device transfers use one serialized network queue, so network transfers do not overlap.
+- Each assignment is evaluated in the native C++ core by expanding the unrolled pipeline into source, compute, and transfer tasks.
+- The evaluator is a work-conserving list scheduler over serialized Device, Host, and Network resources. It schedules ready tasks by earliest feasible start time, then applies deterministic tie-break rules.
+- Cross-device edges become explicit network tasks on one serialized network queue, so network transfers do not overlap.
 - Each cross-device transfer costs `latency_ms + size_mb / bandwidth_mb_s * 1000`.
 - The optional `batch_transfers` environment flag groups multiple outgoing cross-device transfers from the same source node into one network transaction. The batch pays fixed latency once and still pays bandwidth time for the summed payload size.
 - `pipeline_unroll` repeats the same DAG for multiple frames to model pipeline parallelism across consecutive inputs. The evaluator enforces FIFO ordering for the same logical node label across frames, while device, host, and network queues can overlap different labels from different frames.
+- For each candidate assignment, the native core builds the task DAG and critical-path ranks once, simulates `CriticalPath`, `DeviceFirst`, and `FifoReady` scheduling rules, and keeps the schedule with the lowest configured split loss.
+- The evaluator also tests tail-latency-oriented timing variants that defer cross-device transfers or younger-frame side-branch work until the downstream frame can make progress. This avoids counting early no-op work as the start of a long tail-frame E2E window.
 - Source nodes can define `source_period_ms` and `source_phase_ms`. For unrolled pipelines, frame `f` of that input is released at `source_phase_ms + f * source_period_ms`. These nodes are independent zero-duration input events: they do not consume device/host compute queues and their successive frames may overlap downstream work.
 - End-to-end latency excludes source/input events. It is measured from the first non-input compute or transfer event to the last non-input output node finish, then amortized over `pipeline_unroll`.
 - Max-frame latency is the worst per-frame version of the same input-excluded window.
@@ -38,6 +41,8 @@ The application stores graph topology, node/edge costs, environment parameters, 
 - The GUI has two topology views: the config DAG before solving, and the solved unrolled pipeline with placement, transfer, and FIFO edges. In solved views, node fill color identifies the frame; device/host placement is shown by the node outline.
 - The timeline visualizes the evaluator's actual compute and transfer records, including serialized, batched, and unrolled pipeline transfers. Input releases, transfer bars, and vertical dependency/release lines reuse the same high-contrast frame colors as the filled pipeline nodes.
 - Solver search and all schedule/performance evaluation run through a required C++ extension built with CMake/scikit-build-core. Python modules handle validation, JSON IO, GUI wiring, and native-core bindings.
+
+For the full evaluator algorithm, see [docs/native_scheduler.md](docs/native_scheduler.md).
 
 ## JSON Environment Fields
 

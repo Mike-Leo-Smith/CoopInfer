@@ -89,11 +89,41 @@ def test_infer_latency_queues_independent_nodes_on_same_device():
         graph, {"input": 0, "a": 0, "b": 0}, bandwidth=10.0, latency=5.0
     )
 
-    assert starts["a"] == 0.0
-    assert finishes["a"] == 10.0
-    assert starts["b"] == 10.0
-    assert finishes["b"] == 30.0
+    assert starts["a"] in {0.0, 20.0}
+    assert starts["b"] in {0.0, 10.0}
+    assert starts["a"] != starts["b"]
+    assert finishes["a"] - starts["a"] == 10.0
+    assert finishes["b"] - starts["b"] == 20.0
     assert latency == 30.0
+
+
+def test_evaluator_fills_ready_work_while_other_work_waits_for_transfer():
+    graph = graph_from_records(
+        [
+            {"id": "remote_input", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": False},
+            {"id": "delayed_dev", "c_dev": 10.0, "c_host": 10.0, "fixed_dev": False},
+            {"id": "local_input", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": True},
+            {"id": "ready_dev", "c_dev": 5.0, "c_host": 5.0, "fixed_dev": False},
+        ],
+        [
+            {"source": "remote_input", "target": "delayed_dev", "size": 1.0},
+            {"source": "local_input", "target": "ready_dev", "size": 0.0},
+        ],
+    )
+
+    result = evaluate(
+        graph,
+        {"remote_input": 1, "delayed_dev": 0, "local_input": 0, "ready_dev": 0},
+        bandwidth=10.0,
+        latency=5.0,
+        **LATENCY_ONLY_WEIGHTS,
+    )
+
+    assert result.start_times["ready_dev"] == 0.0
+    assert result.finish_times["ready_dev"] == 5.0
+    assert result.start_times["delayed_dev"] == 105.0
+    assert result.finish_times["delayed_dev"] == 115.0
+    assert result.latency == 115.0
 
 
 def test_infer_latency_waits_for_host_queue_after_data_ready():
@@ -292,10 +322,49 @@ def test_evaluate_reports_max_frame_latency_for_unrolled_pipeline():
     )
 
     assert result.latency == 50.0
-    assert result.max_frame_latency == 130.0
+    assert result.max_frame_latency == 50.0
+    assert result.transfer_records[1].start == 50.0
+    assert result.transfer_records[2].start == 100.0
     assert result.avg_latency_loss >= 0.0
     assert result.max_frame_latency_loss >= 0.0
     assert result.device_utilization_loss >= 0.0
+
+
+def test_evaluator_delays_fast_join_branch_to_reduce_tail_frame_latency():
+    graph = graph_from_records(
+        [
+            {
+                "id": "input",
+                "c_dev": 0.0,
+                "c_host": 0.0,
+                "fixed_dev": True,
+                "source_period_ms": 10.0,
+            },
+            {"id": "slow_branch", "c_dev": 50.0, "c_host": 50.0, "fixed_dev": True},
+            {"id": "fast_branch", "c_dev": 1.0, "c_host": 1.0, "fixed_dev": False},
+            {"id": "merge", "c_dev": 1.0, "c_host": 1.0, "fixed_dev": True},
+        ],
+        [
+            {"source": "input", "target": "slow_branch", "size": 0.0},
+            {"source": "input", "target": "fast_branch", "size": 0.0},
+            {"source": "slow_branch", "target": "merge", "size": 0.0},
+            {"source": "fast_branch", "target": "merge", "size": 0.0},
+        ],
+    )
+
+    result = evaluate(
+        graph,
+        {"input": 0, "slow_branch": 0, "fast_branch": 1, "merge": 0},
+        bandwidth=1000.0,
+        latency=0.0,
+        **LATENCY_ONLY_WEIGHTS,
+        pipeline_unroll=3,
+    )
+
+    assert result.latency == 51.0
+    assert result.max_frame_latency == 51.0
+    assert result.start_times["fast_branch[f1]"] == 51.0
+    assert result.start_times["fast_branch[f2]"] == 102.0
 
 
 def test_solver_accounts_for_source_period_in_pipeline_result():
@@ -386,16 +455,19 @@ def test_solver_rejects_assignments_above_latency_limit():
 def test_solver_rejects_on_max_frame_latency_limit_not_amortized_latency_limit():
     graph = graph_from_records(
         [
+            {"id": "input", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": True},
             {
-                "id": "camera",
-                "c_dev": 1.0,
-                "c_host": 1.0,
-                "fixed_dev": True,
-                "source_period_ms": 10.0,
+                "id": "stage",
+                "c_dev": 50.0,
+                "c_host": 30.0,
+                "fixed_dev": False,
             },
-            {"id": "slow_out", "c_dev": 200.0, "c_host": 50.0, "fixed_dev": False},
+            {"id": "head", "c_dev": 999.0, "c_host": 60.0, "fixed_dev": False},
         ],
-        [{"source": "camera", "target": "slow_out", "size": 0.0}],
+        [
+            {"source": "input", "target": "stage", "size": 0.0},
+            {"source": "stage", "target": "head", "size": 0.0},
+        ],
     )
 
     try:
@@ -404,8 +476,8 @@ def test_solver_rejects_on_max_frame_latency_limit_not_amortized_latency_limit()
             bandwidth=1000.0,
             latency=0.0,
             **LATENCY_ONLY_WEIGHTS,
-            latency_limit=60.0,
-            max_frame_latency_limit=120.0,
+            latency_limit=80.0,
+            max_frame_latency_limit=80.0,
             pipeline_unroll=3,
             algorithm="Enumerate",
         )
@@ -418,16 +490,19 @@ def test_solver_rejects_on_max_frame_latency_limit_not_amortized_latency_limit()
 def test_solver_allows_high_max_frame_when_only_amortized_limit_is_set():
     graph = graph_from_records(
         [
+            {"id": "input", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": True},
             {
-                "id": "camera",
-                "c_dev": 1.0,
-                "c_host": 1.0,
-                "fixed_dev": True,
-                "source_period_ms": 10.0,
+                "id": "stage",
+                "c_dev": 50.0,
+                "c_host": 30.0,
+                "fixed_dev": False,
             },
-            {"id": "slow_out", "c_dev": 200.0, "c_host": 50.0, "fixed_dev": False},
+            {"id": "head", "c_dev": 999.0, "c_host": 60.0, "fixed_dev": False},
         ],
-        [{"source": "camera", "target": "slow_out", "size": 0.0}],
+        [
+            {"source": "input", "target": "stage", "size": 0.0},
+            {"source": "stage", "target": "head", "size": 0.0},
+        ],
     )
 
     result = solve(
@@ -435,28 +510,31 @@ def test_solver_allows_high_max_frame_when_only_amortized_limit_is_set():
         bandwidth=1000.0,
         latency=0.0,
         **LATENCY_ONLY_WEIGHTS,
-        latency_limit=60.0,
+        latency_limit=80.0,
         pipeline_unroll=3,
         algorithm="Enumerate",
     )
 
-    assert result.metrics.latency == 50.0
+    assert math.isclose(result.metrics.latency, 230.0 / 3.0)
     assert result.metrics.max_frame_latency == 130.0
 
 
 def test_solver_max_latency_weight_changes_objective_choice():
     graph = graph_from_records(
         [
+            {"id": "input", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": True},
             {
-                "id": "camera",
-                "c_dev": 1.0,
-                "c_host": 1.0,
-                "fixed_dev": True,
-                "source_period_ms": 10.0,
+                "id": "stage",
+                "c_dev": 50.0,
+                "c_host": 30.0,
+                "fixed_dev": False,
             },
-            {"id": "head", "c_dev": 80.0, "c_host": 50.0, "fixed_dev": False},
+            {"id": "head", "c_dev": 999.0, "c_host": 60.0, "fixed_dev": False},
         ],
-        [{"source": "camera", "target": "head", "size": 0.0}],
+        [
+            {"source": "input", "target": "stage", "size": 0.0},
+            {"source": "stage", "target": "head", "size": 0.0},
+        ],
     )
 
     avg_result = solve(
@@ -480,12 +558,14 @@ def test_solver_max_latency_weight_changes_objective_choice():
         algorithm="Enumerate",
     )
 
+    assert avg_result.assignment["stage"] == 0
     assert avg_result.assignment["head"] == 1
-    assert avg_result.metrics.latency == 50.0
+    assert math.isclose(avg_result.metrics.latency, 230.0 / 3.0)
     assert avg_result.metrics.max_frame_latency == 130.0
-    assert max_result.assignment["head"] == 0
-    assert max_result.metrics.latency == 80.0
-    assert max_result.metrics.max_frame_latency == 80.0
+    assert max_result.assignment["stage"] == 1
+    assert max_result.assignment["head"] == 1
+    assert max_result.metrics.latency == 90.0
+    assert max_result.metrics.max_frame_latency == 90.0
 
 
 def test_latency_ignores_delayed_source_phase():
