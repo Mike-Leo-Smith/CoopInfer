@@ -135,8 +135,8 @@ overlap a Host output from frame `f`.
 
 ## Scheduling Rules
 
-For every timing and retiming variant, the evaluator runs seven deterministic
-ready-task rules over the same expanded task graph.
+For every timing, retiming, and scheduler-mode variant, the evaluator runs seven
+deterministic ready-task rules over the same expanded task graph.
 
 ### CriticalPath
 
@@ -200,7 +200,7 @@ scheduler.
 
 ## Event Loop
 
-For a variant and rule, the simulator maintains:
+For a greedy variant and rule, the simulator maintains:
 
 - `pending`: number of unsatisfied dependencies per task.
 - `ready_time`: earliest data/release-ready time per task.
@@ -227,9 +227,41 @@ At each step:
 6. Propagate the finish time to successors. A successor enters the ready set
    when all dependencies are satisfied.
 
-This event loop is work-conserving with respect to the selected variant: it does
-not idle a resource for a high-priority task whose data is not ready when another
-ready task can start earlier.
+This greedy event loop is work-conserving with respect to the selected variant:
+it does not idle a resource for a high-priority task whose data is not ready when
+another ready task can start earlier.
+
+## Bounded Lookahead
+
+The ensemble also runs a deterministic bounded lookahead scheduler for each
+timing, retiming, and ready-rule combination. It uses the same ready-task start
+times and rule priorities as the greedy loop, but keeps several partial
+schedules instead of committing immediately to one ready task.
+
+At each scheduling step:
+
+1. Sort ready candidates by earliest feasible start time, then active rule
+   priority, then task id.
+2. For each current beam state, branch on the first three ready candidates.
+3. Prune the merged states to a beam width of four.
+4. Rank partial states by a lower bound on serialized resource completion:
+
+   ```text
+   max(
+     time_dev_ready + remaining_device_work,
+     time_host_ready + remaining_host_work,
+     time_network_ready + remaining_network_work
+   )
+   ```
+
+5. Break partial-state ties by lower current resource readiness, lower summed
+   starts, higher summed priorities, then scheduled order.
+
+The lookahead brancher can explore a small number of non-greedy orderings, but
+it does not change dependencies, resource serialization, source releases, metric
+extraction, or objective scoring. Each completed beam state is materialized into
+the same metrics as a greedy schedule. If right-shift retiming is active, the
+same postprocess sweep is applied before scoring.
 
 ## Winner Selection
 
@@ -237,11 +269,12 @@ The evaluator currently tests all combinations of:
 
 - `defer_blocked_transfers = false/true`
 - `right_shift_slack = false/true`
+- `lookahead_beam = false/true`
 - `CriticalPath`, `DeviceFirst`, `HostFirst`, `NetworkFirst`, `OutputFirst`,
   `Throughput`, `FifoReady`
 
-That gives 28 deterministic list schedules per candidate assignment. The native
-core computes the configured split loss for each schedule:
+That gives 56 deterministic schedule candidates per candidate assignment. The
+native core computes the configured split loss for each schedule:
 
 ```text
 loss =
@@ -254,9 +287,10 @@ loss =
 `L_avg`, `L_max`, and `L_ii` are normalized by all-device/all-host baseline
 scales. `L_util` is `1 - device_utilization`.
 
-The schedule with the lowest loss wins. If losses tie, the evaluator picks lower
-max-frame latency, then lower average latency, then lower initiation interval,
-then higher Device utilization.
+The schedule with the lowest loss wins, so the inner evaluator follows the same
+global split objective used by the solver. If losses tie, the evaluator picks
+lower max-frame latency, then lower average latency, then lower initiation
+interval, then higher Device utilization.
 
 ## Metric Extraction
 

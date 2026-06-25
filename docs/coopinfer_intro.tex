@@ -180,6 +180,9 @@
     \item Break ties with the active rule priority.
     \item Record start/finish, update the resource queue, and release successors.
   \end{enumerate}
+  Greedy mode commits to one choice per step. Lookahead mode keeps a width-4 beam,
+  branches on the first three ready candidates, and prunes partial schedules by a
+  serialized-resource completion lower bound.
 \end{frame}
 
 \begin{frame}{Evaluator Step 3: Ensemble Rules}
@@ -200,7 +203,7 @@
     \item \textbf{Throughput}: younger-frame aging and rank to test steady-state pipeline schedules.
     \item \textbf{FifoReady}: stable creation order after earliest feasible start time.
   \end{itemize}
-  The earliest-start selection keeps the scheduler work-conserving; priorities decide only among tasks that can start at the same time.
+  Greedy mode remains work-conserving through earliest-start selection; lookahead uses the same ordering to choose bounded branch candidates.
 \end{frame}
 
 \begin{frame}{Evaluator Step 4: Tail-Latency Retiming}
@@ -214,9 +217,9 @@
 
   Per assignment, the native core evaluates:
   \[
-    2 \times 2 \times 7 = 28
+    2 \times 2 \times 2 \times 7 = 56
   \]
-  deterministic list schedules: two transfer timings, retiming on/off, and seven ready-list rules.
+  deterministic schedule candidates: two transfer timings, retiming on/off, greedy/lookahead mode, and seven ready-list rules.
 \end{frame}
 
 \begin{frame}{Evaluator Step 5: Metrics and Winner Selection}
@@ -236,7 +239,7 @@
     \tau_{max}=\max_f \tau_{frame}(f),\quad
     \tau_{avg}=\frac{pipeline\_finish-pipeline\_start}{pipeline\_unroll}
   \]
-  The winner is the schedule with lowest split loss. Ties prefer lower max-frame latency, then lower average latency, then lower initiation interval, then higher Device utilization.
+  The winner is the schedule with the lowest global split loss used by the solver. Ties prefer lower max-frame latency, then lower average latency, then lower initiation interval, then higher Device utilization.
 \end{frame}
 
 \begin{frame}{Network Batching Illustration}

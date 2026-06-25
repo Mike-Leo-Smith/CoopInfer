@@ -178,6 +178,8 @@
     \item 若开始时间相同，则用当前启发式规则打破平局。
     \item 记录开始/结束时间，更新资源队列，并释放后继任务。
   \end{enumerate}
+  贪心模式每步提交一个选择；lookahead 模式保留宽度为 4 的 beam，
+  对前三个 ready 候选分支，并用串行资源完成时间下界裁剪部分调度。
 \end{frame}
 
 \begin{frame}{内层解析器步骤 3：多规则集成}
@@ -198,7 +200,7 @@
     \item \textbf{Throughput}：年轻帧加成和 rank，用于测试稳态流水调度。
     \item \textbf{FifoReady}：在相同可行开始时间下按任务创建顺序稳定排序。
   \end{itemize}
-  先选最早可行开始时间保证资源不无谓空转；规则只负责同一开始时刻的优先级选择。
+  贪心模式通过最早可行开始时间保持资源不无谓空转；lookahead 使用同一排序来选择有限分支候选。
 \end{frame}
 
 \begin{frame}{内层解析器步骤 4：尾帧时延重排}
@@ -212,9 +214,9 @@
 
   每个候选方案共评估：
   \[
-    2 \times 2 \times 7 = 28
+    2 \times 2 \times 2 \times 7 = 56
   \]
-  套确定性列表调度：两种传输时序、是否右移重排，以及七种就绪列表规则。
+  套确定性调度候选：两种传输时序、是否右移重排、贪心/lookahead 模式，以及七种就绪列表规则。
 \end{frame}
 
 \begin{frame}{内层解析器步骤 5：指标提取与胜者选择}
@@ -234,7 +236,7 @@
     \tau_{max}=\max_f \tau_{frame}(f),\quad
     \tau_{avg}=\frac{pipeline\_finish-pipeline\_start}{pipeline\_unroll}
   \]
-  最终保留 Loss 最低的调度；若 Loss 相同，依次选择最大单帧时延更低、平均时延更低、启动间隔更低、端侧利用率更高的方案。
+  最终保留与求解器一致的全局切分 Loss 最低的调度；若 Loss 相同，依次选择最大单帧时延更低、平均时延更低、启动间隔更低、端侧利用率更高的方案。
 \end{frame}
 
 \begin{frame}{网络批处理示意}

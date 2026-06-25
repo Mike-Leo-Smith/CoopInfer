@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <initializer_list>
 #include <limits>
 #include <numeric>
 #include <queue>
@@ -869,6 +870,198 @@ Metrics materialize_metrics(
     return finalize_metrics(graph, assignment, weights, scales, unroll, std::move(metrics));
 }
 
+struct ReadyCandidate {
+    int ready_index = -1;
+    int task_id = -1;
+    double start = 0.0;
+    double priority = 0.0;
+};
+
+struct ScheduleState {
+    std::vector<int> pending;
+    std::vector<double> ready_time;
+    std::vector<int> ready;
+    std::vector<double> task_starts;
+    std::vector<double> task_finishes;
+    std::vector<int> scheduled_order;
+    double dev_ready = 0.0;
+    double host_ready = 0.0;
+    double network_ready = 0.0;
+    double dev_done = 0.0;
+    double host_done = 0.0;
+    double network_done = 0.0;
+    double start_sum = 0.0;
+    double priority_sum = 0.0;
+};
+
+bool is_better_metrics(const Metrics& candidate, const Metrics& best);
+
+bool candidate_precedes(const ReadyCandidate& lhs, const ReadyCandidate& rhs) {
+    constexpr double eps = 1e-9;
+    if (lhs.start < rhs.start - eps) {
+        return true;
+    }
+    if (lhs.start > rhs.start + eps) {
+        return false;
+    }
+    if (lhs.priority > rhs.priority + eps) {
+        return true;
+    }
+    if (lhs.priority < rhs.priority - eps) {
+        return false;
+    }
+    return lhs.task_id < rhs.task_id;
+}
+
+std::vector<ReadyCandidate> ready_candidates(
+    const GraphData& graph,
+    const std::vector<ScheduleTask>& tasks,
+    const std::vector<double>& ranks,
+    const ScheduleState& state,
+    int unroll,
+    ScheduleRule rule
+) {
+    std::vector<ReadyCandidate> candidates;
+    candidates.reserve(state.ready.size());
+    for (int index = 0; index < static_cast<int>(state.ready.size()); ++index) {
+        int task_id = state.ready[index];
+        const auto& task = tasks[task_id];
+        double start = std::max(
+            state.ready_time[task_id],
+            resource_ready_at(
+                task.resource,
+                state.dev_ready,
+                state.host_ready,
+                state.network_ready
+            )
+        );
+        start = std::max(start, task.release);
+        candidates.push_back(
+            ReadyCandidate{
+                index,
+                task_id,
+                start,
+                task_priority(graph, task, ranks, task_id, unroll, rule),
+            }
+        );
+    }
+    std::sort(candidates.begin(), candidates.end(), candidate_precedes);
+    return candidates;
+}
+
+void add_done_time(ScheduleState& state, ResourceKind resource, double duration) {
+    if (resource == ResourceKind::Device) {
+        state.dev_done += duration;
+    } else if (resource == ResourceKind::Host) {
+        state.host_done += duration;
+    } else if (resource == ResourceKind::Network) {
+        state.network_done += duration;
+    }
+}
+
+ScheduleState apply_schedule_choice(
+    const std::vector<ScheduleTask>& tasks,
+    const ScheduleState& state,
+    const ReadyCandidate& candidate
+) {
+    ScheduleState next = state;
+    next.ready.erase(next.ready.begin() + candidate.ready_index);
+    const auto& task = tasks[candidate.task_id];
+    double finish = candidate.start + task.duration;
+    set_resource_ready(
+        task.resource,
+        finish,
+        next.dev_ready,
+        next.host_ready,
+        next.network_ready
+    );
+    add_done_time(next, task.resource, task.duration);
+    next.task_starts[candidate.task_id] = candidate.start;
+    next.task_finishes[candidate.task_id] = finish;
+    next.scheduled_order.push_back(candidate.task_id);
+    next.start_sum += candidate.start;
+    next.priority_sum += candidate.priority;
+
+    for (int successor : task.successors) {
+        next.ready_time[successor] = std::max(next.ready_time[successor], finish);
+        next.pending[successor] -= 1;
+        if (next.pending[successor] == 0) {
+            next.ready.push_back(successor);
+        }
+    }
+    return next;
+}
+
+double beam_lower_bound(
+    const ScheduleState& state,
+    double total_dev,
+    double total_host,
+    double total_network
+) {
+    return std::max({
+        state.dev_ready + std::max(0.0, total_dev - state.dev_done),
+        state.host_ready + std::max(0.0, total_host - state.host_done),
+        state.network_ready + std::max(0.0, total_network - state.network_done),
+    });
+}
+
+bool state_precedes(
+    const ScheduleState& lhs,
+    const ScheduleState& rhs,
+    double total_dev,
+    double total_host,
+    double total_network
+) {
+    constexpr double eps = 1e-9;
+    double lhs_bound = beam_lower_bound(lhs, total_dev, total_host, total_network);
+    double rhs_bound = beam_lower_bound(rhs, total_dev, total_host, total_network);
+    if (lhs_bound < rhs_bound - eps) {
+        return true;
+    }
+    if (lhs_bound > rhs_bound + eps) {
+        return false;
+    }
+    double lhs_ready = std::max({lhs.dev_ready, lhs.host_ready, lhs.network_ready});
+    double rhs_ready = std::max({rhs.dev_ready, rhs.host_ready, rhs.network_ready});
+    if (lhs_ready < rhs_ready - eps) {
+        return true;
+    }
+    if (lhs_ready > rhs_ready + eps) {
+        return false;
+    }
+    if (lhs.start_sum < rhs.start_sum - eps) {
+        return true;
+    }
+    if (lhs.start_sum > rhs.start_sum + eps) {
+        return false;
+    }
+    if (lhs.priority_sum > rhs.priority_sum + eps) {
+        return true;
+    }
+    if (lhs.priority_sum < rhs.priority_sum - eps) {
+        return false;
+    }
+    return lhs.scheduled_order < rhs.scheduled_order;
+}
+
+ScheduleState initial_schedule_state(const std::vector<ScheduleTask>& tasks) {
+    ScheduleState state;
+    state.pending.assign(tasks.size(), 0);
+    state.ready_time.assign(tasks.size(), 0.0);
+    state.ready.reserve(tasks.size());
+    state.task_starts.assign(tasks.size(), 0.0);
+    state.task_finishes.assign(tasks.size(), 0.0);
+    state.scheduled_order.reserve(tasks.size());
+    for (int task_id = 0; task_id < static_cast<int>(tasks.size()); ++task_id) {
+        state.pending[task_id] = tasks[task_id].pending;
+        state.ready_time[task_id] = tasks[task_id].release;
+        if (state.pending[task_id] == 0) {
+            state.ready.push_back(task_id);
+        }
+    }
+    return state;
+}
+
 Metrics simulate_schedule(
     const GraphData& graph,
     const std::vector<int>& assignment,
@@ -969,6 +1162,91 @@ Metrics simulate_schedule(
     );
 }
 
+Metrics simulate_schedule_with_lookahead(
+    const GraphData& graph,
+    const std::vector<int>& assignment,
+    const ObjectiveWeights& weights,
+    const ObjectiveScales& scales,
+    const std::vector<ScheduleTask>& tasks,
+    const std::vector<double>& ranks,
+    int unroll,
+    ScheduleRule rule,
+    bool right_shift_slack
+) {
+    constexpr int beam_width = 4;
+    constexpr int branch_width = 3;
+
+    double total_dev = 0.0;
+    double total_host = 0.0;
+    double total_network = 0.0;
+    for (const auto& task : tasks) {
+        if (task.resource == ResourceKind::Device) {
+            total_dev += task.duration;
+        } else if (task.resource == ResourceKind::Host) {
+            total_host += task.duration;
+        } else if (task.resource == ResourceKind::Network) {
+            total_network += task.duration;
+        }
+    }
+
+    std::vector<ScheduleState> beam;
+    beam.push_back(initial_schedule_state(tasks));
+    for (int scheduled = 0; scheduled < static_cast<int>(tasks.size()); ++scheduled) {
+        std::vector<ScheduleState> next_beam;
+        for (const auto& state : beam) {
+            if (state.ready.empty()) {
+                throw std::runtime_error("Expanded pipeline graph contains a cycle.");
+            }
+            auto candidates = ready_candidates(graph, tasks, ranks, state, unroll, rule);
+            int branches = std::min(branch_width, static_cast<int>(candidates.size()));
+            for (int branch = 0; branch < branches; ++branch) {
+                next_beam.push_back(apply_schedule_choice(tasks, state, candidates[branch]));
+            }
+        }
+        std::sort(
+            next_beam.begin(),
+            next_beam.end(),
+            [&](const ScheduleState& lhs, const ScheduleState& rhs) {
+                return state_precedes(lhs, rhs, total_dev, total_host, total_network);
+            }
+        );
+        if (next_beam.size() > static_cast<size_t>(beam_width)) {
+            next_beam.resize(beam_width);
+        }
+        beam = std::move(next_beam);
+    }
+
+    bool has_best = false;
+    Metrics best;
+    for (auto state : beam) {
+        if (right_shift_slack) {
+            right_shift_non_output_work(
+                graph,
+                tasks,
+                state.scheduled_order,
+                state.task_starts,
+                state.task_finishes
+            );
+        }
+        Metrics candidate = materialize_metrics(
+            graph,
+            assignment,
+            weights,
+            scales,
+            tasks,
+            state.scheduled_order,
+            state.task_starts,
+            state.task_finishes,
+            unroll
+        );
+        if (!has_best || is_better_metrics(candidate, best)) {
+            best = std::move(candidate);
+            has_best = true;
+        }
+    }
+    return best;
+}
+
 bool is_better_metrics(const Metrics& candidate, const Metrics& best) {
     constexpr double eps = 1e-9;
     if (candidate.loss < best.loss - eps) {
@@ -1034,20 +1312,34 @@ Metrics schedule(
         auto ranks = task_ranks(tasks);
         for (bool right_shift_slack : binary_variants) {
             for (ScheduleRule rule : rules) {
-                Metrics candidate = simulate_schedule(
-                    graph,
-                    assignment,
-                    weights,
-                    scales,
-                    tasks,
-                    ranks,
-                    unroll,
-                    rule,
-                    right_shift_slack
-                );
-                if (!has_best || is_better_metrics(candidate, best)) {
-                    best = std::move(candidate);
-                    has_best = true;
+                for (bool use_lookahead : binary_variants) {
+                    Metrics candidate = use_lookahead
+                                            ? simulate_schedule_with_lookahead(
+                                                  graph,
+                                                  assignment,
+                                                  weights,
+                                                  scales,
+                                                  tasks,
+                                                  ranks,
+                                                  unroll,
+                                                  rule,
+                                                  right_shift_slack
+                                              )
+                                            : simulate_schedule(
+                                                  graph,
+                                                  assignment,
+                                                  weights,
+                                                  scales,
+                                                  tasks,
+                                                  ranks,
+                                                  unroll,
+                                                  rule,
+                                                  right_shift_slack
+                                              );
+                    if (!has_best || is_better_metrics(candidate, best)) {
+                        best = std::move(candidate);
+                        has_best = true;
+                    }
                 }
             }
         }
