@@ -111,6 +111,23 @@ This packed graph is an additional candidate, not a replacement. If no adjacent
 linear chain is found, or if the packed schedule does not improve the configured
 objective/tie-breaks, the evaluator returns the normal unpacked schedule.
 
+## Tiled One-Frame Fallback
+
+For multi-frame evaluations, the native core also builds a simple tiled fallback
+from the one-frame schedule. It copies the one-frame compute and transfer
+intervals for each later frame, then shifts that frame to the right until none
+of its Device, Host, or Network intervals overlap already placed frames. Source
+events stay at their real frame releases rather than being shifted with compute
+work. Same-label FIFO constraints add lower bounds to each frame shift.
+
+This candidate is intentionally simple: it does not search ready-list
+permutations and does not retime inside a copied frame. It is useful as a
+fallback when the multi-frame ready-list heuristics choose a schedule with
+artificially good metrics from invalid frame placement. Like packed stages, the
+tiled schedule is scored as just another candidate and can only win if it beats
+the current best objective/tie-breaks while respecting source releases and
+same-label FIFO.
+
 ## Tail-Latency Retiming
 
 The evaluator simulates several deterministic variants for the same assignment
@@ -303,8 +320,9 @@ The evaluator currently tests all combinations of:
 
 That gives 56 deterministic unpacked schedule candidates per candidate
 assignment. For multi-frame packable graphs, the same 56 combinations are also
-tested on the packed-stage task graph inferred from the one-frame schedule. The
-native core computes the configured split loss for each schedule:
+tested on the packed-stage task graph inferred from the one-frame schedule. A
+simple tiled copy of the one-frame schedule is also scored as a fallback
+candidate. The native core computes the configured split loss for each schedule:
 
 ```text
 loss =
@@ -363,12 +381,18 @@ same objective/constraint logic.
 
 Candidate evaluation is parallelized inside the native core. Enumeration splits
 the assignment mask space across worker threads and then reduces the exact best
-feasible result. Random search and simulated annealing run independent per-thread
-chains with deterministic mixed seeds; simulated annealing uses the configured
-initial and final temperatures for each chain schedule. `solver_threads = 0`
-selects the hardware thread count.
+feasible result. Random search runs independent per-thread chains with
+deterministic mixed seeds. Simulated annealing also uses mixed per-thread seeds,
+but every 32 local proposals each chain publishes its local best and adopts the
+shared best when it is better than the chain's current state. This prevents
+worker chains from continuing too long from states already known to be worse.
+Simulated annealing uses the configured initial and final temperatures for each
+chain schedule. `solver_threads = 0` selects the hardware thread count.
 
-Positive `latency_limit` rejects assignments whose amortized E2E latency exceeds
-the limit. Positive `max_frame_latency_limit` rejects assignments whose worst
-single-frame E2E exceeds the limit. A value of `0` disables the corresponding
-limit.
+Positive `latency_limit` constrains amortized E2E latency. Positive
+`max_frame_latency_limit` constrains worst single-frame E2E latency. A value of
+`0` disables the corresponding limit. When either limit is active, each inner
+scheduler candidate set is filtered first: any candidate satisfying the active
+limits wins over candidates that violate them, and the split objective is used
+only within the satisfying subset. If no schedule candidate for an assignment
+satisfies the active limits, the assignment is rejected by the solver.

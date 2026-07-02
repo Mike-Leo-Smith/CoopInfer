@@ -9,6 +9,7 @@
 #include <functional>
 #include <initializer_list>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <queue>
 #include <random>
@@ -79,6 +80,13 @@ struct ObjectiveScales {
     double max_latency = 1.0;
     double initiation_interval = 1.0;
 };
+
+struct MetricLimits {
+    double latency = 0.0;
+    double max_frame_latency = 0.0;
+};
+
+constexpr int anneal_sync_interval = 32;
 
 double transfer_ms(double size_mb, double bandwidth_mb_s, double latency_ms) {
     if (!std::isfinite(size_mb)) {
@@ -1175,6 +1183,168 @@ std::vector<ScheduleTask> build_packed_schedule_tasks(
     return tasks;
 }
 
+struct TiledInterval {
+    ResourceKind resource = ResourceKind::None;
+    double start = 0.0;
+    double finish = 0.0;
+};
+
+bool intervals_overlap(
+    double lhs_start,
+    double lhs_finish,
+    double rhs_start,
+    double rhs_finish
+) {
+    constexpr double eps = 1e-9;
+    return lhs_start < rhs_finish - eps && lhs_finish > rhs_start + eps;
+}
+
+std::vector<TiledInterval> single_frame_resource_intervals(
+    const GraphData& graph,
+    const std::vector<int>& assignment,
+    const Metrics& single_frame
+) {
+    int n = static_cast<int>(graph.ids.size());
+    std::vector<TiledInterval> intervals;
+    intervals.reserve(n + single_frame.transfers.size());
+    constexpr double eps = 1e-9;
+    for (int node = 0; node < n; ++node) {
+        if (is_source_node(graph, node)) {
+            continue;
+        }
+        double start = single_frame.starts[node];
+        double finish = single_frame.finishes[node];
+        if (finish <= start + eps) {
+            continue;
+        }
+        intervals.push_back(
+            TiledInterval{
+                compute_resource_for_node(graph, assignment, node),
+                start,
+                finish,
+            }
+        );
+    }
+    for (const auto& transfer : single_frame.transfers) {
+        if (transfer.finish <= transfer.start + eps) {
+            continue;
+        }
+        intervals.push_back(
+            TiledInterval{
+                ResourceKind::Network,
+                transfer.start,
+                transfer.finish,
+            }
+        );
+    }
+    return intervals;
+}
+
+double earliest_non_overlapping_tile_offset(
+    const std::vector<TiledInterval>& template_intervals,
+    const std::vector<TiledInterval>& placed_intervals,
+    double offset
+) {
+    constexpr double eps = 1e-9;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        double next_offset = offset;
+        for (const auto& item : template_intervals) {
+            double start = item.start + offset;
+            double finish = item.finish + offset;
+            for (const auto& placed : placed_intervals) {
+                if (item.resource != placed.resource) {
+                    continue;
+                }
+                if (intervals_overlap(start, finish, placed.start, placed.finish)) {
+                    next_offset = std::max(next_offset, placed.finish - item.start);
+                }
+            }
+        }
+        if (next_offset > offset + eps) {
+            offset = next_offset;
+            changed = true;
+        }
+    }
+    return offset;
+}
+
+Metrics schedule_tiled_single_frame(
+    const GraphData& graph,
+    const std::vector<int>& assignment,
+    const ObjectiveWeights& weights,
+    const ObjectiveScales& scales,
+    const Metrics& single_frame,
+    int pipeline_unroll
+) {
+    int n = static_cast<int>(graph.ids.size());
+    int unroll = std::max(1, pipeline_unroll);
+    Metrics metrics;
+    metrics.starts.assign(n * unroll, 0.0);
+    metrics.finishes.assign(n * unroll, 0.0);
+
+    auto template_intervals = single_frame_resource_intervals(graph, assignment, single_frame);
+    std::vector<TiledInterval> placed_intervals;
+    placed_intervals.reserve(template_intervals.size() * static_cast<size_t>(unroll));
+    std::vector<double> previous_finish(n, -std::numeric_limits<double>::infinity());
+
+    for (int frame = 0; frame < unroll; ++frame) {
+        double offset = 0.0;
+        for (int node = 0; node < n; ++node) {
+            if (is_source_node(graph, node)) {
+                offset = std::max(
+                    offset,
+                    source_release_time(graph, node, frame) - single_frame.starts[node]
+                );
+            } else if (frame > 0) {
+                offset = std::max(offset, previous_finish[node] - single_frame.starts[node]);
+            }
+        }
+        offset = earliest_non_overlapping_tile_offset(
+            template_intervals,
+            placed_intervals,
+            offset
+        );
+
+        for (int node = 0; node < n; ++node) {
+            int op = frame * n + node;
+            if (is_source_node(graph, node)) {
+                metrics.starts[op] = source_release_time(graph, node, frame);
+                metrics.finishes[op] = metrics.starts[op];
+            } else {
+                metrics.starts[op] = single_frame.starts[node] + offset;
+                metrics.finishes[op] = single_frame.finishes[node] + offset;
+                previous_finish[node] = metrics.finishes[op];
+            }
+        }
+
+        for (const auto& transfer : single_frame.transfers) {
+            TransferRecord shifted;
+            shifted.start = transfer.start + offset;
+            shifted.finish = transfer.finish + offset;
+            shifted.size = transfer.size;
+            shifted.batched = transfer.batched;
+            shifted.edges.reserve(transfer.edges.size());
+            for (auto [source, target] : transfer.edges) {
+                shifted.edges.push_back({frame * n + source, frame * n + target});
+            }
+            metrics.transfers.push_back(std::move(shifted));
+        }
+        for (const auto& item : template_intervals) {
+            placed_intervals.push_back(
+                TiledInterval{
+                    item.resource,
+                    item.start + offset,
+                    item.finish + offset,
+                }
+            );
+        }
+    }
+
+    return finalize_metrics(graph, assignment, weights, scales, unroll, std::move(metrics));
+}
+
 struct ReadyCandidate {
     int ready_index = -1;
     int task_id = -1;
@@ -1200,6 +1370,14 @@ struct ScheduleState {
 };
 
 bool is_better_metrics(const Metrics& candidate, const Metrics& best);
+bool exceeds_limit(const Metrics& metrics, const MetricLimits& limits);
+void keep_schedule_candidate(
+    Metrics& best,
+    bool& has_best,
+    bool& best_satisfies_limits,
+    Metrics candidate,
+    const MetricLimits& limits
+);
 
 bool candidate_precedes(const ReadyCandidate& lhs, const ReadyCandidate& rhs) {
     constexpr double eps = 1e-9;
@@ -1581,6 +1759,88 @@ bool is_better_metrics(const Metrics& candidate, const Metrics& best) {
     return candidate.utilization > best.utilization + eps;
 }
 
+bool exceeds_limit(const Metrics& metrics, const MetricLimits& limits) {
+    return (limits.latency > 0.0 && metrics.latency > limits.latency) ||
+           (limits.max_frame_latency > 0.0 &&
+            metrics.max_frame_latency > limits.max_frame_latency);
+}
+
+bool exceeds_limit(
+    const Metrics& metrics,
+    double latency_limit,
+    double max_frame_latency_limit
+) {
+    return exceeds_limit(metrics, MetricLimits{latency_limit, max_frame_latency_limit});
+}
+
+bool has_active_limits(const MetricLimits& limits) {
+    return limits.latency > 0.0 || limits.max_frame_latency > 0.0;
+}
+
+void keep_schedule_candidate(
+    Metrics& best,
+    bool& has_best,
+    bool& best_satisfies_limits,
+    Metrics candidate,
+    const MetricLimits& limits
+) {
+    if (!has_active_limits(limits)) {
+        if (!has_best || is_better_metrics(candidate, best)) {
+            best = std::move(candidate);
+            has_best = true;
+        }
+        return;
+    }
+
+    bool candidate_satisfies_limits = !exceeds_limit(candidate, limits);
+    bool replace = !has_best;
+    if (!replace && candidate_satisfies_limits != best_satisfies_limits) {
+        replace = candidate_satisfies_limits;
+    }
+    if (!replace && candidate_satisfies_limits == best_satisfies_limits) {
+        replace = is_better_metrics(candidate, best);
+    }
+    if (replace) {
+        best = std::move(candidate);
+        has_best = true;
+        best_satisfies_limits = candidate_satisfies_limits;
+    }
+}
+
+bool respects_basic_pipeline_constraints(
+    const GraphData& graph,
+    const Metrics& metrics,
+    int unroll
+) {
+    constexpr double eps = 1e-9;
+    int n = static_cast<int>(graph.ids.size());
+    if (static_cast<int>(metrics.starts.size()) < n * unroll ||
+        static_cast<int>(metrics.finishes.size()) < n * unroll) {
+        return false;
+    }
+    for (int frame = 0; frame < unroll; ++frame) {
+        for (int node = 0; node < n; ++node) {
+            int op = frame * n + node;
+            if (metrics.finishes[op] + eps < metrics.starts[op]) {
+                return false;
+            }
+            if (is_source_node(graph, node)) {
+                if (metrics.starts[op] + eps < source_release_time(graph, node, frame)) {
+                    return false;
+                }
+                continue;
+            }
+            if (frame > 0) {
+                int previous_op = (frame - 1) * n + node;
+                if (metrics.starts[op] + eps < metrics.finishes[previous_op]) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 Metrics schedule_unpacked(
     const GraphData& graph,
     const std::vector<int>& assignment,
@@ -1589,7 +1849,8 @@ Metrics schedule_unpacked(
     const ObjectiveWeights& weights,
     const ObjectiveScales& scales,
     bool batch_transfers,
-    int pipeline_unroll
+    int pipeline_unroll,
+    const MetricLimits& limits
 ) {
     int unroll = std::max(1, pipeline_unroll);
     const ScheduleRule rules[] = {
@@ -1602,6 +1863,7 @@ Metrics schedule_unpacked(
         ScheduleRule::FifoReady,
     };
     bool has_best = false;
+    bool best_satisfies_limits = false;
     Metrics best;
     const bool binary_variants[] = {false, true};
     for (bool defer_blocked_transfers : binary_variants) {
@@ -1641,10 +1903,13 @@ Metrics schedule_unpacked(
                                                   rule,
                                                   right_shift_slack
                                               );
-                    if (!has_best || is_better_metrics(candidate, best)) {
-                        best = std::move(candidate);
-                        has_best = true;
-                    }
+                    keep_schedule_candidate(
+                        best,
+                        has_best,
+                        best_satisfies_limits,
+                        std::move(candidate),
+                        limits
+                    );
                 }
             }
         }
@@ -1661,7 +1926,8 @@ Metrics schedule_packed(
     const ObjectiveWeights& weights,
     const ObjectiveScales& scales,
     bool batch_transfers,
-    int pipeline_unroll
+    int pipeline_unroll,
+    const MetricLimits& limits
 ) {
     int unroll = std::max(1, pipeline_unroll);
     const ScheduleRule rules[] = {
@@ -1674,6 +1940,7 @@ Metrics schedule_packed(
         ScheduleRule::FifoReady,
     };
     bool has_best = false;
+    bool best_satisfies_limits = false;
     Metrics best;
     const bool binary_variants[] = {false, true};
     for (bool defer_blocked_transfers : binary_variants) {
@@ -1714,10 +1981,13 @@ Metrics schedule_packed(
                                                   rule,
                                                   right_shift_slack
                                               );
-                    if (!has_best || is_better_metrics(candidate, best)) {
-                        best = std::move(candidate);
-                        has_best = true;
-                    }
+                    keep_schedule_candidate(
+                        best,
+                        has_best,
+                        best_satisfies_limits,
+                        std::move(candidate),
+                        limits
+                    );
                 }
             }
         }
@@ -1733,7 +2003,8 @@ Metrics schedule(
     const ObjectiveWeights& weights,
     const ObjectiveScales& scales,
     bool batch_transfers,
-    int pipeline_unroll
+    int pipeline_unroll,
+    const MetricLimits& limits
 ) {
     int unroll = std::max(1, pipeline_unroll);
     if (unroll <= 1) {
@@ -1745,10 +2016,12 @@ Metrics schedule(
             weights,
             scales,
             batch_transfers,
-            unroll
+            unroll,
+            limits
         );
     }
 
+    MetricLimits no_limits;
     Metrics single_frame = schedule_unpacked(
         graph,
         assignment,
@@ -1757,15 +2030,51 @@ Metrics schedule(
         weights,
         scales,
         batch_transfers,
-        1
+        1,
+        no_limits
     );
+    Metrics tile_template = single_frame;
+
     PackedPlan packed_plan = build_packed_plan_from_single_frame(
         graph,
         assignment,
         single_frame
     );
-    if (!packed_plan.has_combined_stage) {
-        return schedule_unpacked(
+    bool has_packed = packed_plan.has_combined_stage;
+    Metrics packed;
+    if (has_packed) {
+        packed = schedule_packed(
+            graph,
+            assignment,
+            packed_plan,
+            bandwidth,
+            latency,
+            weights,
+            scales,
+            batch_transfers,
+            unroll,
+            limits
+        );
+    }
+
+    Metrics best;
+    bool has_best = false;
+    bool best_satisfies_limits = false;
+    auto keep_valid_candidate = [&](Metrics candidate) {
+        if (!respects_basic_pipeline_constraints(graph, candidate, unroll)) {
+            return;
+        }
+        keep_schedule_candidate(
+            best,
+            has_best,
+            best_satisfies_limits,
+            std::move(candidate),
+            limits
+        );
+    };
+
+    keep_valid_candidate(
+        schedule_unpacked(
             graph,
             assignment,
             bandwidth,
@@ -1773,33 +2082,24 @@ Metrics schedule(
             weights,
             scales,
             batch_transfers,
-            unroll
-        );
+            unroll,
+            limits
+        )
+    );
+    if (has_packed) {
+        keep_valid_candidate(std::move(packed));
     }
-
-    Metrics packed = schedule_packed(
+    Metrics tiled = schedule_tiled_single_frame(
         graph,
         assignment,
-        packed_plan,
-        bandwidth,
-        latency,
         weights,
         scales,
-        batch_transfers,
+        tile_template,
         unroll
     );
-    Metrics best = schedule_unpacked(
-        graph,
-        assignment,
-        bandwidth,
-        latency,
-        weights,
-        scales,
-        batch_transfers,
-        unroll
-    );
-    if (is_better_metrics(packed, best)) {
-        return packed;
+    keep_valid_candidate(std::move(tiled));
+    if (!has_best) {
+        throw std::runtime_error("No valid multi-frame schedule candidate was produced.");
     }
     return best;
 }
@@ -1821,6 +2121,7 @@ ObjectiveScales baseline_scales(
     }
     ObjectiveWeights weights{1.0, 1.0, 1.0, 0.0};
     ObjectiveScales neutral_scales{1.0, 1.0, 1.0};
+    MetricLimits no_limits;
     auto dev = schedule(
         graph,
         all_device,
@@ -1829,7 +2130,8 @@ ObjectiveScales baseline_scales(
         weights,
         neutral_scales,
         batch_transfers,
-        pipeline_unroll
+        pipeline_unroll,
+        no_limits
     );
     auto host = schedule(
         graph,
@@ -1839,23 +2141,14 @@ ObjectiveScales baseline_scales(
         weights,
         neutral_scales,
         batch_transfers,
-        pipeline_unroll
+        pipeline_unroll,
+        no_limits
     );
     return ObjectiveScales{
         std::max(dev.latency, host.latency),
         std::max(dev.max_frame_latency, host.max_frame_latency),
         std::max(dev.initiation_interval, host.initiation_interval),
     };
-}
-
-bool exceeds_limit(
-    const Metrics& metrics,
-    double latency_limit,
-    double max_frame_latency_limit
-) {
-    return (latency_limit > 0.0 && metrics.latency > latency_limit) ||
-           (max_frame_latency_limit > 0.0 &&
-            metrics.max_frame_latency > max_frame_latency_limit);
 }
 
 std::vector<int> mostly_host_seed(const GraphData& graph, const std::vector<int>& base) {
@@ -2037,11 +2330,12 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
         ObjectiveScales scales = baseline_scales(
             graph, bandwidth, latency, batch_transfers, pipeline_unroll
         );
+        MetricLimits limits{latency_limit, max_frame_latency_limit};
 
         auto eval_assignment = [&](const std::vector<int>& assignment) {
             return schedule(
                 graph, assignment, bandwidth, latency, weights, scales,
-                batch_transfers, pipeline_unroll
+                batch_transfers, pipeline_unroll, limits
             );
         };
 
@@ -2234,6 +2528,8 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
                     std::vector<std::exception_ptr> errors(threads);
                     std::vector<std::thread> workers;
                     workers.reserve(threads);
+                    std::mutex shared_best_mutex;
+                    AssignmentSearchResult shared_best = combined;
                     for (int worker = 0; worker < threads; ++worker) {
                         int begin = total_iterations * worker / threads;
                         int end = total_iterations * (worker + 1) / threads;
@@ -2256,7 +2552,33 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
                                     )) {
                                     keep_search_result(local, current, current_metrics, 0);
                                 }
+                                auto sync_shared_best = [&]() {
+                                    std::lock_guard<std::mutex> guard(shared_best_mutex);
+                                    if (local.has_best &&
+                                        is_better_search_result(
+                                            local.metrics,
+                                            local.order,
+                                            shared_best
+                                        )) {
+                                        shared_best = local;
+                                    }
+                                    if (shared_best.has_best &&
+                                        (exceeds_limit(
+                                             current_metrics,
+                                             latency_limit,
+                                             max_frame_latency_limit
+                                         ) ||
+                                         is_better_metrics(shared_best.metrics, current_metrics))) {
+                                        current = shared_best.assignment;
+                                        current_metrics = shared_best.metrics;
+                                    }
+                                };
                                 for (int step = begin; step < end; ++step) {
+                                    int local_step = step - begin;
+                                    if (local_step > 0 &&
+                                        local_step % anneal_sync_interval == 0) {
+                                        sync_shared_best();
+                                    }
                                     double progress = static_cast<double>(step - begin) /
                                                       std::max(1, local_iterations - 1);
                                     double temperature = anneal_initial_temp * std::pow(
@@ -2295,6 +2617,7 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
                                         static_cast<std::uint64_t>(step + 1)
                                     );
                                 }
+                                sync_shared_best();
                                 partials[worker] = std::move(local);
                             } catch (...) {
                                 errors[worker] = std::current_exception();
@@ -2314,6 +2637,10 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
                             is_better_search_result(partial.metrics, partial.order, combined)) {
                             combined = std::move(partial);
                         }
+                    }
+                    if (shared_best.has_best &&
+                        is_better_search_result(shared_best.metrics, shared_best.order, combined)) {
+                        combined = std::move(shared_best);
                     }
                 }
             }
@@ -2395,7 +2722,8 @@ py::dict evaluate_core(const py::dict& data, const py::dict& params) {
         weights,
         scales,
         batch_transfers,
-        pipeline_unroll
+        pipeline_unroll,
+        MetricLimits{}
     );
     return metrics_to_python(graph, metrics, pipeline_unroll);
 }

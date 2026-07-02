@@ -395,14 +395,18 @@ def test_evaluator_delays_fast_join_branch_to_reduce_tail_frame_latency():
 
     assert result.latency == 51.0
     assert result.max_frame_latency == 51.0
-    assert result.start_times["fast_branch[f0]"] == 49.0
-    assert result.start_times["fast_branch[f1]"] == 100.0
-    assert result.start_times["fast_branch[f2]"] == 151.0
+    for frame in range(3):
+        assert result.finish_times[f"fast_branch[f{frame}]"] == result.finish_times[
+            f"slow_branch[f{frame}]"
+        ]
+        assert result.start_times[f"merge[f{frame}]"] == result.finish_times[
+            f"slow_branch[f{frame}]"
+        ]
     assert result.start_times["slow_branch[f1]"] == 51.0
     assert result.start_times["slow_branch[f2]"] == 102.0
 
 
-def test_evaluator_preserves_inter_frame_pipeline_overlap():
+def test_evaluator_accepts_tiled_fallback_when_metrics_tie():
     graph = graph_from_records(
         [
             {"id": "input", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": True},
@@ -425,13 +429,12 @@ def test_evaluator_preserves_inter_frame_pipeline_overlap():
     )
 
     assert result.start_times["stage[f0]"] == 0.0
-    assert result.start_times["stage[f1]"] == 50.0
-    assert result.start_times["stage[f2]"] == 100.0
-    assert result.start_times["stage[f1]"] < result.finish_times["head[f0]"]
-    assert result.start_times["stage[f2]"] < result.finish_times["head[f0]"]
+    assert result.start_times["stage[f1]"] == 100.0
+    assert result.start_times["stage[f2]"] == 200.0
     assert result.start_times["head[f0]"] == 50.0
     assert result.start_times["head[f1]"] == 150.0
     assert result.latency == 350.0 / 3.0
+    assert result.max_frame_latency == 150.0
     assert result.initiation_interval == 100.0
 
 
@@ -586,7 +589,7 @@ def test_solver_allows_high_max_frame_when_only_amortized_limit_is_set():
     )
 
     assert math.isclose(result.metrics.latency, 230.0 / 3.0)
-    assert result.metrics.max_frame_latency == 130.0
+    assert result.metrics.max_frame_latency == 110.0
 
 
 def test_solver_max_latency_weight_changes_objective_choice():
@@ -631,11 +634,70 @@ def test_solver_max_latency_weight_changes_objective_choice():
     assert avg_result.assignment["stage"] == 0
     assert avg_result.assignment["head"] == 1
     assert math.isclose(avg_result.metrics.latency, 230.0 / 3.0)
-    assert avg_result.metrics.max_frame_latency == 130.0
+    assert avg_result.metrics.max_frame_latency == 110.0
     assert max_result.assignment["stage"] == 1
     assert max_result.assignment["head"] == 1
     assert max_result.metrics.latency == 90.0
     assert max_result.metrics.max_frame_latency == 90.0
+
+
+def test_solver_filters_internal_schedule_candidates_before_selecting_by_loss():
+    graph = graph_from_records(
+        [
+            {"id": "input", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": True},
+            {"id": "n0", "c_dev": 180.0, "c_host": 100.0, "fixed_dev": False},
+            {"id": "n1", "c_dev": 20.0, "c_host": 80.0, "fixed_dev": True},
+            {"id": "n2", "c_dev": 10.0, "c_host": 50.0, "fixed_dev": True},
+            {"id": "out", "c_dev": 30.0, "c_host": 20.0, "fixed_dev": True},
+        ],
+        [
+            {"source": "input", "target": "n0", "size": 0.0},
+            {"source": "input", "target": "n1", "size": 0.0},
+            {"source": "input", "target": "n2", "size": 0.0},
+            {"source": "n0", "target": "n2", "size": 0.0},
+            {"source": "n2", "target": "out", "size": 0.0},
+        ],
+    )
+
+    unconstrained_avg = evaluate(
+        graph,
+        {"input": 0, "n0": 1, "n1": 0, "n2": 0, "out": 0},
+        bandwidth=1000.0,
+        latency=0.0,
+        weight_avg_latency=1.0,
+        weight_max_latency=0.0,
+        weight_device_utilization=0.0,
+        pipeline_unroll=3,
+    )
+    unconstrained_max = evaluate(
+        graph,
+        {"input": 0, "n0": 1, "n1": 0, "n2": 0, "out": 0},
+        bandwidth=1000.0,
+        latency=0.0,
+        weight_avg_latency=0.0,
+        weight_max_latency=1.0,
+        weight_device_utilization=0.0,
+        pipeline_unroll=3,
+    )
+
+    assert unconstrained_avg.max_frame_latency == 300.0
+    assert unconstrained_max.max_frame_latency == 140.0
+
+    constrained = solve(
+        graph,
+        bandwidth=1000.0,
+        latency=0.0,
+        weight_avg_latency=1.0,
+        weight_max_latency=0.0,
+        weight_device_utilization=0.0,
+        max_frame_latency_limit=220.0,
+        pipeline_unroll=3,
+        algorithm="Enumerate",
+    )
+
+    assert constrained.assignment["n0"] == 1
+    assert constrained.metrics.max_frame_latency <= 220.0
+    assert constrained.metrics.max_frame_latency == 140.0
 
 
 def test_latency_ignores_delayed_source_phase():
@@ -724,7 +786,7 @@ def test_solver_supports_explicit_random_and_annealing_modes():
         latency=5.0,
         **LATENCY_ONLY_WEIGHTS,
         algorithm="Simulated Annealing",
-        heuristic_iterations=10,
+        heuristic_iterations=64,
         solver_threads=2,
         anneal_initial_temp=2.0,
         anneal_final_temp=0.05,
@@ -732,6 +794,7 @@ def test_solver_supports_explicit_random_and_annealing_modes():
 
     assert random_result.mode == "Random Search"
     assert anneal_result.mode == "Simulated Annealing"
+    assert anneal_result.iterations == 64
     assert random_result.assignment["v1"] == 0
     assert anneal_result.assignment["v1"] == 0
 
