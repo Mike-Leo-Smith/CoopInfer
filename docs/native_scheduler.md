@@ -86,6 +86,31 @@ The FIFO dependency prevents younger frames from overtaking older frames at the
 same logical operator. This protects frame order and avoids schedules that look
 good in aggregate but produce pathological control-tail latency.
 
+## Packed Single-Frame Stages
+
+For multi-frame evaluations, the native core also tests a packed-stage variant
+of the task graph. This variant is inferred from a non-unrolled, one-frame
+schedule for the same assignment:
+
+1. Run the normal one-frame evaluator.
+2. Find adjacent non-source operators where the first operator's finish time is
+   exactly the second operator's start time.
+3. Pack only linear same-resource pairs/chains: the upstream operator must have
+   one outgoing edge, the downstream operator must have one incoming edge, and
+   both operators must be assigned to the same serialized resource.
+4. Build the full `pipeline_unroll` task graph using each packed chain as one
+   internal scheduler task.
+
+The packed task keeps the sum of the original operator durations and preserves
+all original DAG, transfer, source-release, and same-label FIFO constraints at
+the packed-stage boundary. Metrics are expanded back to the original operator
+IDs, so GUI timelines and API results still report per-node start/finish times
+and original transfer edges.
+
+This packed graph is an additional candidate, not a replacement. If no adjacent
+linear chain is found, or if the packed schedule does not improve the configured
+objective/tie-breaks, the evaluator returns the normal unpacked schedule.
+
 ## Tail-Latency Retiming
 
 The evaluator simulates several deterministic variants for the same assignment
@@ -276,7 +301,9 @@ The evaluator currently tests all combinations of:
 - `CriticalPath`, `DeviceFirst`, `HostFirst`, `NetworkFirst`, `OutputFirst`,
   `Throughput`, `FifoReady`
 
-That gives 56 deterministic schedule candidates per candidate assignment. The
+That gives 56 deterministic unpacked schedule candidates per candidate
+assignment. For multi-frame packable graphs, the same 56 combinations are also
+tested on the packed-stage task graph inferred from the one-frame schedule. The
 native core computes the configured split loss for each schedule:
 
 ```text

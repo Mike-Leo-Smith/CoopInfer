@@ -236,6 +236,38 @@ def test_pipeline_unroll_preserves_same_label_fifo():
     assert latency == 11.5
 
 
+def test_evaluator_materializes_packed_same_resource_chain_across_frames():
+    graph = graph_from_records(
+        [
+            {"id": "input", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": True},
+            {"id": "decode", "c_dev": 10.0, "c_host": 10.0, "fixed_dev": True},
+            {"id": "refine", "c_dev": 20.0, "c_host": 20.0, "fixed_dev": True},
+        ],
+        [
+            {"source": "input", "target": "decode", "size": 0.0},
+            {"source": "decode", "target": "refine", "size": 0.0},
+        ],
+    )
+
+    result = evaluate(
+        graph,
+        {"input": 0, "decode": 0, "refine": 0},
+        bandwidth=1000.0,
+        latency=0.0,
+        **LATENCY_ONLY_WEIGHTS,
+        pipeline_unroll=3,
+    )
+
+    assert result.start_times["decode[f0]"] == 0.0
+    assert result.start_times["refine[f0]"] == 10.0
+    assert result.start_times["decode[f1]"] == 30.0
+    assert result.start_times["refine[f1]"] == 40.0
+    assert result.start_times["decode[f2]"] == 60.0
+    assert result.start_times["refine[f2]"] == 70.0
+    assert result.latency == 30.0
+    assert result.max_frame_latency == 30.0
+
+
 def test_source_period_delays_unrolled_input_frames():
     graph = graph_from_records(
         [
