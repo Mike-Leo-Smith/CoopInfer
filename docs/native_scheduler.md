@@ -14,14 +14,15 @@ For a fixed assignment `x`, the evaluator receives:
 - Source cadence fields `source_period_ms` and `source_phase_ms`.
 - Environment bandwidth, fixed transfer latency, batching flag, and
   `pipeline_unroll`.
-- Objective weights for average E2E latency, max-frame E2E latency, initiation
+- Objective weights for amortized pipeline span, max-frame E2E latency, initiation
   interval, and device utilization. The public GUI/model path exposes average
-  E2E, max-frame E2E, and device-utilization weights; the native parser accepts
+  span, max-frame E2E, and device-utilization weights; the native parser accepts
   `weight_initiation_interval` for direct/internal callers and otherwise
   defaults it to zero.
 
-Placement values are binary: `x=0` means Device and `x=1` means Host. Fixed
-device nodes are enforced by the solver before evaluation.
+Internal placement values are binary: `x=0` means Device and `x=1` means Host.
+Input JSON does not need to specify `x`; legacy values are accepted only as
+optional warm starts. Fixed device nodes are enforced by the solver.
 
 ## Expanded Task DAG
 
@@ -339,7 +340,7 @@ interval metric and loss term.
 
 The schedule with the lowest loss wins, so the inner evaluator follows the same
 global split objective used by the solver. If losses tie, the evaluator picks
-lower max-frame latency, then lower average latency, then lower initiation
+lower max-frame latency, then lower amortized span, then lower initiation
 interval, then higher Device utilization.
 
 ## Metric Extraction
@@ -359,15 +360,21 @@ The reported max-frame latency is:
 max_frame_latency = max(frame_latency)
 ```
 
-The reported average E2E latency is amortized over the unrolled pipeline:
+The reported mean-frame E2E latency is:
+
+```text
+mean_frame_latency = sum(frame_latency) / completed_frame_count
+```
+
+The compatibility field `latency` is the amortized pipeline span:
 
 ```text
 latency = (latest_frame_finish - earliest_frame_work_start) / pipeline_unroll
 ```
 
 For `pipeline_unroll = 1`, this is exactly the wall-clock E2E window from the
-first non-input work to the last output finish. For larger unroll factors, it is
-the amortized pipeline latency per frame.
+first non-input work to the last output finish. For larger unroll factors it
+also contains inter-frame release gaps, so it must not be labeled mean E2E.
 
 Device, Host, and Network utilization are active time over the same
 input-excluded pipeline span. Device utilization also remains the utilization
@@ -389,10 +396,13 @@ worker chains from continuing too long from states already known to be worse.
 Simulated annealing uses the configured initial and final temperatures for each
 chain schedule. `solver_threads = 0` selects the hardware thread count.
 
-Positive `latency_limit` constrains amortized E2E latency. Positive
-`max_frame_latency_limit` constrains worst single-frame E2E latency. A value of
-`0` disables the corresponding limit. When either limit is active, each inner
-scheduler candidate set is filtered first: any candidate satisfying the active
-limits wins over candidates that violate them, and the split objective is used
-only within the satisfying subset. If no schedule candidate for an assignment
-satisfies the active limits, the assignment is rejected by the solver.
+Positive `latency_limit` constrains amortized pipeline span. Positive
+`max_frame_latency_limit` constrains worst single-frame E2E latency. Positive
+`initiation_interval_limit` constrains steady-state output spacing. A value of
+`0` disables the corresponding limit. For a 10 Hz workload, the usual gate is
+`initiation_interval_limit = 100` plus the desired max-frame E2E budget. When a
+limit is active, each inner scheduler candidate set is filtered first: any
+candidate satisfying all active limits wins over candidates that violate them,
+and the split objective is used only within the satisfying subset. If no
+schedule candidate for an assignment satisfies the active limits, the
+assignment is rejected by the solver.

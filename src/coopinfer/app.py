@@ -49,6 +49,7 @@ class MainWindow(QMainWindow):
         self.resize(1280, 800)
         self.graph = nx.DiGraph()
         self.solver_result: Optional[SolverResult] = None
+        self.initiation_interval_limit = 0.0
         self._loading_tables = False
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -405,6 +406,7 @@ class MainWindow(QMainWindow):
             self.latency_spin.setValue(environment.latency)
             self.latency_limit_spin.setValue(environment.latency_limit)
             self.max_frame_latency_limit_spin.setValue(environment.max_frame_latency_limit)
+            self.initiation_interval_limit = environment.initiation_interval_limit
             self._set_objective_slider_value(
                 self.weight_avg_latency_slider,
                 environment.weight_avg_latency,
@@ -543,6 +545,7 @@ class MainWindow(QMainWindow):
                 batch_transfers=environment.batch_transfers,
                 pipeline_unroll=environment.pipeline_unroll,
                 max_frame_latency_limit=environment.max_frame_latency_limit,
+                initiation_interval_limit=environment.initiation_interval_limit,
                 solver_threads=environment.solver_threads,
                 anneal_initial_temp=environment.anneal_initial_temp,
                 anneal_final_temp=environment.anneal_final_temp,
@@ -645,6 +648,7 @@ class MainWindow(QMainWindow):
                 batch_transfers=self.batch_transfers_check.isChecked(),
                 pipeline_unroll=self.pipeline_unroll_spin.value(),
                 max_frame_latency_limit=self.max_frame_latency_limit_spin.value(),
+                initiation_interval_limit=self.initiation_interval_limit,
                 solver_threads=self.solver_threads_spin.value(),
                 anneal_initial_temp=self.anneal_initial_temp_spin.value(),
                 anneal_final_temp=self.anneal_final_temp_spin.value(),
@@ -977,7 +981,8 @@ class MainWindow(QMainWindow):
     def _update_metrics(self, result: SolverResult) -> None:
         if result.metrics.pipeline_unroll > 1:
             self.latency_label.setText(
-                f"平均时延: {result.metrics.latency:.1f} ms/frame; "
+                f"摊销流水线跨度: {result.metrics.latency:.1f} ms/frame; "
+                f"平均单帧E2E: {result.metrics.mean_frame_latency:.1f} ms; "
                 f"启动间隔: {result.metrics.initiation_interval:.1f} ms; "
                 f"最大E2E: {result.metrics.max_frame_latency:.1f} ms "
                 f"(unroll {result.metrics.pipeline_unroll})"

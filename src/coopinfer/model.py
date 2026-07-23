@@ -26,6 +26,7 @@ class Environment:
     batch_transfers: bool = False
     pipeline_unroll: int = 1
     max_frame_latency_limit: float = 0.0
+    initiation_interval_limit: float = 0.0
     solver_threads: int = 0
     anneal_initial_temp: float = 1.0
     anneal_final_temp: float = 0.01
@@ -74,6 +75,7 @@ def environment_from_mapping(data: Mapping[str, Any]) -> Environment:
             weight_device_utilization=weight_device_utilization,
             latency_limit=data.get("latency_limit", 0.0),
             max_frame_latency_limit=data.get("max_frame_latency_limit", 0.0),
+            initiation_interval_limit=data.get("initiation_interval_limit", 0.0),
             batch_transfers=data.get("batch_transfers", False),
             pipeline_unroll=data.get("pipeline_unroll", 1),
             solver_threads=data.get("solver_threads", 0),
@@ -103,6 +105,10 @@ def validate_environment(environment: Environment) -> Environment:
         environment.max_frame_latency_limit,
         "Environment max_frame_latency_limit",
     )
+    initiation_interval_limit = _non_negative_float(
+        environment.initiation_interval_limit,
+        "Environment initiation_interval_limit",
+    )
     pipeline_unroll = _integer(environment.pipeline_unroll, "Environment pipeline_unroll")
     if pipeline_unroll < 1:
         raise ValueError("Environment pipeline_unroll must be at least 1.")
@@ -126,6 +132,7 @@ def validate_environment(environment: Environment) -> Environment:
         weight_device_utilization=weight_device_utilization,
         latency_limit=latency_limit,
         max_frame_latency_limit=max_frame_latency_limit,
+        initiation_interval_limit=initiation_interval_limit,
         batch_transfers=_bool(environment.batch_transfers, "Environment batch_transfers"),
         pipeline_unroll=pipeline_unroll,
         solver_threads=solver_threads,
@@ -148,7 +155,14 @@ def graph_from_records(
             raise ValueError(f"Duplicate Node ID: {node_id}")
         seen.add(node_id)
         fixed_dev = _bool(node.get("fixed_dev", False), f"Node {node_id} fixed_dev")
-        x_value = 0 if fixed_dev else _binary_int(node.get("x", 1), f"Node {node_id} x")
+        # Placement is solver output, not required configuration input.  Keep
+        # accepting legacy ``x`` fields as an optional warm start while making
+        # an all-host initial guess the default for movable operators.
+        x_value = (
+            0
+            if fixed_dev
+            else _binary_int(node.get("x", 1), f"Node {node_id} x")
+        )
         graph.add_node(
             node_id,
             name=str(node.get("name", node_id)).strip() or node_id,
@@ -225,7 +239,6 @@ def records_from_graph(graph: nx.DiGraph) -> Tuple[List[Dict[str, Any]], List[Di
                 "fixed_dev": fixed_dev,
                 "source_period_ms": float(attrs.get("source_period_ms", 0.0)),
                 "source_phase_ms": float(attrs.get("source_phase_ms", 0.0)),
-                "x": 0 if fixed_dev else _binary_int(attrs.get("x", 1), f"Node {node_id} x"),
             }
         )
 
@@ -268,6 +281,7 @@ def save_to_json(state: ProjectState, path: Union[str, Path]) -> None:
             "weight_device_utilization": float(environment.weight_device_utilization),
             "latency_limit": float(environment.latency_limit),
             "max_frame_latency_limit": float(environment.max_frame_latency_limit),
+            "initiation_interval_limit": float(environment.initiation_interval_limit),
             "batch_transfers": bool(environment.batch_transfers),
             "pipeline_unroll": int(environment.pipeline_unroll),
             "solver_threads": int(environment.solver_threads),

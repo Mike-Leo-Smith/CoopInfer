@@ -14,18 +14,22 @@ description = "Host-device cooperative inference scheduling prototype"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "PyQt6>=6.6",
-    "PyQt6-WebEngine>=6.6",
     "networkx>=3.0",
+    "reportlab>=4.0",
 ]
 
 [project.optional-dependencies]
+gui = [
+    "PyQt6>=6.6",
+    "PyQt6-WebEngine>=6.6",
+]
 dev = [
     "cmake>=3.18",
     "cibuildwheel>=2.20",
     "ninja>=1.11",
     "pytest>=7.0",
     "pybind11>=2.12",
+    "reportlab>=4.0",
     "scikit-build-core>=0.10",
 ]
 
@@ -45,4 +49,5 @@ test-requires = ["pytest>=7.0"]
 manylinux-x86_64-image = "manylinux_2_34"
 
 [project.scripts]
-coopinfer = "coopinfer.app:main"
+coopinfer = "coopinfer.__main__:main"
+coopinfer-gui = "coopinfer.app:main"

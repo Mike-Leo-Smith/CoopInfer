@@ -20,6 +20,7 @@ class TransferRecord:
 
 @dataclass(frozen=True)
 class EvaluationResult:
+    # Historical latency is pipeline makespan / unroll, not mean per-frame E2E.
     latency: float
     device_utilization: float
     avg_latency_loss: float
@@ -30,6 +31,7 @@ class EvaluationResult:
     finish_times: Dict[str, float]
     transfer_records: Tuple[TransferRecord, ...]
     pipeline_unroll: int = 1
+    mean_frame_latency: float = 0.0
     max_frame_latency: float = 0.0
     initiation_interval: float = 0.0
     initiation_interval_loss: float = 0.0
@@ -237,6 +239,9 @@ def metrics_from_core(raw_metrics: Mapping[str, Any]) -> EvaluationResult:
     )
     return EvaluationResult(
         latency=float(raw_metrics["latency"]),
+        mean_frame_latency=float(
+            raw_metrics.get("mean_frame_latency", raw_metrics["latency"])
+        ),
         initiation_interval=float(
             raw_metrics.get("initiation_interval", raw_metrics["latency"])
         ),

@@ -52,7 +52,10 @@ struct GraphData {
 };
 
 struct Metrics {
+    // Historical `latency` is the input-excluded pipeline makespan divided by
+    // unroll. It is a throughput/amortization metric, not mean per-frame E2E.
     double latency = 0.0;
+    double mean_frame_latency = 0.0;
     double max_frame_latency = 0.0;
     double initiation_interval = 0.0;
     double utilization = 0.0;
@@ -84,6 +87,7 @@ struct ObjectiveScales {
 struct MetricLimits {
     double latency = 0.0;
     double max_frame_latency = 0.0;
+    double initiation_interval = 0.0;
 };
 
 constexpr int anneal_sync_interval = 32;
@@ -752,6 +756,8 @@ Metrics finalize_metrics(
     double pipeline_finish = first_work_start;
     std::vector<double> frame_finishes(unroll, 0.0);
     std::vector<bool> frame_has_finish(unroll, false);
+    double frame_latency_sum = 0.0;
+    int frame_latency_count = 0;
     for (int frame = 0; frame < unroll; ++frame) {
         if (!frame_has_work[frame]) {
             continue;
@@ -778,11 +784,21 @@ Metrics finalize_metrics(
         frame_finishes[frame] = frame_finish;
         frame_has_finish[frame] = true;
         pipeline_finish = std::max(pipeline_finish, frame_finish);
+        double frame_latency = std::max(
+            0.0,
+            frame_finish - frame_work_start[frame]
+        );
+        frame_latency_sum += frame_latency;
+        frame_latency_count += 1;
         metrics.max_frame_latency = std::max(
             metrics.max_frame_latency,
-            std::max(0.0, frame_finish - frame_work_start[frame])
+            frame_latency
         );
     }
+    metrics.mean_frame_latency =
+        frame_latency_count > 0
+            ? frame_latency_sum / static_cast<double>(frame_latency_count)
+            : 0.0;
 
     double pipeline_time = has_pipeline_work ? std::max(0.0, pipeline_finish - first_work_start)
                                              : 0.0;
@@ -1762,19 +1778,72 @@ bool is_better_metrics(const Metrics& candidate, const Metrics& best) {
 bool exceeds_limit(const Metrics& metrics, const MetricLimits& limits) {
     return (limits.latency > 0.0 && metrics.latency > limits.latency) ||
            (limits.max_frame_latency > 0.0 &&
-            metrics.max_frame_latency > limits.max_frame_latency);
+            metrics.max_frame_latency > limits.max_frame_latency) ||
+           (limits.initiation_interval > 0.0 &&
+            metrics.initiation_interval > limits.initiation_interval);
+}
+
+double normalized_limit_violation(
+    const Metrics& metrics,
+    double latency_limit,
+    double max_frame_latency_limit,
+    double initiation_interval_limit
+) {
+    double violation = 0.0;
+    if (latency_limit > 0.0 && metrics.latency > latency_limit) {
+        violation += (metrics.latency - latency_limit) / latency_limit;
+    }
+    if (max_frame_latency_limit > 0.0 &&
+        metrics.max_frame_latency > max_frame_latency_limit) {
+        violation +=
+            (metrics.max_frame_latency - max_frame_latency_limit) /
+            max_frame_latency_limit;
+    }
+    if (initiation_interval_limit > 0.0 &&
+        metrics.initiation_interval > initiation_interval_limit) {
+        violation +=
+            (metrics.initiation_interval - initiation_interval_limit) /
+            initiation_interval_limit;
+    }
+    return violation;
+}
+
+double constrained_search_energy(
+    const Metrics& metrics,
+    double latency_limit,
+    double max_frame_latency_limit,
+    double initiation_interval_limit
+) {
+    constexpr double constraint_penalty = 1000.0;
+    return metrics.loss +
+           constraint_penalty * normalized_limit_violation(
+               metrics,
+               latency_limit,
+               max_frame_latency_limit,
+               initiation_interval_limit
+           );
 }
 
 bool exceeds_limit(
     const Metrics& metrics,
     double latency_limit,
-    double max_frame_latency_limit
+    double max_frame_latency_limit,
+    double initiation_interval_limit = 0.0
 ) {
-    return exceeds_limit(metrics, MetricLimits{latency_limit, max_frame_latency_limit});
+    return exceeds_limit(
+        metrics,
+        MetricLimits{
+            latency_limit,
+            max_frame_latency_limit,
+            initiation_interval_limit
+        }
+    );
 }
 
 bool has_active_limits(const MetricLimits& limits) {
-    return limits.latency > 0.0 || limits.max_frame_latency > 0.0;
+    return limits.latency > 0.0 ||
+           limits.max_frame_latency > 0.0 ||
+           limits.initiation_interval > 0.0;
 }
 
 void keep_schedule_candidate(
@@ -2246,6 +2315,7 @@ py::dict metrics_to_python(const GraphData& graph, const Metrics& metrics, int u
         transfers.append(item);
     }
     out["latency"] = metrics.latency;
+    out["mean_frame_latency"] = metrics.mean_frame_latency;
     out["max_frame_latency"] = metrics.max_frame_latency;
     out["initiation_interval"] = metrics.initiation_interval;
     out["device_utilization"] = metrics.utilization;
@@ -2282,6 +2352,12 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
         params["max_frame_latency_limit"].cast<double>(),
         "Environment max_frame_latency_limit"
     );
+    double initiation_interval_limit = params.contains("initiation_interval_limit")
+                                           ? non_negative(
+                                                 params["initiation_interval_limit"].cast<double>(),
+                                                 "Environment initiation_interval_limit"
+                                             )
+                                           : 0.0;
     bool batch_transfers = params["batch_transfers"].cast<bool>();
     int pipeline_unroll = std::max(1, params["pipeline_unroll"].cast<int>());
     int requested_threads = params.contains("solver_threads")
@@ -2330,12 +2406,44 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
         ObjectiveScales scales = baseline_scales(
             graph, bandwidth, latency, batch_transfers, pipeline_unroll
         );
-        MetricLimits limits{latency_limit, max_frame_latency_limit};
+        MetricLimits limits{
+            latency_limit,
+            max_frame_latency_limit,
+            initiation_interval_limit
+        };
 
         auto eval_assignment = [&](const std::vector<int>& assignment) {
             return schedule(
                 graph, assignment, bandwidth, latency, weights, scales,
                 batch_transfers, pipeline_unroll, limits
+            );
+        };
+        auto search_seed = [&]() {
+            std::vector<int> candidate = mostly_host_seed(graph, base_assignment);
+            Metrics candidate_metrics = eval_assignment(candidate);
+            std::vector<int> all_device = base_assignment;
+            for (int node : free_nodes) {
+                all_device[node] = 0;
+            }
+            Metrics all_device_metrics = eval_assignment(all_device);
+            if (constrained_search_energy(
+                    all_device_metrics,
+                    latency_limit,
+                    max_frame_latency_limit,
+                    initiation_interval_limit
+                ) <
+                constrained_search_energy(
+                    candidate_metrics,
+                    latency_limit,
+                    max_frame_latency_limit,
+                    initiation_interval_limit
+                )) {
+                candidate = std::move(all_device);
+                candidate_metrics = std::move(all_device_metrics);
+            }
+            return std::make_pair(
+                std::move(candidate),
+                std::move(candidate_metrics)
             );
         };
 
@@ -2374,7 +2482,12 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
                                     static_cast<int>((mask >> bit) & 1U);
                             }
                             Metrics metrics = eval_assignment(assignment);
-                            if (exceeds_limit(metrics, latency_limit, max_frame_latency_limit)) {
+                            if (exceeds_limit(
+                                    metrics,
+                                    latency_limit,
+                                    max_frame_latency_limit,
+                                    initiation_interval_limit
+                                )) {
                                 continue;
                             }
                             keep_search_result(
@@ -2410,13 +2523,17 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
                 best_metrics = std::move(combined.metrics);
                 has_best = true;
             }
-        } else if (algorithm == "auto" || algorithm.empty() || algorithm == "random" ||
-                   algorithm == "random_search" || algorithm == "random_n") {
-            mode = (algorithm == "auto" || algorithm.empty()) ? "Auto Random" : "Random Search";
-            std::vector<int> seed_assignment = mostly_host_seed(graph, base_assignment);
-            Metrics seed_metrics = eval_assignment(seed_assignment);
+        } else if (algorithm == "random" || algorithm == "random_search" ||
+                   algorithm == "random_n") {
+            mode = "Random Search";
+            auto [seed_assignment, seed_metrics] = search_seed();
             AssignmentSearchResult combined;
-            if (!exceeds_limit(seed_metrics, latency_limit, max_frame_latency_limit)) {
+            if (!exceeds_limit(
+                    seed_metrics,
+                    latency_limit,
+                    max_frame_latency_limit,
+                    initiation_interval_limit
+                )) {
                 keep_search_result(combined, seed_assignment, seed_metrics, 0);
             }
             if (free_nodes.empty()) {
@@ -2443,7 +2560,8 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
                                 if (!exceeds_limit(
                                         seed_metrics,
                                         latency_limit,
-                                        max_frame_latency_limit
+                                        max_frame_latency_limit,
+                                        initiation_interval_limit
                                     )) {
                                     keep_search_result(local, seed_assignment, seed_metrics, 0);
                                 }
@@ -2467,7 +2585,8 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
                                     if (exceeds_limit(
                                             metrics,
                                             latency_limit,
-                                            max_frame_latency_limit
+                                            max_frame_latency_limit,
+                                            initiation_interval_limit
                                         )) {
                                         continue;
                                     }
@@ -2505,13 +2624,20 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
                 best_metrics = std::move(combined.metrics);
                 has_best = true;
             }
-        } else if (algorithm == "simulated_annealing" || algorithm == "annealing" ||
+        } else if (algorithm == "auto" || algorithm.empty() ||
+                   algorithm == "simulated_annealing" || algorithm == "annealing" ||
                    algorithm == "sim_anneal" || algorithm == "sim_aneal") {
-            mode = "Simulated Annealing";
-            std::vector<int> seed_assignment = mostly_host_seed(graph, base_assignment);
-            Metrics seed_metrics = eval_assignment(seed_assignment);
+            mode = (algorithm == "auto" || algorithm.empty())
+                       ? "Auto Simulated Annealing"
+                       : "Simulated Annealing";
+            auto [seed_assignment, seed_metrics] = search_seed();
             AssignmentSearchResult combined;
-            if (!exceeds_limit(seed_metrics, latency_limit, max_frame_latency_limit)) {
+            if (!exceeds_limit(
+                    seed_metrics,
+                    latency_limit,
+                    max_frame_latency_limit,
+                    initiation_interval_limit
+                )) {
                 keep_search_result(combined, seed_assignment, seed_metrics, 0);
             }
             if (free_nodes.empty()) {
@@ -2548,7 +2674,8 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
                                 if (!exceeds_limit(
                                         current_metrics,
                                         latency_limit,
-                                        max_frame_latency_limit
+                                        max_frame_latency_limit,
+                                        initiation_interval_limit
                                     )) {
                                     keep_search_result(local, current, current_metrics, 0);
                                 }
@@ -2566,7 +2693,8 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
                                         (exceeds_limit(
                                              current_metrics,
                                              latency_limit,
-                                             max_frame_latency_limit
+                                             max_frame_latency_limit,
+                                             initiation_interval_limit
                                          ) ||
                                          is_better_metrics(shared_best.metrics, current_metrics))) {
                                         current = shared_best.assignment;
@@ -2589,33 +2717,47 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
                                     int node = free_nodes[node_dist(rng)];
                                     candidate[node] = 1 - candidate[node];
                                     Metrics metrics = eval_assignment(candidate);
-                                    if (exceeds_limit(
-                                            metrics,
-                                            latency_limit,
-                                            max_frame_latency_limit
-                                        )) {
-                                        continue;
-                                    }
-                                    double delta = metrics.loss - current_metrics.loss;
-                                    bool accept = exceeds_limit(
-                                                      current_metrics,
-                                                      latency_limit,
-                                                      max_frame_latency_limit
-                                                  ) ||
-                                                  delta <= 0.0 ||
-                                                  unit(rng) < std::exp(
-                                                      -delta / std::max(temperature, 1e-9)
-                                                  );
+                                    double candidate_violation = normalized_limit_violation(
+                                        metrics,
+                                        latency_limit,
+                                        max_frame_latency_limit,
+                                        initiation_interval_limit
+                                    );
+                                    // A constrained chain must be allowed to cross an
+                                    // infeasible region when the mostly-host seed needs
+                                    // multiple placement flips.  The normalized penalty
+                                    // makes every feasible state preferable to an
+                                    // infeasible state without polluting the public loss.
+                                    double current_energy = constrained_search_energy(
+                                        current_metrics,
+                                        latency_limit,
+                                        max_frame_latency_limit,
+                                        initiation_interval_limit
+                                    );
+                                    double candidate_energy = constrained_search_energy(
+                                        metrics,
+                                        latency_limit,
+                                        max_frame_latency_limit,
+                                        initiation_interval_limit
+                                    );
+                                    double delta = candidate_energy - current_energy;
+                                    bool accept =
+                                        delta <= 0.0 ||
+                                        unit(rng) < std::exp(
+                                            -delta / std::max(temperature, 1e-9)
+                                        );
                                     if (accept) {
                                         current = candidate;
                                         current_metrics = metrics;
                                     }
-                                    keep_search_result(
-                                        local,
-                                        std::move(candidate),
-                                        std::move(metrics),
-                                        static_cast<std::uint64_t>(step + 1)
-                                    );
+                                    if (candidate_violation == 0.0) {
+                                        keep_search_result(
+                                            local,
+                                            std::move(candidate),
+                                            std::move(metrics),
+                                            static_cast<std::uint64_t>(step + 1)
+                                        );
+                                    }
                                 }
                                 sync_shared_best();
                                 partials[worker] = std::move(local);
@@ -2656,10 +2798,12 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
 
     if (!has_best) {
         throw std::runtime_error(
-            "No feasible assignment satisfies latency limits: E2E " +
+            "No feasible assignment satisfies latency limits: amortized span " +
             std::to_string(latency_limit) +
             " ms, max-frame " +
             std::to_string(max_frame_latency_limit) +
+            " ms, initiation interval " +
+            std::to_string(initiation_interval_limit) +
             " ms."
         );
     }
