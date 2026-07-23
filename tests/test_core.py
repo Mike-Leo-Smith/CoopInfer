@@ -3,6 +3,7 @@ import math
 
 import networkx as nx
 
+from coopinfer.cli import apply_environment_overrides, build_parser
 from coopinfer.evaluator import base_node_id, edge_transfer_ms, evaluate, infer_latency, infer_schedule
 from coopinfer.model import (
     Environment,
@@ -354,12 +355,43 @@ def test_evaluate_reports_max_frame_latency_for_unrolled_pipeline():
     )
 
     assert result.latency == 50.0
+    assert result.mean_frame_latency == 50.0
     assert result.max_frame_latency == 50.0
     assert result.transfer_records[1].start == 50.0
     assert result.transfer_records[2].start == 100.0
     assert result.avg_latency_loss >= 0.0
     assert result.max_frame_latency_loss >= 0.0
     assert result.device_utilization_loss >= 0.0
+
+
+def test_amortized_pipeline_span_is_distinct_from_mean_frame_latency():
+    graph = graph_from_records(
+        [
+            {
+                "id": "input",
+                "c_dev": 0.0,
+                "c_host": 0.0,
+                "fixed_dev": True,
+                "source_period_ms": 100.0,
+            },
+            {"id": "work", "c_dev": 40.0, "c_host": 40.0, "fixed_dev": True},
+        ],
+        [{"source": "input", "target": "work", "size": 0.0}],
+    )
+
+    result = evaluate(
+        graph,
+        {"input": 0, "work": 0},
+        bandwidth=1000.0,
+        latency=0.0,
+        **LATENCY_ONLY_WEIGHTS,
+        pipeline_unroll=8,
+    )
+
+    assert result.latency == 92.5
+    assert result.mean_frame_latency == 40.0
+    assert result.max_frame_latency == 40.0
+    assert result.initiation_interval == 100.0
 
 
 def test_evaluator_delays_fast_join_branch_to_reduce_tail_frame_latency():
@@ -770,6 +802,29 @@ def test_solver_raises_when_no_assignment_satisfies_latency_limit():
         raise AssertionError("Expected solve to reject all over-limit assignments")
 
 
+def test_solver_rejects_initiation_interval_above_limit():
+    graph = graph_from_records(
+        [
+            {"id": "input", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": True},
+            {"id": "work", "c_dev": 50.0, "c_host": 50.0, "fixed_dev": True},
+        ],
+        [{"source": "input", "target": "work", "size": 0.0}],
+    )
+
+    try:
+        solve(
+            graph,
+            bandwidth=1000.0,
+            latency=0.0,
+            pipeline_unroll=3,
+            initiation_interval_limit=40.0,
+        )
+    except ValueError as exc:
+        assert "initiation interval" in str(exc)
+    else:
+        raise AssertionError("Expected solve to reject an over-limit initiation interval")
+
+
 def test_solver_supports_explicit_random_and_annealing_modes():
     graph = sample_graph()
     random_result = solve(
@@ -797,6 +852,121 @@ def test_solver_supports_explicit_random_and_annealing_modes():
     assert anneal_result.iterations == 64
     assert random_result.assignment["v1"] == 0
     assert anneal_result.assignment["v1"] == 0
+
+
+def test_auto_uses_simulated_annealing_for_large_graph():
+    nodes = [
+        {"id": "input", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": True}
+    ]
+    nodes.extend(
+        {
+            "id": f"op-{index}",
+            "c_dev": 1.0 + index * 0.01,
+            "c_host": 0.5 + index * 0.01,
+            "fixed_dev": False,
+        }
+        for index in range(13)
+    )
+    graph = graph_from_records(
+        nodes,
+        [
+            {"source": "input", "target": f"op-{index}", "size": 0.0}
+            for index in range(13)
+        ],
+    )
+
+    result = solve(
+        graph,
+        bandwidth=1000.0,
+        latency=0.0,
+        algorithm="auto",
+        heuristic_iterations=32,
+        solver_threads=2,
+    )
+
+    assert result.mode == "Auto Simulated Annealing"
+    assert result.iterations == 32
+
+
+def test_annealing_can_cross_infeasible_neighbors_to_find_feasible_split():
+    nodes = [
+        {"id": "input", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": True},
+        *[
+            {
+                "id": f"parallel-{index}",
+                "c_dev": 40.0,
+                "c_host": 40.0,
+                "fixed_dev": False,
+            }
+            for index in range(4)
+        ],
+        {"id": "output", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": True},
+    ]
+    graph = graph_from_records(
+        nodes,
+        [
+            *[
+                {"source": "input", "target": f"parallel-{index}", "size": 0.0}
+                for index in range(4)
+            ],
+            *[
+                {"source": f"parallel-{index}", "target": "output", "size": 0.0}
+                for index in range(4)
+            ],
+        ],
+    )
+
+    result = solve(
+        graph,
+        bandwidth=1000.0,
+        latency=0.0,
+        algorithm="simulated_annealing",
+        heuristic_iterations=128,
+        seed=3,
+        latency_limit=90.0,
+        max_frame_latency_limit=90.0,
+        solver_threads=1,
+    )
+
+    assert result.metrics.latency <= 90.0
+    assert result.metrics.max_frame_latency <= 90.0
+    assert sum(result.assignment[f"parallel-{index}"] for index in range(4)) == 2
+
+
+def test_cli_environment_overrides_support_mbps_and_scheduler_parameters():
+    args = build_parser().parse_args(
+        [
+            "placeholder.json",
+            "--bandwidth-mbps",
+            "510",
+            "--latency",
+            "1.5",
+            "--latency-limit",
+            "95",
+            "--initiation-interval-limit",
+            "100",
+            "--pipeline-unroll",
+            "8",
+            "--no-batch-transfers",
+            "--solver-threads",
+            "4",
+            "--anneal-initial-temp",
+            "2.0",
+            "--anneal-final-temp",
+            "0.05",
+        ]
+    )
+    overridden = apply_environment_overrides(Environment(), args)
+
+    assert overridden.bandwidth == 63.75
+    assert overridden.latency == 1.5
+    assert overridden.latency_limit == 95.0
+    assert overridden.initiation_interval_limit == 100.0
+    assert overridden.pipeline_unroll == 8
+    assert overridden.batch_transfers is False
+    assert overridden.solver_threads == 4
+    assert overridden.anneal_initial_temp == 2.0
+    assert overridden.anneal_final_temp == 0.05
 
 
 def test_parallel_enumerate_matches_single_thread_result():
@@ -860,6 +1030,7 @@ def test_json_round_trip(tmp_path):
         batch_transfers=True,
         pipeline_unroll=3,
         max_frame_latency_limit=180.0,
+        initiation_interval_limit=100.0,
         solver_threads=2,
         anneal_initial_temp=2.5,
         anneal_final_temp=0.05,
@@ -871,15 +1042,17 @@ def test_json_round_trip(tmp_path):
     assert set(loaded.graph.nodes) == {"v1", "v2"}
     assert loaded.graph.nodes["v1"]["name"] == "Input"
     assert loaded.graph.nodes["v1"]["x"] == 0
-    assert loaded.graph.nodes["v2"]["x"] == 0
+    # Placement is solver output and is intentionally not serialized. Movable
+    # nodes reload with the default host-side warm start.
+    assert loaded.graph.nodes["v2"]["x"] == 1
     assert loaded.graph.edges["v1", "v2"]["size"] == 1.0
 
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["version"] == "1.0"
-    assert data["nodes"][0]["x"] == 0
-    assert data["nodes"][1]["x"] == 0
+    assert all("x" not in node for node in data["nodes"])
     assert data["environment"]["latency_limit"] == 120.0
     assert data["environment"]["max_frame_latency_limit"] == 180.0
+    assert data["environment"]["initiation_interval_limit"] == 100.0
     assert data["environment"]["batch_transfers"] is True
     assert data["environment"]["pipeline_unroll"] == 3
     assert data["environment"]["solver_threads"] == 2
@@ -958,6 +1131,7 @@ def test_environment_validation_rejects_invalid_values():
         (Environment(weight_device_utilization=1.1), "between 0 and 1"),
         (Environment(latency_limit=-1.0), "non-negative"),
         (Environment(max_frame_latency_limit=-1.0), "non-negative"),
+        (Environment(initiation_interval_limit=-1.0), "non-negative"),
         (Environment(pipeline_unroll=0), "at least 1"),
         (Environment(pipeline_unroll=1.5), "integer"),
         (Environment(solver_threads=-1), "non-negative"),
