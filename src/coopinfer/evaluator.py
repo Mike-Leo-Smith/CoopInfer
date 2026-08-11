@@ -6,7 +6,14 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 import networkx as nx
 
-from .model import Environment, validate_environment, validate_graph
+from .model import (
+    Environment,
+    PLACEMENT_DEVICE,
+    PLACEMENT_FREE,
+    PLACEMENT_HOST,
+    validate_environment,
+    validate_graph,
+)
 
 
 @dataclass(frozen=True)
@@ -174,37 +181,51 @@ def evaluate(
         "assignment": assignment_to_core_vector(graph, assignment),
     }
     if avg_latency_scale is not None and max_latency_scale is not None:
-        params["avg_latency_scale"] = _finite_float(
-            avg_latency_scale,
-            "avg_latency_scale",
-        )
-        params["max_latency_scale"] = _finite_float(
-            max_latency_scale,
-            "max_latency_scale",
-        )
+        params["avg_latency_scale"] = _finite_float(avg_latency_scale, "avg_latency_scale")
+        params["max_latency_scale"] = _finite_float(max_latency_scale, "max_latency_scale")
 
     raw_metrics = _core_module().evaluate_core(graph_to_core_data(graph), params)
     return metrics_from_core(raw_metrics)
 
 
+def _node_placement(attrs: Mapping[str, Any]) -> str:
+    placement = str(
+        attrs.get(
+            "placement",
+            PLACEMENT_DEVICE if attrs.get("fixed_dev", False) else PLACEMENT_FREE,
+        )
+    ).strip().lower()
+    if placement not in {PLACEMENT_FREE, PLACEMENT_DEVICE, PLACEMENT_HOST}:
+        raise ValueError(f"Unknown placement constraint: {placement!r}")
+    return placement
+
+
 def graph_to_core_data(graph: nx.DiGraph) -> Dict[str, Any]:
     node_ids = [str(node) for node in graph.nodes]
     node_index = {node: index for index, node in enumerate(graph.nodes)}
+    placements = [_node_placement(attrs) for _, attrs in graph.nodes(data=True)]
+    x_initial = []
+    for placement, (_, attrs) in zip(placements, graph.nodes(data=True)):
+        if placement == PLACEMENT_DEVICE:
+            x_initial.append(0)
+        elif placement == PLACEMENT_HOST:
+            x_initial.append(1)
+        else:
+            x_initial.append(int(attrs.get("x", 1)))
     return {
         "ids": node_ids,
         "c_dev": [float(attrs["c_dev"]) for _, attrs in graph.nodes(data=True)],
         "c_host": [float(attrs["c_host"]) for _, attrs in graph.nodes(data=True)],
-        "fixed_dev": [bool(attrs.get("fixed_dev", False)) for _, attrs in graph.nodes(data=True)],
+        # Native core historically calls this field fixed_dev. It now acts as a
+        # generic fixed-placement mask; x_initial carries Device(0)/Host(1).
+        "fixed_dev": [placement != PLACEMENT_FREE for placement in placements],
         "source_period_ms": [
             float(attrs.get("source_period_ms", 0.0)) for _, attrs in graph.nodes(data=True)
         ],
         "source_phase_ms": [
             float(attrs.get("source_phase_ms", 0.0)) for _, attrs in graph.nodes(data=True)
         ],
-        "x_initial": [
-            0 if attrs.get("fixed_dev", False) else int(attrs.get("x", 1))
-            for _, attrs in graph.nodes(data=True)
-        ],
+        "x_initial": x_initial,
         "edge_sources": [node_index[source] for source, _ in graph.edges],
         "edge_targets": [node_index[target] for _, target in graph.edges],
         "edge_sizes": [float(attrs.get("size", 0.0)) for _, _, attrs in graph.edges(data=True)],
@@ -237,9 +258,7 @@ def metrics_from_core(raw_metrics: Mapping[str, Any]) -> EvaluationResult:
     )
     return EvaluationResult(
         latency=float(raw_metrics["latency"]),
-        initiation_interval=float(
-            raw_metrics.get("initiation_interval", raw_metrics["latency"])
-        ),
+        initiation_interval=float(raw_metrics.get("initiation_interval", raw_metrics["latency"])),
         device_utilization=float(raw_metrics["device_utilization"]),
         host_utilization=float(raw_metrics.get("host_utilization", 0.0)),
         network_utilization=float(raw_metrics.get("network_utilization", 0.0)),
@@ -249,9 +268,7 @@ def metrics_from_core(raw_metrics: Mapping[str, Any]) -> EvaluationResult:
         device_utilization_loss=float(raw_metrics["device_utilization_loss"]),
         loss=float(raw_metrics["loss"]),
         start_times={str(node): float(value) for node, value in raw_metrics["start_times"].items()},
-        finish_times={
-            str(node): float(value) for node, value in raw_metrics["finish_times"].items()
-        },
+        finish_times={str(node): float(value) for node, value in raw_metrics["finish_times"].items()},
         transfer_records=transfer_records,
         pipeline_unroll=int(raw_metrics["pipeline_unroll"]),
         max_frame_latency=float(raw_metrics["max_frame_latency"]),
