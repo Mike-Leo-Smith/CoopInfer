@@ -1,0 +1,80 @@
+name: Temporary VLA-Perf integration staging
+
+on:
+  push:
+    branches:
+      - agent/tmp-vlaperf-integration
+
+permissions:
+  contents: write
+
+jobs:
+  stage:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/tmp-vlaperf-integration
+          fetch-depth: 0
+
+      - name: Copy validated integration files
+        run: |
+          git fetch origin agent/vla-perf-coopinfer
+          git checkout origin/agent/vla-perf-coopinfer -- \
+            docs/vla_perf_integration.md \
+            scripts/profile_pi05_vla_perf.py \
+            scripts/vla_perf_to_coopinfer.py \
+            src/coopinfer/vla_perf_adapter.py \
+            tests/test_vla_perf_adapter.py
+
+      - name: Fix independent language/state token sizes
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("src/coopinfer/vla_perf_adapter.py")
+          text = path.read_text(encoding="utf-8")
+
+          replacements = [
+              (
+                  '''    token_ids = mb(\n        (spec.language_tokens + spec.state_tokens) * 4\n    )''',
+                  '''    language_token_ids = mb(spec.language_tokens * 4)\n    state_token_ids = mb(spec.state_tokens * 4)''',
+              ),
+              (
+                  '''        "token_ids": token_ids,''',
+                  '''        "language_token_ids": language_token_ids,\n        "state_token_ids": state_token_ids,''',
+              ),
+              (
+                  '''    add_edge("language_input", "vlm_0", sizes["token_ids"])\n    add_edge("state_input", "vlm_0", sizes["token_ids"])''',
+                  '''    add_edge("language_input", "vlm_0", sizes["language_token_ids"])\n    add_edge("state_input", "vlm_0", sizes["state_token_ids"])''',
+              ),
+          ]
+
+          for old, new in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected exactly one adapter match, found {count}: {old!r}")
+              text = text.replace(old, new)
+
+          path.write_text(text, encoding="utf-8")
+          Path(".github/workflows/tmp-vlaperf-copy.yml").unlink()
+
+      - name: Check syntax and whitespace
+        run: |
+          python -m compileall -q src/coopinfer scripts tests/test_vla_perf_adapter.py
+          git diff --check
+
+      - name: Commit staged integration
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            docs/vla_perf_integration.md \
+            scripts/profile_pi05_vla_perf.py \
+            scripts/vla_perf_to_coopinfer.py \
+            src/coopinfer/vla_perf_adapter.py \
+            tests/test_vla_perf_adapter.py \
+            .github/workflows/tmp-vlaperf-copy.yml
+          git commit -m "Stage VLA-Perf cost modeling integration"
+          git push origin HEAD:agent/tmp-vlaperf-integration
