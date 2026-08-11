@@ -9,8 +9,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Tuple, Union
 import networkx as nx
 
 
-SCHEMA_VERSION = "1.1"
-SUPPORTED_SCHEMA_VERSIONS = {"1.0", SCHEMA_VERSION}
+SCHEMA_VERSION = "1.0"
+SUPPORTED_SCHEMA_VERSIONS = {"1.0", "1.1"}
 PLACEMENT_FREE = "free"
 PLACEMENT_DEVICE = "device"
 PLACEMENT_HOST = "host"
