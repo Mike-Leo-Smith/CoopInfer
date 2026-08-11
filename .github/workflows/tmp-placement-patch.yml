@@ -1,0 +1,120 @@
+name: Temporary placement patch
+
+on:
+  push:
+    branches:
+      - agent/tmp-placement-fix
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/tmp-placement-fix
+          fetch-depth: 0
+
+      - name: Apply exact placement fixes
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_exact(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, found {count}: {old!r}")
+              file.write_text(text.replace(old, new), encoding="utf-8")
+
+          replace_exact(
+              "src/coopinfer/model.py",
+              'SCHEMA_VERSION = "1.1"\nSUPPORTED_SCHEMA_VERSIONS = {"1.0", SCHEMA_VERSION}',
+              'SCHEMA_VERSION = "1.0"\nSUPPORTED_SCHEMA_VERSIONS = {"1.0", "1.1"}',
+          )
+
+          replace_exact(
+              "src/coopinfer/cpp/core.cpp",
+              '''    std::vector<int> all_device(n, 0);\n    std::vector<int> mostly_host(n, 1);\n    for (int i = 0; i < n; ++i) {\n        if (graph.fixed_dev[i]) {\n            mostly_host[i] = 0;\n        }\n    }''',
+              '''    std::vector<int> all_device(n, 0);\n    std::vector<int> mostly_host(n, 1);\n    for (int i = 0; i < n; ++i) {\n        if (graph.fixed_dev[i]) {\n            // fixed_dev is the legacy wire name for the generic fixed-placement mask.\n            // x_initial carries the fixed resource: Device=0, Host=1.\n            all_device[i] = graph.x_initial[i];\n            mostly_host[i] = graph.x_initial[i];\n        }\n    }''',
+          )
+
+          replace_exact(
+              "src/coopinfer/cpp/core.cpp",
+              '''        std::vector<int> free_nodes;\n        std::vector<int> base_assignment(n, 1);\n        for (int i = 0; i < n; ++i) {\n            if (graph.fixed_dev[i]) {\n                base_assignment[i] = 0;\n            } else {\n                base_assignment[i] = graph.x_initial[i];\n                free_nodes.push_back(i);\n            }\n        }''',
+              '''        std::vector<int> free_nodes;\n        std::vector<int> base_assignment(n, 1);\n        for (int i = 0; i < n; ++i) {\n            base_assignment[i] = graph.x_initial[i];\n            if (!graph.fixed_dev[i]) {\n                free_nodes.push_back(i);\n            }\n        }''',
+          )
+
+          replace_exact(
+              "src/coopinfer/app.py",
+              '                "Fixed on Dev",',
+              '                "Placement",',
+          )
+
+          replace_exact(
+              "src/coopinfer/app.py",
+              '''                    bool(node.get("fixed_dev", False)),\n                )''',
+              '''                    str(\n                        node.get(\n                            "placement",\n                            "device" if node.get("fixed_dev", False) else "free",\n                        )\n                    ),\n                )''',
+          )
+
+          replace_exact(
+              "src/coopinfer/app.py",
+              '        fixed_dev: bool = False,\n',
+              '        placement: str = "free",\n',
+          )
+
+          replace_exact(
+              "src/coopinfer/app.py",
+              '''        fixed_item = QTableWidgetItem()\n        fixed_item.setFlags(fixed_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)\n        fixed_item.setCheckState(Qt.CheckState.Checked if fixed_dev else Qt.CheckState.Unchecked)\n        self.nodes_table.setItem(row, 6, fixed_item)''',
+              '''        placement_combo = QComboBox()\n        placement_combo.addItems(["Free", "Device", "Host"])\n        placement_labels = {"free": "Free", "device": "Device", "host": "Host"}\n        placement_combo.setCurrentText(\n            placement_labels.get(placement.strip().lower(), "Free")\n        )\n        placement_combo.currentTextChanged.connect(self._preview_from_tables)\n        self.nodes_table.setCellWidget(row, 6, placement_combo)''',
+          )
+
+          replace_exact(
+              "src/coopinfer/app.py",
+              '''        free_nodes = [\n            node for node, attrs in graph.nodes(data=True) if not attrs.get("fixed_dev", False)\n        ]''',
+              '''        free_nodes = [\n            node\n            for node, attrs in graph.nodes(data=True)\n            if str(\n                attrs.get(\n                    "placement",\n                    "device" if attrs.get("fixed_dev", False) else "free",\n                )\n            ).strip().lower() == "free"\n        ]''',
+          )
+
+          replace_exact(
+              "src/coopinfer/app.py",
+              '''                    "fixed_dev": self.nodes_table.item(row, 6).checkState()\n                    == Qt.CheckState.Checked,''',
+              '''                    "placement": (\n                        self.nodes_table.cellWidget(row, 6).currentText().strip().lower()\n                        if isinstance(self.nodes_table.cellWidget(row, 6), QComboBox)\n                        else "free"\n                    ),''',
+          )
+
+          replace_exact(
+              "src/coopinfer/app.py",
+              '''        for node, attrs in graph.nodes(data=True):\n            if attrs.get("fixed_dev", False):\n                attrs["x"] = 0\n            elif self.solver_result is not None and node in self.solver_result.assignment:''',
+              '''        for node, attrs in graph.nodes(data=True):\n            placement = str(\n                attrs.get(\n                    "placement",\n                    "device" if attrs.get("fixed_dev", False) else "free",\n                )\n            ).strip().lower()\n            if placement == "device":\n                attrs["x"] = 0\n            elif placement == "host":\n                attrs["x"] = 1\n            elif self.solver_result is not None and node in self.solver_result.assignment:''',
+          )
+
+          replace_exact(
+              "src/coopinfer/app.py",
+              '''                "fixed_dev": attrs.get("fixed_dev", False),''',
+              '''                "placement": attrs.get(\n                    "placement",\n                    "device" if attrs.get("fixed_dev", False) else "free",\n                ),''',
+          )
+
+          replace_exact(
+              "src/coopinfer/app.py",
+              '            stroke_width = 4 if attrs.get("fixed_dev", False) else 1.5',
+              '''            placement = str(\n                attrs.get(\n                    "placement",\n                    "device" if attrs.get("fixed_dev", False) else "free",\n                )\n            ).strip().lower()\n            stroke_width = 4 if placement != "free" else 1.5''',
+          )
+
+          workflow = Path(".github/workflows/tmp-placement-patch.yml")
+          workflow.unlink()
+
+      - name: Check Python syntax and whitespace
+        run: |
+          python -m compileall -q src/coopinfer tests/test_placement_constraints.py
+          git diff --check
+
+      - name: Commit patched sources
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/coopinfer/model.py src/coopinfer/cpp/core.cpp src/coopinfer/app.py tests/test_placement_constraints.py .github/workflows/tmp-placement-patch.yml
+          git commit -m "Complete symmetric host/device placement support"
+          git push origin HEAD:agent/tmp-placement-fix
