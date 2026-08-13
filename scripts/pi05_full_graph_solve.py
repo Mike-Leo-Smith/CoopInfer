@@ -9,11 +9,16 @@ def _assignment(node_ids, value: int):
     return {str(node_id): int(value) for node_id in node_ids}
 
 
+def _default_output(cost_source: str) -> Path:
+    suffix = "synthetic" if cost_source == "synthetic" else "vla_perf"
+    return Path(f"results/pi05_export_probe/prefix_ae_coopinfer_{suffix}.json")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Convert a fine-grained pi0.5 ModelIR into CoopInfer's backend schema "
-            "without coarsening, inject synthetic costs, and run backend smoke checks."
+            "Convert the full fine-grained pi0.5 ModelIR into CoopInfer's backend "
+            "schema without coarsening, attach costs, and run backend checks."
         )
     )
     parser.add_argument(
@@ -21,10 +26,17 @@ def main() -> None:
         type=Path,
         default=Path("results/pi05_export_probe/prefix_ae_ir.json"),
     )
+    parser.add_argument("--output", type=Path, default=None)
     parser.add_argument(
-        "--output",
+        "--cost-source",
+        choices=("synthetic", "vla-perf"),
+        default="synthetic",
+    )
+    parser.add_argument(
+        "--vla-perf-profile",
         type=Path,
-        default=Path("results/pi05_export_probe/prefix_ae_coopinfer_synthetic.json"),
+        default=Path("results/vla_perf_pi05_profile.json"),
+        help="Component-level VLA-Perf/GenZ profile used when --cost-source vla-perf",
     )
     parser.add_argument("--device-cost-ms", type=float, default=0.001)
     parser.add_argument("--host-cost-ms", type=float, default=0.002)
@@ -56,11 +68,20 @@ def main() -> None:
     from coopinfer.solver import solve
 
     model_ir = load_model_ir_json(args.input)
-    costed_ir = annotate_synthetic_costs(
-        model_ir,
-        device_cost_ms=args.device_cost_ms,
-        host_cost_ms=args.host_cost_ms,
-    )
+
+    if args.cost_source == "synthetic":
+        costed_ir = annotate_synthetic_costs(
+            model_ir,
+            device_cost_ms=args.device_cost_ms,
+            host_cost_ms=args.host_cost_ms,
+        )
+    else:
+        from coopinfer.cost import annotate_vla_perf_profile_costs
+        from coopinfer.vla_perf_adapter import load_vla_perf_profile
+
+        profile = load_vla_perf_profile(args.vla_perf_profile)
+        costed_ir = annotate_vla_perf_profile_costs(model_ir, profile)
+
     scheduling_ir = identity_scheduling_ir(costed_ir)
     payload = to_coopinfer_payload(
         scheduling_ir,
@@ -68,24 +89,43 @@ def main() -> None:
         latency_ms=args.latency_ms,
     )
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    output = args.output or _default_output(args.cost_source)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
-    state = load_from_json(args.output)
+    state = load_from_json(output)
     validate_graph(state.graph, require_dag=True)
 
     print("===== full graph conversion =====")
     print(f"input={args.input}")
-    print(f"output={args.output}")
+    print(f"output={output}")
     print(f"model_ir_nodes={len(model_ir.nodes)}")
     print(f"model_ir_tensor_edges={len(model_ir.edges)}")
     print(f"backend_nodes={state.graph.number_of_nodes()}")
     print(f"backend_edges={state.graph.number_of_edges()}")
     print(f"cost_source={scheduling_ir.metadata.get('cost_source')}")
-    print(
-        "synthetic_costs_ms="
-        f"device:{args.device_cost_ms} host:{args.host_cost_ms}"
-    )
+
+    if args.cost_source == "synthetic":
+        print(
+            "synthetic_costs_ms="
+            f"device:{args.device_cost_ms} host:{args.host_cost_ms}"
+        )
+    else:
+        print(f"vla_perf_profile={args.vla_perf_profile}")
+        print(f"hardware={costed_ir.metadata.get('cost_hardware')}")
+        print("cost_mode=stage-normalized-fine-graph")
+        audit = costed_ir.metadata.get("cost_audit", {})
+        for side in ("device", "host"):
+            for stage in ("vlm", "ae"):
+                row = audit.get(side, {}).get(stage, {})
+                if row:
+                    print(
+                        f"cost_audit[{side}][{stage}]: "
+                        f"nodes={row['node_count']} "
+                        f"profile_total_ms={row['profile_total_ms']:.6f} "
+                        f"allocated_total_ms={row['allocated_total_ms']:.6f}"
+                    )
+
     print(
         "network="
         f"{args.bandwidth_mb_s} MB/s + {args.latency_ms} ms/transfer"
@@ -142,7 +182,13 @@ def main() -> None:
     print(f"device_nodes={device_nodes}")
     print(f"host_nodes={host_nodes}")
     print(f"transfers={len(result.metrics.transfer_records)}")
-    print("NOTE: latency/placement are plumbing-only because costs are synthetic.")
+    if args.cost_source == "synthetic":
+        print("NOTE: latency/placement are plumbing-only because costs are synthetic.")
+    else:
+        print(
+            "NOTE: VLA-Perf stage totals are real modeled costs, but their current "
+            "fine-op allocation is stage-normalized rather than direct op-level GenZ."
+        )
 
 
 if __name__ == "__main__":
