@@ -19,27 +19,30 @@ class CoarseningPolicy:
 
 @dataclass(frozen=True)
 class DependencyAwarePolicy(CoarseningPolicy):
-    """Greedy coarsening that never hides graph fan-out/join opportunities.
+    """Greedy path contraction guided by generic dependency scores.
 
-    Capture stays fine-grained. Search granularity is reduced by merging only
-    simple one-producer/one-consumer chains. Fan-out, joins, model I/O, explicit
-    hard boundaries, placement conflicts, and optional module-scope changes are
-    preserved as scheduling boundaries.
+    With an unannotated ModelIR this policy keeps the earlier conservative
+    behavior and merges only strict 1->1 chains. After ``analyze_dependencies``
+    it may also contract low-value local fan-out/join edges, but it preserves
+    edges marked as scheduling boundaries and never contracts an unsafe edge
+    that can encode an alternate path through both a fan-out and a join.
 
-    networkx is imported lazily inside ``apply`` so graph capture and cost-only
-    workflows do not need scheduler/coarsening dependencies installed.
+    The policy is model agnostic: it consumes graph/cost annotations only.
     """
 
     max_ops_per_group: int = 16
     max_group_cost_ms: Optional[float] = None
     reference_resource: Optional[str] = None
     preserve_module_boundaries: bool = False
+    min_merge_affinity: float = 0.45
 
     def __post_init__(self) -> None:
         if self.max_ops_per_group < 1:
             raise ValueError("max_ops_per_group must be >= 1")
         if self.max_group_cost_ms is not None and self.max_group_cost_ms <= 0:
             raise ValueError("max_group_cost_ms must be positive")
+        if not 0.0 <= self.min_merge_affinity <= 1.0:
+            raise ValueError("min_merge_affinity must be in [0, 1]")
 
     def apply(self, model_ir: ModelIR) -> SchedulingIR:
         try:
@@ -57,6 +60,12 @@ class DependencyAwarePolicy(CoarseningPolicy):
         if not nx.is_directed_acyclic_graph(graph):
             raise ValueError("DependencyAwarePolicy requires a DAG")
 
+        dependency_scored = any(
+            isinstance(edge.metadata.get("dependency"), dict)
+            for edge in model_ir.edges
+        )
+        edge_scores = self._build_edge_scores(model_ir)
+
         groups: List[Tuple[str, ...]] = []
         assigned: Set[str] = set()
 
@@ -68,14 +77,31 @@ class DependencyAwarePolicy(CoarseningPolicy):
             current = start
 
             while len(members) < self.max_ops_per_group:
-                successors = list(graph.successors(current))
-                if len(successors) != 1:
+                candidates = []
+                for nxt in graph.successors(current):
+                    if nxt in assigned:
+                        continue
+                    if not self._can_merge(
+                        model_ir,
+                        graph,
+                        current,
+                        nxt,
+                        members,
+                        edge_scores,
+                        dependency_scored,
+                    ):
+                        continue
+                    score = edge_scores.get((current, nxt), {}).get(
+                        "merge_affinity", 1.0
+                    )
+                    candidates.append((float(score), str(nxt)))
+
+                if not candidates:
                     break
-                nxt = successors[0]
-                if nxt in assigned or graph.in_degree(nxt) != 1:
-                    break
-                if not self._can_merge(model_ir, graph, current, nxt, members):
-                    break
+
+                # Prefer the strongest local affinity. Stable node-id tie-break
+                # keeps coarsening deterministic.
+                _, nxt = max(candidates, key=lambda item: (item[0], item[1]))
                 members.append(nxt)
                 assigned.add(nxt)
                 current = nxt
@@ -116,17 +142,58 @@ class DependencyAwarePolicy(CoarseningPolicy):
             )
             for (source, target), values in edge_accumulator.items()
         )
+        group_sizes = [len(members) for members in groups]
         result = SchedulingIR(
             nodes=schedule_nodes,
             edges=schedule_edges,
             metadata={
-                "coarsening_policy": "dependency-aware",
+                "coarsening_policy": "dependency-aware-scored"
+                if dependency_scored
+                else "dependency-aware-conservative",
                 "source_node_count": len(model_ir.nodes),
                 "source_edge_count": len(model_ir.edges),
+                "coarse_node_count": len(schedule_nodes),
+                "coarse_edge_count": len(schedule_edges),
+                "dependency_scored": dependency_scored,
+                "max_ops_per_group": self.max_ops_per_group,
+                "min_merge_affinity": self.min_merge_affinity,
+                "largest_group": max(group_sizes, default=0),
+                "average_group_size": (
+                    sum(group_sizes) / len(group_sizes) if group_sizes else 0.0
+                ),
             },
         )
         result.validate()
         return result
+
+    @staticmethod
+    def _build_edge_scores(model_ir: ModelIR) -> Dict[Tuple[str, str], Dict[str, float | bool]]:
+        scores: Dict[Tuple[str, str], Dict[str, float | bool]] = {}
+        for edge in model_ir.edges:
+            dep = edge.metadata.get("dependency", {})
+            if not isinstance(dep, dict):
+                continue
+            key = (edge.source, edge.target)
+            bucket = scores.setdefault(
+                key,
+                {
+                    "preserve_boundary": False,
+                    "boundary_score": 0.0,
+                    "merge_affinity": 1.0,
+                },
+            )
+            bucket["preserve_boundary"] = bool(bucket["preserve_boundary"]) or bool(
+                dep.get("preserve_boundary", False)
+            )
+            bucket["boundary_score"] = max(
+                float(bucket["boundary_score"]),
+                float(dep.get("boundary_score", 0.0)),
+            )
+            bucket["merge_affinity"] = min(
+                float(bucket["merge_affinity"]),
+                float(dep.get("merge_affinity", 1.0)),
+            )
+        return scores
 
     def _can_merge(
         self,
@@ -135,6 +202,8 @@ class DependencyAwarePolicy(CoarseningPolicy):
         current: str,
         nxt: str,
         members: Sequence[str],
+        edge_scores: Dict[Tuple[str, str], Dict[str, float | bool]],
+        dependency_scored: bool,
     ) -> bool:
         current_node = model_ir.nodes[current]
         next_node = model_ir.nodes[nxt]
@@ -146,9 +215,6 @@ class DependencyAwarePolicy(CoarseningPolicy):
         if current_node.metadata.get("hard_boundary_after", False):
             return False
         if next_node.metadata.get("hard_boundary_before", False):
-            return False
-
-        if graph.out_degree(current) != 1 or graph.in_degree(nxt) != 1:
             return False
 
         if self.preserve_module_boundaries:
@@ -170,6 +236,22 @@ class DependencyAwarePolicy(CoarseningPolicy):
             )
             if total > self.max_group_cost_ms:
                 return False
+
+        if not dependency_scored:
+            # Backward-compatible conservative mode.
+            return graph.out_degree(current) == 1 and graph.in_degree(nxt) == 1
+
+        dep = edge_scores.get((current, nxt), {})
+        if bool(dep.get("preserve_boundary", False)):
+            return False
+        if float(dep.get("merge_affinity", 0.0)) < self.min_merge_affinity:
+            return False
+
+        # Contracting an edge where the source fans out AND the destination joins
+        # can collapse an alternate source->...->destination path and create a
+        # cycle in the quotient graph. At least one side must therefore be linear.
+        if graph.out_degree(current) > 1 and graph.in_degree(nxt) > 1:
+            return False
 
         return True
 
@@ -210,11 +292,21 @@ class DependencyAwarePolicy(CoarseningPolicy):
             raise ValueError(f"Group {group_id} contains conflicting placements: {fixed}")
         placement = next(iter(fixed)) if fixed else PLACEMENT_FREE
         name = members[0] if len(members) == 1 else f"{members[0]}..{members[-1]}"
+        criticality = max(
+            (
+                float(model_ir.nodes[member].metadata.get("dependency", {}).get("criticality", 0.0))
+                for member in members
+            ),
+            default=0.0,
+        )
         return SchedulingNode(
             id=group_id,
             members=members,
             name=name,
             costs_ms=costs,
             placement=placement,
-            metadata={"member_count": len(members)},
+            metadata={
+                "member_count": len(members),
+                "max_member_criticality": criticality,
+            },
         )
