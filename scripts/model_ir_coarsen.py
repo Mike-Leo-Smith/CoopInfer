@@ -35,6 +35,7 @@ def main() -> None:
     parser.add_argument("--min-merge-affinity", type=float, default=0.45)
     parser.add_argument("--boundary-threshold", type=float, default=0.55)
     parser.add_argument("--long-range-span-threshold", type=float, default=0.10)
+    parser.add_argument("--long-range-min-skipped-nodes", type=int, default=2)
     parser.add_argument(
         "--communication-exposure-threshold", type=float, default=0.18
     )
@@ -57,6 +58,7 @@ def main() -> None:
             boundary_threshold=args.boundary_threshold,
             long_range_span_threshold=args.long_range_span_threshold,
             communication_exposure_threshold=args.communication_exposure_threshold,
+            long_range_min_skipped_nodes=args.long_range_min_skipped_nodes,
         ),
     )
     scheduling_ir = DependencyAwarePolicy(
@@ -99,6 +101,7 @@ def main() -> None:
         "thresholds="
         f"boundary:{args.boundary_threshold} "
         f"span:{args.long_range_span_threshold} "
+        f"min_skipped:{args.long_range_min_skipped_nodes} "
         f"exposure:{args.communication_exposure_threshold} "
         f"merge_affinity:{args.min_merge_affinity}"
     )
