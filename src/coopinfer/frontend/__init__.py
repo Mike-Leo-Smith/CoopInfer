@@ -7,6 +7,8 @@ from .full_graph import (
     identity_scheduling_ir,
     load_model_ir_json,
     model_ir_from_dict,
+    model_ir_to_dict,
+    write_model_ir_json,
 )
 from .ir import (
     IRNode,
@@ -33,5 +35,7 @@ __all__ = [
     "identity_scheduling_ir",
     "load_model_ir_json",
     "model_ir_from_dict",
+    "model_ir_to_dict",
     "to_coopinfer_payload",
+    "write_model_ir_json",
 ]
