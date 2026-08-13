@@ -61,6 +61,7 @@ class DependencyAnalysisConfig:
     boundary_threshold: float = 0.55
     long_range_span_threshold: float = 0.10
     communication_exposure_threshold: float = 0.18
+    long_range_min_skipped_nodes: int = 2
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -70,6 +71,8 @@ class DependencyAnalysisConfig:
         ):
             if not 0.0 <= float(value) <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1]")
+        if int(self.long_range_min_skipped_nodes) < 0:
+            raise ValueError("long_range_min_skipped_nodes must be >= 0")
 
 
 def analyze_dependencies(
@@ -183,7 +186,9 @@ def analyze_dependencies(
     for edge in model_ir.edges:
         src = edge.source
         dst = edge.target
-        span = max(0.0, (topo_index[dst] - topo_index[src]) / topo_denominator)
+        topo_delta = max(0, topo_index[dst] - topo_index[src])
+        skipped_nodes = max(0, topo_delta - 1)
+        span = topo_delta / topo_denominator
         size_norm = _robust_unit(
             math.log1p(float(edge.size_bytes)),
             math.log1p(edge_size_scale),
@@ -221,8 +226,12 @@ def analyze_dependencies(
             + 0.20 * placement_similarity,
         )
 
+        # Relative topological span is useful on large graphs, but by itself it
+        # misclassifies ordinary neighboring edges in tiny DAGs as "long range".
+        # Require an absolute number of skipped topological nodes as well.
         long_range_exposed = (
-            span >= config.long_range_span_threshold
+            skipped_nodes >= config.long_range_min_skipped_nodes
+            and span >= config.long_range_span_threshold
             and communication_exposure >= config.communication_exposure_threshold
         )
         preserve_boundary = bool(
@@ -236,6 +245,7 @@ def analyze_dependencies(
         dep.update(
             {
                 "topological_span": span,
+                "topological_skipped_nodes": skipped_nodes,
                 "tensor_size_normalized": size_norm,
                 "fanout_score": fanout,
                 "join_score": join,
@@ -246,6 +256,7 @@ def analyze_dependencies(
                 "local_heavy_affinity": local_heavy_affinity,
                 "boundary_score": boundary_score,
                 "merge_affinity": merge_affinity,
+                "long_range_exposed": long_range_exposed,
                 "preserve_boundary": preserve_boundary,
             }
         )
@@ -272,6 +283,7 @@ def analyze_dependencies(
         "boundary_threshold": config.boundary_threshold,
         "long_range_span_threshold": config.long_range_span_threshold,
         "communication_exposure_threshold": config.communication_exposure_threshold,
+        "long_range_min_skipped_nodes": config.long_range_min_skipped_nodes,
         "preserved_edges": preserved,
         "edge_count": len(model_ir.edges),
     }
