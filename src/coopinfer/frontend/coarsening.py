@@ -145,6 +145,13 @@ class DependencyAwarePolicy(CoarseningPolicy):
             )
             for (source, target), values in edge_accumulator.items()
         )
+
+        quotient = nx.DiGraph()
+        quotient.add_nodes_from(schedule_nodes)
+        quotient.add_edges_from((edge.source, edge.target) for edge in schedule_edges)
+        if not nx.is_directed_acyclic_graph(quotient):
+            raise RuntimeError("Coarsening produced a cyclic quotient graph")
+
         group_sizes = [len(members) for members in groups]
         result = SchedulingIR(
             nodes=schedule_nodes,
@@ -264,6 +271,8 @@ class DependencyAwarePolicy(CoarseningPolicy):
         path would become group -> ... -> group.
         """
 
+        import networkx as nx
+
         group = set(members)
         candidate = group | {nxt}
         external_predecessors = [
@@ -274,9 +283,7 @@ class DependencyAwarePolicy(CoarseningPolicy):
 
         for member in group:
             for pred in external_predecessors:
-                if graph.has_edge(member, pred) or __import__("networkx").has_path(
-                    graph, member, pred
-                ):
+                if nx.has_path(graph, member, pred):
                     return True
         return False
 
