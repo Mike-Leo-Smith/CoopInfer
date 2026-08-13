@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 import sys
 import traceback
-from typing import Any
 
 
 def _add_lerobot_to_path(root: Path) -> None:
@@ -49,35 +48,10 @@ def _load_pi05(args):
     return model, source
 
 
-def _flatten_cache(cache: Any) -> tuple:
-    if cache is None:
-        raise RuntimeError("Prefix forward returned no past_key_values")
-    if hasattr(cache, "to_legacy_cache"):
-        cache = cache.to_legacy_cache()
-
-    flat = []
-    if isinstance(cache, (tuple, list)):
-        for layer in cache:
-            if isinstance(layer, (tuple, list)) and len(layer) >= 2:
-                flat.extend((layer[0], layer[1]))
-            else:
-                flat.append(layer)
-    else:
-        key_cache = getattr(cache, "key_cache", None)
-        value_cache = getattr(cache, "value_cache", None)
-        if key_cache is not None and value_cache is not None:
-            for key, value in zip(key_cache, value_cache, strict=True):
-                flat.extend((key, value))
-
-    if not flat or not all(hasattr(item, "shape") for item in flat):
-        raise RuntimeError(
-            f"Could not flatten cache type {type(cache)!r} into tensor K/V pairs"
-        )
-    return tuple(flat)
-
-
 def _make_wrappers(model, prefix_tokens: int):
     import torch
+
+    from coopinfer.frontend.pi05_probe import flatten_past_key_values
 
     vlm = model.paligemma_with_expert.paligemma.model.language_model
     layer0 = vlm.layers[0]
@@ -108,7 +82,7 @@ def _make_wrappers(model, prefix_tokens: int):
                 inputs_embeds=[prefix_embs, None],
                 use_cache=True,
             )
-            return _flatten_cache(cache)
+            return flatten_past_key_values(cache)
 
     class PrefixOneStepWrapper(torch.nn.Module):
         def __init__(self, pi05):
