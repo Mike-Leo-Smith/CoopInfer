@@ -75,10 +75,19 @@ def test_dependency_aware_coarsening_preserves_wave_fanout():
     assert (groups["kv"], groups["ae"]) in edge_pairs
 
 
-def test_simple_chain_can_be_coarsened():
+def test_simple_chain_can_be_coarsened_after_source():
     ir = ModelIR.from_parts(
-        [IRNode("a", "gemm"), IRNode("b", "gemm"), IRNode("c", "gemm")],
-        [TensorEdge("a", "b", 1), TensorEdge("b", "c", 1)],
+        [
+            IRNode("input", "input", kind="input"),
+            IRNode("a", "gemm"),
+            IRNode("b", "gemm"),
+            IRNode("c", "gemm"),
+        ],
+        [
+            TensorEdge("input", "a", 1),
+            TensorEdge("a", "b", 1),
+            TensorEdge("b", "c", 1),
+        ],
     )
     backend = MappingCostBackend({}, default_ms=0.01)
     annotated = annotate_costs(
@@ -89,9 +98,10 @@ def test_simple_chain_can_be_coarsened():
         },
     )
     schedule = DependencyAwarePolicy(max_ops_per_group=16).apply(annotated)
-    assert len(schedule.nodes) == 1
-    only_group = next(iter(schedule.nodes.values()))
-    assert only_group.members == ("a", "b", "c")
+    assert len(schedule.nodes) == 2
+    groups = [group.members for group in schedule.nodes.values()]
+    assert ("input",) in groups
+    assert ("a", "b", "c") in groups
 
 
 def test_export_matches_existing_coopinfer_schema():
