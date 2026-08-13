@@ -8,6 +8,10 @@ from .base import (
     MappingCostBackend,
     annotate_costs,
 )
+from .vla_perf_profile import (
+    VlaPerfPi05FineCostBackend,
+    annotate_vla_perf_profile_costs,
+)
 
 __all__ = [
     "CallableCostBackend",
@@ -15,5 +19,7 @@ __all__ = [
     "CostEstimate",
     "CostTarget",
     "MappingCostBackend",
+    "VlaPerfPi05FineCostBackend",
     "annotate_costs",
+    "annotate_vla_perf_profile_costs",
 ]
