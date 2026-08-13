@@ -222,6 +222,13 @@ class DependencyAwarePolicy(CoarseningPolicy):
             return False
         if next_node.kind in {"input", "output"}:
             return False
+
+        # CoopInfer's current evaluator treats every indegree-0 graph node as a
+        # zero-duration source event. Never absorb real downstream compute into
+        # such a source-like node or that compute cost would disappear.
+        if any(graph.in_degree(node_id) == 0 for node_id in members):
+            return False
+
         if current_node.metadata.get("hard_boundary_after", False):
             return False
         if next_node.metadata.get("hard_boundary_before", False):
