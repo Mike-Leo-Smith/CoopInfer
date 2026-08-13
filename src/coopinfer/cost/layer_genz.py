@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from math import prod
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
-from coopinfer.frontend.ir import ModelIR, SchedulingIR, TensorEdge
+from coopinfer.frontend.ir import IRNode, ModelIR, SchedulingIR, TensorEdge
 from coopinfer.frontend.layerwise import LayerGrouping, build_layer_scheduling_ir
 
 from .genz import infer_node_work
@@ -100,7 +100,11 @@ def infer_layer_work(
         source_inside = edge.source in members
         target_inside = edge.target in members
         tensor_key = (edge.source, edge.tensor_id or edge.source)
-        adjusted_bytes = _edge_bytes(edge, precision=precision)
+        adjusted_bytes = _edge_bytes(
+            edge,
+            precision=precision,
+            source_node=model_ir.nodes.get(edge.source),
+        )
         if target_inside and not source_inside:
             incoming.setdefault(tensor_key, adjusted_bytes)
         if source_inside and not target_inside:
@@ -258,7 +262,11 @@ def _precision_adjusted_model_ir(model_ir: ModelIR, *, precision: str) -> ModelI
             TensorEdge(
                 source=edge.source,
                 target=edge.target,
-                size_bytes=_edge_bytes(edge, precision=precision),
+                size_bytes=_edge_bytes(
+                    edge,
+                    precision=precision,
+                    source_node=model_ir.nodes.get(edge.source),
+                ),
                 tensor_id=edge.tensor_id,
                 metadata=dict(edge.metadata),
             )
@@ -268,7 +276,13 @@ def _precision_adjusted_model_ir(model_ir: ModelIR, *, precision: str) -> ModelI
     )
 
 
-def _edge_bytes(edge: TensorEdge, *, precision: str) -> float:
+def _edge_bytes(
+    edge: TensorEdge,
+    *,
+    precision: str,
+    source_node: Optional[IRNode] = None,
+) -> float:
+    # Newer/full serializers may retain tensor descriptors directly on the edge.
     rows = edge.metadata.get("tensors", ())
     if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes)):
         tensor_rows = [row for row in rows if isinstance(row, Mapping)]
@@ -276,6 +290,19 @@ def _edge_bytes(edge: TensorEdge, *, precision: str) -> float:
             value = sum(_row_bytes(row, precision=precision) for row in tensor_rows)
             if value > 0.0:
                 return float(value)
+
+    # pi05_export_probe's historical serializer retained tensor descriptors on
+    # the source node rather than on the edge. Recover precision-aware bytes
+    # from that metadata before falling back to the captured raw byte count.
+    if source_node is not None:
+        rows = source_node.metadata.get("output_tensors", ())
+        if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes)):
+            tensor_rows = [row for row in rows if isinstance(row, Mapping)]
+            if tensor_rows:
+                value = sum(_row_bytes(row, precision=precision) for row in tensor_rows)
+                if value > 0.0:
+                    return float(value)
+
     return float(edge.size_bytes)
 
 
