@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .ir import ModelIR
 from .layerwise import LayerGrouping
@@ -10,18 +10,12 @@ from .layerwise import LayerGrouping
 
 @dataclass(frozen=True)
 class LayerDependency:
-    """A layer-to-layer dependency recovered from real Fine ModelIR reachability.
-
-    The dependency is not a synthetic scheduling edge. It is a discovery overlay:
-    starting from one detected layer group, traverse only non-layer groups until
-    the next layer frontier is reached. Therefore every reported dependency is
-    backed by an actual path in the quotient graph, while no intermediate layer
-    is skipped.
-    """
+    """A layer-to-layer dependency recovered from the real Fine ModelIR DAG."""
 
     source_group: str
     target_group: str
     path_groups: Tuple[str, ...]
+    path_fine_nodes: Tuple[str, ...]
     source_stack: str
     target_stack: str
     source_layer: Optional[int]
@@ -50,9 +44,10 @@ class LayerDependency:
             "cross_stack": self.cross_stack,
             "glue_hops": self.glue_hops,
             "path_groups": list(self.path_groups),
+            "path_fine_nodes": list(self.path_fine_nodes),
             "derivation": (
-                "shortest real quotient-graph path from source layer to the next "
-                "layer frontier, traversing non-layer groups only"
+                "shortest real Fine ModelIR directed path from source layer to the "
+                "next layer frontier, traversing non-layer fine nodes only"
             ),
         }
 
@@ -63,30 +58,24 @@ def discover_layer_dependencies(
 ) -> Tuple[LayerDependency, ...]:
     """Recover layer-frontier dependencies without inventing model-specific edges.
 
-    A direct Fine edge between layer groups is only one special case. More often,
-    exported graphs contain glue operations (cat/clone/reshape/cast/etc.) between
-    repeated transformer layers. This routine removes that representational
-    accident for *dependency discovery only* by tracing through non-layer groups.
+    Exported graphs often place glue operations (cat/clone/reshape/cast/etc.)
+    between repeated transformer layers, so requiring a direct layer->layer Fine
+    edge misses real dependencies. This routine searches the original Fine DAG.
 
-    Important semantics:
-    - Every result corresponds to a real directed path in the Fine/quotient DAG.
-    - Traversal stops at the first encountered layer group on each path, so the
-      routine never infers a dependency through another layer.
-    - The SchedulingIR itself is not modified; auxiliary compute/communication
-      remains explicit for the exact CoopInfer evaluator.
+    Semantics:
+    - Every reported result has an explicit real Fine-node directed path.
+    - The search may traverse nodes in the source layer and non-layer nodes.
+    - The search stops as soon as it reaches any *other* detected layer group;
+      therefore no dependency is inferred through an intermediate layer.
+    - The SchedulingIR is not modified. This is a dependency-discovery overlay,
+      so auxiliary compute/communication remains explicit for exact evaluation.
     """
 
     model_ir.validate()
 
-    group_adj: Dict[str, List[str]] = defaultdict(list)
-    seen_group_edges = set()
+    fine_adj: Dict[str, List[str]] = defaultdict(list)
     for edge in model_ir.edges:
-        src = grouping.member_to_group[edge.source]
-        dst = grouping.member_to_group[edge.target]
-        if src == dst or (src, dst) in seen_group_edges:
-            continue
-        seen_group_edges.add((src, dst))
-        group_adj[src].append(dst)
+        fine_adj[edge.source].append(edge.target)
 
     layer_ids = {
         group_id
@@ -95,44 +84,50 @@ def discover_layer_dependencies(
     }
 
     recovered: Dict[Tuple[str, str], LayerDependency] = {}
+
     for source_id in sorted(layer_ids):
         source = grouping.groups[source_id]
-        queue = deque()
-        best_depth: Dict[str, int] = {}
 
-        for nxt in group_adj.get(source_id, ()):
-            queue.append((nxt, (source_id, nxt)))
-            best_depth[nxt] = 1
+        # Multi-source BFS: every fine op inside the source layer is a legitimate
+        # producer. Starting from all members avoids imposing an artificial
+        # intra-layer ordering on dependency discovery.
+        queue = deque((member, (member,)) for member in source.members)
+        best_depth: Dict[str, int] = {member: 0 for member in source.members}
 
         while queue:
-            current, path = queue.popleft()
+            current, fine_path = queue.popleft()
 
-            if current in layer_ids:
-                if current != source_id:
-                    target = grouping.groups[current]
-                    key = (source_id, current)
+            for nxt in fine_adj.get(current, ()):
+                target_group_id = grouping.member_to_group[nxt]
+
+                if target_group_id != source_id and target_group_id in layer_ids:
+                    target = grouping.groups[target_group_id]
+                    candidate_path = (*fine_path, nxt)
+                    group_path = _compress_group_path(candidate_path, grouping)
+                    key = (source_id, target_group_id)
                     candidate = LayerDependency(
                         source_group=source_id,
-                        target_group=current,
-                        path_groups=path,
+                        target_group=target_group_id,
+                        path_groups=group_path,
+                        path_fine_nodes=candidate_path,
                         source_stack=source.stack_root,
                         target_stack=target.stack_root,
                         source_layer=source.layer_index,
                         target_layer=target.layer_index,
                     )
                     previous = recovered.get(key)
-                    if previous is None or len(candidate.path_groups) < len(previous.path_groups):
+                    if previous is None or len(candidate.path_fine_nodes) < len(
+                        previous.path_fine_nodes
+                    ):
                         recovered[key] = candidate
-                # Do not traverse through another detected layer. This makes the
-                # result a layer-frontier dependency, not arbitrary transitive closure.
-                continue
-
-            for nxt in group_adj.get(current, ()):
-                depth = len(path)
-                if best_depth.get(nxt, 1 << 30) <= depth:
+                    # Frontier semantics: do not traverse through another layer.
                     continue
-                best_depth[nxt] = depth
-                queue.append((nxt, (*path, nxt)))
+
+                next_depth = len(fine_path)
+                if best_depth.get(nxt, 1 << 30) <= next_depth:
+                    continue
+                best_depth[nxt] = next_depth
+                queue.append((nxt, (*fine_path, nxt)))
 
     return tuple(
         recovered[key]
@@ -168,3 +163,15 @@ def layer_dependency_summary(
         "same_index_cross_stack_dependencies": len(same_index_cross),
         "dependencies": [dependency.to_dict() for dependency in dependencies],
     }
+
+
+def _compress_group_path(
+    fine_path: Sequence[str],
+    grouping: LayerGrouping,
+) -> Tuple[str, ...]:
+    groups: List[str] = []
+    for node_id in fine_path:
+        group_id = grouping.member_to_group[node_id]
+        if not groups or groups[-1] != group_id:
+            groups.append(group_id)
+    return tuple(groups)
