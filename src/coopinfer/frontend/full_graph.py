@@ -15,11 +15,7 @@ from .ir import (
 
 
 def model_ir_from_dict(data: Mapping[str, Any]) -> ModelIR:
-    """Reconstruct a ModelIR from the JSON emitted by the export probe.
-
-    This intentionally preserves the fine-grained node/tensor dependency graph.
-    It does not coarsen nodes or infer costs.
-    """
+    """Reconstruct a ModelIR from its JSON-friendly representation."""
 
     nodes = []
     for index, row in enumerate(data.get("nodes", []), start=1):
@@ -59,9 +55,75 @@ def model_ir_from_dict(data: Mapping[str, Any]) -> ModelIR:
     return ModelIR.from_parts(nodes, edges, metadata=dict(data.get("metadata", {})))
 
 
+def model_ir_to_dict(
+    model_ir: ModelIR,
+    *,
+    include_stack_trace: bool = False,
+) -> Dict[str, Any]:
+    """Serialize a ModelIR, including costs and generic tensor metadata."""
+
+    def node_metadata(node: IRNode) -> Dict[str, Any]:
+        if include_stack_trace:
+            return dict(node.metadata)
+        return {
+            key: value
+            for key, value in node.metadata.items()
+            if key != "stack_trace"
+        }
+
+    return {
+        "metadata": dict(model_ir.metadata),
+        "nodes": [
+            {
+                "id": node.id,
+                "kind": node.kind,
+                "op": node.op,
+                "target": node.target,
+                "module_path": node.module_path,
+                "placement": node.placement,
+                "costs_ms": dict(node.costs_ms),
+                "metadata": node_metadata(node),
+            }
+            for node in model_ir.nodes.values()
+        ],
+        "edges": [
+            {
+                "source": edge.source,
+                "target": edge.target,
+                "size_bytes": float(edge.size_bytes),
+                "tensor_id": edge.tensor_id,
+                "metadata": dict(edge.metadata),
+            }
+            for edge in model_ir.edges
+        ],
+    }
+
+
 def load_model_ir_json(path: Union[str, Path]) -> ModelIR:
     with Path(path).open("r", encoding="utf-8") as file:
         return model_ir_from_dict(json.load(file))
+
+
+def write_model_ir_json(
+    model_ir: ModelIR,
+    path: Union[str, Path],
+    *,
+    include_stack_trace: bool = False,
+) -> Path:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(
+            model_ir_to_dict(
+                model_ir,
+                include_stack_trace=include_stack_trace,
+            ),
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return output
 
 
 def annotate_synthetic_costs(
