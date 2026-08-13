@@ -50,7 +50,7 @@ def _profile():
     }
 
 
-def _fine_ir():
+def _fine_ir(*, include_source_like_vlm: bool = False):
     nodes = [
         IRNode("input", "input", kind="input"),
         IRNode(
@@ -86,9 +86,19 @@ def _fine_ir():
         ),
         IRNode("output", "output", kind="output"),
     ]
+    if include_source_like_vlm:
+        nodes.append(
+            IRNode(
+                "vlm_static",
+                "transform",
+                module_path="pi05.paligemma_with_expert.paligemma.model.language_model.layers.0.self_attn.k_proj",
+            )
+        )
+
+    chain_nodes = nodes[:9]
     edges = [
-        TensorEdge(nodes[i].id, nodes[i + 1].id, 1024.0, f"t{i}")
-        for i in range(len(nodes) - 1)
+        TensorEdge(chain_nodes[i].id, chain_nodes[i + 1].id, 1024.0, f"t{i}")
+        for i in range(len(chain_nodes) - 1)
     ]
     return ModelIR.from_parts(nodes, edges)
 
@@ -115,8 +125,25 @@ def test_vla_perf_costs_preserve_component_totals():
     audit = costed.metadata["cost_audit"]
     assert audit["device"]["vlm"]["node_count"] == 2
     assert audit["device"]["ae"]["node_count"] == 4
+    assert audit["device"]["vlm"]["excluded_source_nodes"] == 0
     assert math.isclose(audit["device"]["vlm"]["allocated_total_ms"], 10.0)
     assert math.isclose(audit["host"]["ae"]["allocated_total_ms"], 8.0)
+
+
+def test_vla_perf_costs_exclude_source_like_export_ops_and_redistribute_total():
+    costed = annotate_vla_perf_profile_costs(
+        _fine_ir(include_source_like_vlm=True), _profile()
+    )
+
+    assert costed.nodes["vlm_static"].costs_ms == {"device": 0.0, "host": 0.0}
+    assert costed.nodes["vlm0_a"].costs_ms == {"device": 5.0, "host": 10.0}
+    assert costed.nodes["vlm0_b"].costs_ms == {"device": 5.0, "host": 10.0}
+
+    audit = costed.metadata["cost_audit"]
+    assert audit["device"]["vlm"]["classified_node_count"] == 3
+    assert audit["device"]["vlm"]["node_count"] == 2
+    assert audit["device"]["vlm"]["excluded_source_nodes"] == 1
+    assert math.isclose(audit["device"]["vlm"]["allocated_total_ms"], 10.0)
 
 
 def test_vla_perf_costed_full_graph_enters_identity_adapter():
