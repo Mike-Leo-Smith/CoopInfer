@@ -19,6 +19,11 @@ from .ir import (
     SchedulingNode,
     TensorEdge,
 )
+from .layer_dependencies import (
+    LayerDependency,
+    discover_layer_dependencies,
+    layer_dependency_summary,
+)
 from .layerwise import (
     LayerGroup,
     LayerGrouping,
@@ -33,6 +38,7 @@ __all__ = [
     "DependencyAwarePolicy",
     "DependencyAnalysisConfig",
     "IRNode",
+    "LayerDependency",
     "LayerGroup",
     "LayerGrouping",
     "ModelIR",
@@ -46,7 +52,9 @@ __all__ = [
     "capture_exported_program",
     "capture_model",
     "detect_layer_groups",
+    "discover_layer_dependencies",
     "identity_scheduling_ir",
+    "layer_dependency_summary",
     "layer_mapping_dict",
     "load_model_ir_json",
     "model_ir_from_dict",
