@@ -32,8 +32,8 @@ def main() -> None:
     parser.add_argument("--latency-ms", type=float, default=0.2)
     parser.add_argument(
         "--algorithm",
-        choices=("auto", "enumerate", "random", "anneal"),
-        default="random",
+        choices=("Auto", "Enumerate", "Random Search", "Simulated Annealing"),
+        default="Random Search",
     )
     parser.add_argument("--heuristic-iterations", type=int, default=32)
     parser.add_argument("--seed", type=int, default=7)
