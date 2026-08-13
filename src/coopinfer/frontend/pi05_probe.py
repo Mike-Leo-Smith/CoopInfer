@@ -39,6 +39,64 @@ class Pi05ProbeSummary:
         }
 
 
+def flatten_past_key_values(cache: Any) -> tuple:
+    """Flatten supported Hugging Face cache containers into K/V tensor pairs.
+
+    Transformers 5.x stores DynamicCache data as ``cache.layers[i].keys`` and
+    ``cache.layers[i].values``. Older releases exposed either a legacy tuple or
+    ``key_cache`` / ``value_cache`` lists. This helper accepts all three forms
+    without importing Transformers, keeping the probe version-tolerant.
+    """
+
+    if cache is None:
+        raise RuntimeError("Prefix forward returned no past_key_values")
+
+    legacy = getattr(cache, "to_legacy_cache", None)
+    if callable(legacy):
+        cache = legacy()
+
+    flat: List[Any] = []
+    if isinstance(cache, (tuple, list)):
+        for layer in cache:
+            if isinstance(layer, (tuple, list)) and len(layer) >= 2:
+                flat.extend((layer[0], layer[1]))
+            else:
+                flat.append(layer)
+    else:
+        # Transformers >=5: DynamicCache.layers contains CacheLayer objects
+        # whose actual tensors live in .keys and .values.
+        layers = getattr(cache, "layers", None)
+        if layers is not None:
+            for layer in layers:
+                key = getattr(layer, "keys", None)
+                value = getattr(layer, "values", None)
+                if key is None and value is None:
+                    continue
+                if key is None or value is None:
+                    raise RuntimeError(
+                        "DynamicCache layer exposed only one of keys/values"
+                    )
+                flat.extend((key, value))
+
+        # Transformers 4.x compatibility.
+        if not flat:
+            key_cache = getattr(cache, "key_cache", None)
+            value_cache = getattr(cache, "value_cache", None)
+            if key_cache is not None and value_cache is not None:
+                for key, value in zip(key_cache, value_cache, strict=True):
+                    flat.extend((key, value))
+
+    if not flat or not all(hasattr(item, "shape") for item in flat):
+        raise RuntimeError(
+            f"Could not flatten cache type {type(cache)!r} into tensor K/V pairs"
+        )
+    if len(flat) % 2 != 0:
+        raise RuntimeError(
+            f"Flattened cache contained {len(flat)} tensors; expected K/V pairs"
+        )
+    return tuple(flat)
+
+
 def summarize_pi05_ir(model_ir: ModelIR) -> Pi05ProbeSummary:
     """Report pi0.5 graph visibility without inventing any VLM->AE edge."""
 
