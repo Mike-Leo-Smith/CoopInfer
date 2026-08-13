@@ -58,8 +58,15 @@ def test_long_range_large_edge_scores_above_local_large_edge():
 
 
 def test_scored_policy_can_contract_low_value_local_fanout_edge():
+    source = IRNode(
+        "input",
+        "input",
+        kind="input",
+        costs_ms={"device": 0.0, "host": 0.0},
+    )
     ir = ModelIR.from_parts(
         [
+            source,
             _costed_node("u"),
             _costed_node("left"),
             _costed_node("right"),
@@ -67,6 +74,7 @@ def test_scored_policy_can_contract_low_value_local_fanout_edge():
             _costed_node("right_out"),
         ],
         [
+            TensorEdge("input", "u", 4096),
             TensorEdge("u", "left", 4096),
             TensorEdge("u", "right", 4096),
             TensorEdge("left", "left_out", 4096),
@@ -88,9 +96,19 @@ def test_scored_policy_can_contract_low_value_local_fanout_edge():
 
 
 def test_scored_policy_keeps_marked_boundary_between_groups():
+    source = IRNode(
+        "input",
+        "input",
+        kind="input",
+        costs_ms={"device": 0.0, "host": 0.0},
+    )
     ir = ModelIR.from_parts(
-        [_costed_node("a"), _costed_node("b"), _costed_node("c")],
-        [TensorEdge("a", "b", 4096, "ab"), TensorEdge("b", "c", 4096, "bc")],
+        [source, _costed_node("a"), _costed_node("b"), _costed_node("c")],
+        [
+            TensorEdge("input", "a", 1024),
+            TensorEdge("a", "b", 4096, "ab"),
+            TensorEdge("b", "c", 4096, "bc"),
+        ],
     )
     analyzed = analyze_dependencies(
         ir,
@@ -110,9 +128,16 @@ def test_scored_policy_keeps_marked_boundary_between_groups():
 def test_scored_policy_rejects_contraction_that_would_cycle_quotient():
     # If {a,b,c} were contracted, the outside path a->x->c would become
     # group->x->group. The policy must stop before absorbing c.
+    source = IRNode(
+        "input",
+        "input",
+        kind="input",
+        costs_ms={"device": 0.0, "host": 0.0},
+    )
     ir = ModelIR.from_parts(
-        [_costed_node(name) for name in ("a", "b", "x", "c")],
+        [source] + [_costed_node(name) for name in ("a", "b", "x", "c")],
         [
+            TensorEdge("input", "a", 1024),
             TensorEdge("a", "b", 1024),
             TensorEdge("a", "x", 1024),
             TensorEdge("b", "c", 1024),
@@ -134,3 +159,30 @@ def test_scored_policy_rejects_contraction_that_would_cycle_quotient():
     }
 
     assert member_to_group["a"] != member_to_group["c"]
+
+
+def test_source_like_op_remains_singleton_group():
+    source_like = IRNode(
+        "source_like",
+        "memory",
+        costs_ms={"device": 0.0, "host": 0.0},
+    )
+    ir = ModelIR.from_parts(
+        [source_like, _costed_node("compute")],
+        [TensorEdge("source_like", "compute", 4096)],
+    )
+    analyzed = analyze_dependencies(
+        ir,
+        config=DependencyAnalysisConfig(boundary_threshold=0.99),
+    )
+    schedule = DependencyAwarePolicy(
+        max_ops_per_group=16,
+        min_merge_affinity=0.0,
+    ).apply(analyzed)
+    member_to_group = {
+        member: group_id
+        for group_id, group in schedule.nodes.items()
+        for member in group.members
+    }
+
+    assert member_to_group["source_like"] != member_to_group["compute"]
