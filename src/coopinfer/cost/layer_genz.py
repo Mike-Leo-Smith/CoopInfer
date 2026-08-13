@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import prod
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
-from coopinfer.frontend.ir import ModelIR, SchedulingIR
+from coopinfer.frontend.ir import ModelIR, SchedulingIR, TensorEdge
 from coopinfer.frontend.layerwise import LayerGrouping, build_layer_scheduling_ir
 
 from .genz import infer_node_work
@@ -47,7 +47,7 @@ class LayerWork:
         return float(self.parameter_bytes + self.input_bytes + self.output_bytes)
 
 
-SystemFactory = Any
+SystemFactory = Callable[[str, str, float, float], Any]
 
 
 def infer_layer_work(
@@ -100,14 +100,15 @@ def infer_layer_work(
         source_inside = edge.source in members
         target_inside = edge.target in members
         tensor_key = (edge.source, edge.tensor_id or edge.source)
+        adjusted_bytes = _edge_bytes(edge, precision=precision)
         if target_inside and not source_inside:
-            incoming.setdefault(tensor_key, float(edge.size_bytes))
+            incoming.setdefault(tensor_key, adjusted_bytes)
         if source_inside and not target_inside:
-            outgoing.setdefault(tensor_key, float(edge.size_bytes))
+            outgoing.setdefault(tensor_key, adjusted_bytes)
 
     return LayerWork(
         flops=flops,
-        parameter_bytes=float(sum(incoming.values()) * 0.0 + parameter_bytes),
+        parameter_bytes=float(parameter_bytes),
         input_bytes=float(sum(incoming.values())),
         output_bytes=float(sum(outgoing.values())),
         metadata={
@@ -117,6 +118,7 @@ def infer_layer_work(
             "unique_boundary_inputs": len(incoming),
             "unique_boundary_outputs": len(outgoing),
             "memory_model": "weights-plus-external-io",
+            "internal_activation_hbm": "not-recharged",
         },
     )
 
@@ -222,8 +224,11 @@ def annotate_layer_genz_costs(
             "resource_cost_details": resource_meta,
         }
 
+    # Keep the source Fine ModelIR immutable. A precision-adjusted clone is used
+    # only to express layer-boundary communication sizes in the target precision.
+    adjusted_ir = _precision_adjusted_model_ir(model_ir, precision=precision)
     result = build_layer_scheduling_ir(
-        model_ir,
+        adjusted_ir,
         grouping,
         group_costs=costs,
         group_metadata=metadata,
@@ -240,9 +245,38 @@ def annotate_layer_genz_costs(
                 "compute": float(compute_efficiency),
                 "memory": float(memory_efficiency),
             },
+            "communication_edge_precision": precision,
         }
     )
     return result
+
+
+def _precision_adjusted_model_ir(model_ir: ModelIR, *, precision: str) -> ModelIR:
+    return ModelIR.from_parts(
+        [node.clone() for node in model_ir.nodes.values()],
+        [
+            TensorEdge(
+                source=edge.source,
+                target=edge.target,
+                size_bytes=_edge_bytes(edge, precision=precision),
+                tensor_id=edge.tensor_id,
+                metadata=dict(edge.metadata),
+            )
+            for edge in model_ir.edges
+        ],
+        metadata=dict(model_ir.metadata),
+    )
+
+
+def _edge_bytes(edge: TensorEdge, *, precision: str) -> float:
+    rows = edge.metadata.get("tensors", ())
+    if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes)):
+        tensor_rows = [row for row in rows if isinstance(row, Mapping)]
+        if tensor_rows:
+            value = sum(_row_bytes(row, precision=precision) for row in tensor_rows)
+            if value > 0.0:
+                return float(value)
+    return float(edge.size_bytes)
 
 
 def _default_system_factory(
