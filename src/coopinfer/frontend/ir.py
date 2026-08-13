@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
@@ -136,9 +137,29 @@ class SchedulingIR:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        indegree = {node_id: 0 for node_id in self.nodes}
+        adjacency: Dict[str, list[str]] = defaultdict(list)
         for edge in self.edges:
             if edge.source not in self.nodes or edge.target not in self.nodes:
                 raise ValueError(
                     f"Scheduling edge references unknown node: "
                     f"{edge.source}->{edge.target}"
                 )
+            if float(edge.size_bytes) < 0:
+                raise ValueError(
+                    f"Scheduling edge {edge.source}->{edge.target} has negative size"
+                )
+            indegree[edge.target] += 1
+            adjacency[edge.source].append(edge.target)
+
+        queue = deque(node_id for node_id, degree in indegree.items() if degree == 0)
+        visited = 0
+        while queue:
+            current = queue.popleft()
+            visited += 1
+            for nxt in adjacency.get(current, ()):
+                indegree[nxt] -= 1
+                if indegree[nxt] == 0:
+                    queue.append(nxt)
+        if visited != len(self.nodes):
+            raise ValueError("SchedulingIR contains a cycle; DAG required")
