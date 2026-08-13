@@ -19,6 +19,13 @@ from .ir import (
     SchedulingNode,
     TensorEdge,
 )
+from .layerwise import (
+    LayerGroup,
+    LayerGrouping,
+    build_layer_scheduling_ir,
+    detect_layer_groups,
+    layer_mapping_dict,
+)
 from .torch_export import capture_exported_program, capture_model
 
 __all__ = [
@@ -26,6 +33,8 @@ __all__ = [
     "DependencyAwarePolicy",
     "DependencyAnalysisConfig",
     "IRNode",
+    "LayerGroup",
+    "LayerGrouping",
     "ModelIR",
     "SchedulingEdge",
     "SchedulingIR",
@@ -33,9 +42,12 @@ __all__ = [
     "TensorEdge",
     "analyze_dependencies",
     "annotate_synthetic_costs",
+    "build_layer_scheduling_ir",
     "capture_exported_program",
     "capture_model",
+    "detect_layer_groups",
     "identity_scheduling_ir",
+    "layer_mapping_dict",
     "load_model_ir_json",
     "model_ir_from_dict",
     "model_ir_to_dict",
