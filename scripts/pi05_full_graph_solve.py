@@ -121,7 +121,9 @@ def main() -> None:
                 if row:
                     print(
                         f"cost_audit[{side}][{stage}]: "
-                        f"nodes={row['node_count']} "
+                        f"runtime_nodes={row['node_count']} "
+                        f"classified_nodes={row.get('classified_node_count', row['node_count'])} "
+                        f"excluded_source_nodes={row.get('excluded_source_nodes', 0)} "
                         f"profile_total_ms={row['profile_total_ms']:.6f} "
                         f"allocated_total_ms={row['allocated_total_ms']:.6f}"
                     )
