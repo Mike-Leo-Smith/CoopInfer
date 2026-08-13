@@ -9,6 +9,7 @@ from .base import (
     annotate_costs,
 )
 from .genz import GenZCostBackend, NodeWork, annotate_genz_costs, infer_node_work
+from .layer_genz import LayerWork, annotate_layer_genz_costs, infer_layer_work
 from .vla_perf_profile import (
     VlaPerfPi05FineCostBackend,
     annotate_vla_perf_profile_costs,
@@ -20,11 +21,14 @@ __all__ = [
     "CostEstimate",
     "CostTarget",
     "GenZCostBackend",
+    "LayerWork",
     "MappingCostBackend",
     "NodeWork",
     "VlaPerfPi05FineCostBackend",
     "annotate_costs",
     "annotate_genz_costs",
+    "annotate_layer_genz_costs",
     "annotate_vla_perf_profile_costs",
+    "infer_layer_work",
     "infer_node_work",
 ]
