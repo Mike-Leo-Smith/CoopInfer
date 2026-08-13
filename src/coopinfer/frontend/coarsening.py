@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set, Tuple
-
-import networkx as nx
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .ir import (
     ModelIR,
@@ -27,6 +25,9 @@ class DependencyAwarePolicy(CoarseningPolicy):
     simple one-producer/one-consumer chains. Fan-out, joins, model I/O, explicit
     hard boundaries, placement conflicts, and optional module-scope changes are
     preserved as scheduling boundaries.
+
+    networkx is imported lazily inside ``apply`` so graph capture and cost-only
+    workflows do not need scheduler/coarsening dependencies installed.
     """
 
     max_ops_per_group: int = 16
@@ -41,6 +42,14 @@ class DependencyAwarePolicy(CoarseningPolicy):
             raise ValueError("max_group_cost_ms must be positive")
 
     def apply(self, model_ir: ModelIR) -> SchedulingIR:
+        try:
+            import networkx as nx
+        except ImportError as exc:
+            raise RuntimeError(
+                "Dependency-aware coarsening requires networkx. Install CoopInfer "
+                "runtime dependencies before running the coarsening stage."
+            ) from exc
+
         model_ir.validate()
         graph = nx.DiGraph()
         graph.add_nodes_from(model_ir.nodes)
@@ -122,7 +131,7 @@ class DependencyAwarePolicy(CoarseningPolicy):
     def _can_merge(
         self,
         model_ir: ModelIR,
-        graph: nx.DiGraph,
+        graph: Any,
         current: str,
         nxt: str,
         members: Sequence[str],
