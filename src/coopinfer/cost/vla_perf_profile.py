@@ -13,6 +13,8 @@ from .base import CostBackend, CostEstimate, CostTarget, annotate_costs
 class StageAllocation:
     stage: str
     node_count: int
+    classified_node_count: int
+    excluded_source_nodes: int
     total_ms: float
     per_node_ms: float
 
@@ -23,12 +25,20 @@ class VlaPerfPi05FineCostBackend(CostBackend):
     VLA-Perf currently reports aggregate latency for the VLM transformer and one
     Action-Expert pass. This backend preserves those aggregate totals exactly by
     distributing each total uniformly over the fine-grained torch.export nodes
-    that belong to that modeled component. Structural/wrapper operations that
-    VLA-Perf does not model receive zero cost.
+    that become runtime compute tasks in CoopInfer.
 
-    This is intentionally a bridge backend, not the final direct op-level GenZ
-    mapper. It lets the full fine graph exercise the real CostBackend interface
-    now while keeping the total modeled latency consistent with VLA-Perf.
+    A subtle but important rule is that an exported op with no incoming ModelIR
+    edge is not charged here. CoopInfer treats all in-degree-zero DAG nodes as
+    source events with zero runtime, so assigning cost to such a node would make
+    the allocation audit look correct while the evaluator silently ignores that
+    cost. In the torch.export graph these nodes are commonly parameter-only or
+    constant-derived helper transforms whose parameter placeholders were removed
+    from ModelIR. Their share is therefore redistributed over the stage's actual
+    runtime compute nodes.
+
+    Structural/wrapper operations that VLA-Perf does not model also receive zero
+    cost. This remains a bridge backend, not the final direct op-level GenZ
+    mapper.
     """
 
     SOURCE = "vla-perf-stage-normalized"
@@ -41,10 +51,24 @@ class VlaPerfPi05FineCostBackend(CostBackend):
             str(profile["hardware"]["device"]): "device",
             str(profile["hardware"]["host"]): "host",
         }
+
+        incoming_count = {node_id: 0 for node_id in model_ir.nodes}
+        for edge in model_ir.edges:
+            incoming_count[edge.target] += 1
+
         self._node_stage = {
             node.id: self.classify_stage(node) for node in model_ir.nodes.values()
         }
-        self._stage_nodes: Dict[str, tuple[str, ...]] = {
+        self._runtime_node = {
+            node.id: (
+                node.kind == "op"
+                and incoming_count[node.id] > 0
+                and self._node_stage[node.id] in {"vlm", "ae"}
+            )
+            for node in model_ir.nodes.values()
+        }
+
+        self._classified_stage_nodes: Dict[str, tuple[str, ...]] = {
             stage: tuple(
                 node_id
                 for node_id, node_stage in self._node_stage.items()
@@ -52,10 +76,18 @@ class VlaPerfPi05FineCostBackend(CostBackend):
             )
             for stage in ("vlm", "ae")
         }
+        self._stage_nodes: Dict[str, tuple[str, ...]] = {
+            stage: tuple(
+                node_id
+                for node_id in self._classified_stage_nodes[stage]
+                if self._runtime_node[node_id]
+            )
+            for stage in ("vlm", "ae")
+        }
         for stage in ("vlm", "ae"):
             if not self._stage_nodes[stage]:
                 raise ValueError(
-                    f"Fine pi0.5 graph contains no nodes classified as {stage!r}"
+                    f"Fine pi0.5 graph contains no runtime nodes classified as {stage!r}"
                 )
 
         self._allocations: Dict[str, Dict[str, StageAllocation]] = {}
@@ -68,9 +100,12 @@ class VlaPerfPi05FineCostBackend(CostBackend):
             self._allocations[side] = {}
             for stage, total in totals.items():
                 count = len(self._stage_nodes[stage])
+                classified_count = len(self._classified_stage_nodes[stage])
                 self._allocations[side][stage] = StageAllocation(
                     stage=stage,
                     node_count=count,
+                    classified_node_count=classified_count,
+                    excluded_source_nodes=classified_count - count,
                     total_ms=total,
                     per_node_ms=total / count,
                 )
@@ -99,6 +134,18 @@ class VlaPerfPi05FineCostBackend(CostBackend):
                 },
             )
 
+        if not self._runtime_node.get(node.id, False):
+            return CostEstimate(
+                0.0,
+                self.SOURCE,
+                {
+                    "stage": stage,
+                    "profile_side": side,
+                    "modeled": False,
+                    "allocation": "source-like-zero",
+                },
+            )
+
         allocation = self._allocations[side][stage]
         return CostEstimate(
             allocation.per_node_ms,
@@ -107,7 +154,7 @@ class VlaPerfPi05FineCostBackend(CostBackend):
                 "stage": stage,
                 "profile_side": side,
                 "modeled": True,
-                "allocation": "uniform-within-stage",
+                "allocation": "uniform-runtime-nodes-within-stage",
                 "stage_total_ms": allocation.total_ms,
                 "stage_node_count": allocation.node_count,
             },
@@ -120,6 +167,8 @@ class VlaPerfPi05FineCostBackend(CostBackend):
             for stage, allocation in stages.items():
                 result[side][stage] = {
                     "node_count": allocation.node_count,
+                    "classified_node_count": allocation.classified_node_count,
+                    "excluded_source_nodes": allocation.excluded_source_nodes,
                     "profile_total_ms": allocation.total_ms,
                     "allocated_total_ms": allocation.per_node_ms
                     * allocation.node_count,
