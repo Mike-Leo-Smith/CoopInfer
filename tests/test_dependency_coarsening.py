@@ -105,3 +105,32 @@ def test_scored_policy_keeps_marked_boundary_between_groups():
 
     assert member_to_group["a"] != member_to_group["b"]
     assert member_to_group["b"] != member_to_group["c"]
+
+
+def test_scored_policy_rejects_contraction_that_would_cycle_quotient():
+    # If {a,b,c} were contracted, the outside path a->x->c would become
+    # group->x->group. The policy must stop before absorbing c.
+    ir = ModelIR.from_parts(
+        [_costed_node(name) for name in ("a", "b", "x", "c")],
+        [
+            TensorEdge("a", "b", 1024),
+            TensorEdge("a", "x", 1024),
+            TensorEdge("b", "c", 1024),
+            TensorEdge("x", "c", 1024),
+        ],
+    )
+    analyzed = analyze_dependencies(
+        ir,
+        config=DependencyAnalysisConfig(boundary_threshold=0.99),
+    )
+    schedule = DependencyAwarePolicy(
+        max_ops_per_group=4,
+        min_merge_affinity=0.0,
+    ).apply(analyzed)
+    member_to_group = {
+        member: group_id
+        for group_id, group in schedule.nodes.items()
+        for member in group.members
+    }
+
+    assert member_to_group["a"] != member_to_group["c"]
