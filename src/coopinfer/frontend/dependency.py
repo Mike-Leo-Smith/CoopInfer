@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Dict, Iterable, Mapping, Sequence, Tuple
+from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 from .ir import ModelIR, TensorEdge
 
@@ -75,7 +75,7 @@ class DependencyAnalysisConfig:
 def analyze_dependencies(
     model_ir: ModelIR,
     *,
-    config: DependencyAnalysisConfig | None = None,
+    config: Optional[DependencyAnalysisConfig] = None,
 ) -> ModelIR:
     """Annotate a costed fine ModelIR with generic scheduling-boundary scores.
 
@@ -109,6 +109,9 @@ def analyze_dependencies(
     if not nx.is_directed_acyclic_graph(graph):
         raise ValueError("Dependency analysis requires a DAG")
 
+    # Work on clones so dependency analysis is a pure ModelIR -> ModelIR stage.
+    nodes = {node_id: node.clone() for node_id, node in model_ir.nodes.items()}
+
     topo = list(nx.topological_sort(graph))
     topo_index = {node_id: index for index, node_id in enumerate(topo)}
     topo_denominator = max(1, len(topo) - 1)
@@ -116,12 +119,12 @@ def analyze_dependencies(
     resources = sorted(
         {
             resource
-            for node in model_ir.nodes.values()
+            for node in nodes.values()
             for resource in node.costs_ms
         }
     )
     avg_cost = {
-        node_id: _average_cost(model_ir.nodes[node_id].costs_ms)
+        node_id: _average_cost(nodes[node_id].costs_ms)
         for node_id in topo
     }
     cost_scale = _percentile(avg_cost.values(), 0.95)
@@ -142,7 +145,7 @@ def analyze_dependencies(
 
     critical_path = max(upward.values(), default=0.0)
     signatures = {
-        node_id: _cost_signature(model_ir.nodes[node_id].costs_ms, resources)
+        node_id: _cost_signature(nodes[node_id].costs_ms, resources)
         for node_id in topo
     }
 
@@ -150,10 +153,14 @@ def analyze_dependencies(
     for node_id in topo:
         through = downward[node_id] + upward[node_id] - avg_cost[node_id]
         slack = max(0.0, critical_path - through)
-        criticality = 1.0 - _robust_unit(slack, critical_path)
+        criticality = (
+            1.0 - _robust_unit(slack, critical_path)
+            if critical_path > 0.0
+            else 0.0
+        )
         node_criticality[node_id] = criticality
 
-        node = model_ir.nodes[node_id]
+        node = nodes[node_id]
         dep = dict(node.metadata.get("dependency", {}))
         dep.update(
             {
@@ -177,7 +184,10 @@ def analyze_dependencies(
         src = edge.source
         dst = edge.target
         span = max(0.0, (topo_index[dst] - topo_index[src]) / topo_denominator)
-        size_norm = _robust_unit(math.log1p(float(edge.size_bytes)), math.log1p(edge_size_scale))
+        size_norm = _robust_unit(
+            math.log1p(float(edge.size_bytes)),
+            math.log1p(edge_size_scale),
+        )
         fanout = min(1.0, max(0, graph.out_degree(src) - 1) / 3.0)
         join = min(1.0, max(0, graph.in_degree(dst) - 1) / 3.0)
         criticality = min(node_criticality[src], node_criticality[dst])
@@ -251,7 +261,7 @@ def analyze_dependencies(
         )
 
     result = ModelIR.from_parts(
-        [node.clone() for node in model_ir.nodes.values()],
+        nodes.values(),
         annotated_edges,
         metadata=dict(model_ir.metadata),
     )
