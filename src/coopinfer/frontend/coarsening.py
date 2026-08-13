@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from .ir import (
     ModelIR,
@@ -10,6 +10,9 @@ from .ir import (
     SchedulingIR,
     SchedulingNode,
 )
+
+
+EdgeScore = Dict[str, Union[float, bool]]
 
 
 class CoarseningPolicy:
@@ -24,8 +27,8 @@ class DependencyAwarePolicy(CoarseningPolicy):
     With an unannotated ModelIR this policy keeps the earlier conservative
     behavior and merges only strict 1->1 chains. After ``analyze_dependencies``
     it may also contract low-value local fan-out/join edges, but it preserves
-    edges marked as scheduling boundaries and never contracts an unsafe edge
-    that can encode an alternate path through both a fan-out and a join.
+    edges marked as scheduling boundaries and rejects contractions that would
+    introduce a cycle in the quotient DAG.
 
     The policy is model agnostic: it consumes graph/cost annotations only.
     """
@@ -167,8 +170,8 @@ class DependencyAwarePolicy(CoarseningPolicy):
         return result
 
     @staticmethod
-    def _build_edge_scores(model_ir: ModelIR) -> Dict[Tuple[str, str], Dict[str, float | bool]]:
-        scores: Dict[Tuple[str, str], Dict[str, float | bool]] = {}
+    def _build_edge_scores(model_ir: ModelIR) -> Dict[Tuple[str, str], EdgeScore]:
+        scores: Dict[Tuple[str, str], EdgeScore] = {}
         for edge in model_ir.edges:
             dep = edge.metadata.get("dependency", {})
             if not isinstance(dep, dict):
@@ -202,7 +205,7 @@ class DependencyAwarePolicy(CoarseningPolicy):
         current: str,
         nxt: str,
         members: Sequence[str],
-        edge_scores: Dict[Tuple[str, str], Dict[str, float | bool]],
+        edge_scores: Dict[Tuple[str, str], EdgeScore],
         dependency_scored: bool,
     ) -> bool:
         current_node = model_ir.nodes[current]
@@ -247,13 +250,35 @@ class DependencyAwarePolicy(CoarseningPolicy):
         if float(dep.get("merge_affinity", 0.0)) < self.min_merge_affinity:
             return False
 
-        # Contracting an edge where the source fans out AND the destination joins
-        # can collapse an alternate source->...->destination path and create a
-        # cycle in the quotient graph. At least one side must therefore be linear.
-        if graph.out_degree(current) > 1 and graph.in_degree(nxt) > 1:
+        if self._would_create_quotient_cycle(graph, members, nxt):
             return False
 
         return True
+
+    @staticmethod
+    def _would_create_quotient_cycle(graph: Any, members: Sequence[str], nxt: str) -> bool:
+        """Return True if contracting ``members + [nxt]`` would create a DAG cycle.
+
+        In a DAG this happens when an earlier group member also reaches ``nxt``
+        through nodes outside the proposed group. After contraction that outside
+        path would become group -> ... -> group.
+        """
+
+        group = set(members)
+        candidate = group | {nxt}
+        external_predecessors = [
+            pred for pred in graph.predecessors(nxt) if pred not in candidate
+        ]
+        if not external_predecessors:
+            return False
+
+        for member in group:
+            for pred in external_predecessors:
+                if graph.has_edge(member, pred) or __import__("networkx").has_path(
+                    graph, member, pred
+                ):
+                    return True
+        return False
 
     def _reference_cost(self, node) -> float:
         if not node.costs_ms:
@@ -294,7 +319,11 @@ class DependencyAwarePolicy(CoarseningPolicy):
         name = members[0] if len(members) == 1 else f"{members[0]}..{members[-1]}"
         criticality = max(
             (
-                float(model_ir.nodes[member].metadata.get("dependency", {}).get("criticality", 0.0))
+                float(
+                    model_ir.nodes[member]
+                    .metadata.get("dependency", {})
+                    .get("criticality", 0.0)
+                )
                 for member in members
             ),
             default=0.0,
