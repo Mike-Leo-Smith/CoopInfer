@@ -2,6 +2,7 @@
 
 from .coarsening import CoarseningPolicy, DependencyAwarePolicy
 from .coopinfer_export import to_coopinfer_payload
+from .dependency import DependencyAnalysisConfig, analyze_dependencies
 from .full_graph import (
     annotate_synthetic_costs,
     identity_scheduling_ir,
@@ -23,12 +24,14 @@ from .torch_export import capture_exported_program, capture_model
 __all__ = [
     "CoarseningPolicy",
     "DependencyAwarePolicy",
+    "DependencyAnalysisConfig",
     "IRNode",
     "ModelIR",
     "SchedulingEdge",
     "SchedulingIR",
     "SchedulingNode",
     "TensorEdge",
+    "analyze_dependencies",
     "annotate_synthetic_costs",
     "capture_exported_program",
     "capture_model",
