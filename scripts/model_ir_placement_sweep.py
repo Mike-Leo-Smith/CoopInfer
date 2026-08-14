@@ -97,11 +97,6 @@ def _result_row(
         for record in result.transfer_records
     )
     transfer_mb = sum(float(record.size_mb) for record in result.transfer_records)
-    cross_device_edges = sum(
-        1
-        for source, target in result.start_times.keys()  # placeholder overwritten below
-        if False
-    )
     return {
         "offload_layers": int(offload_count),
         "device_layer_indices": device_target_layers,
