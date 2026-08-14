@@ -22,6 +22,22 @@ Use these entry points for the current production/research path:
 
 The detailed workflow and validation commands are documented in `docs/vla_pipeline.md`.
 
+### Model Stage-1 adapters
+
+`pi05_export_probe.py` is now the single pi0.5 Stage-1 adapter. Despite the historical filename, it no longer exposes the old `qkv`, `prefix`, or `prefix_ae` debug modes. It captures the complete model tensor-input path used for structural scheduling analysis:
+
+```text
+images + language/token inputs
+        -> vision frontend / multimodal projection
+        -> prefix VLM prefill + KV cache
+        -> one Action Expert denoise step
+        -> Fine ModelIR
+```
+
+The number of denoise iterations is stored as workload metadata; Stage 1 captures one denoise execution rather than statically duplicating the same Expert layers N times.
+
+`smolvla_export_probe.py` follows the same one-step structural scope.
+
 ## Experiment helpers / references
 
 The remaining scripts are not additional required pipeline stages. They are retained for controlled experiments or historical reference, for example:
@@ -31,8 +47,7 @@ The remaining scripts are not additional required pipeline stages. They are reta
 - `model_ir_genz_cost.py`: Fine-graph GenZ costing reference;
 - `model_ir_coarsen.py`: generic coarsening experiments;
 - `model_ir_solve.py`: legacy Full-Graph reference path;
-- `pi05_full_graph_solve.py`: pi0.5 Full-Graph reference;
 - `profile_pi05_vla_perf.py`: VLA-Perf/pi0.5 profiling experiments;
 - `generic_frontend_smoke.py`: small generic frontend smoke test.
 
-Development-only dependency/frontier/ingress/min-cut/ownership audit CLIs were removed after the validated causal dependency and ownership-boundary logic was promoted into `src/coopinfer/frontend/layer_graph.py`.
+The old pi0.5 `qkv` / `prefix` / `prefix_ae` probe implementation, its dedicated frontend helper, and the pi0.5-specific Full-Graph solve wrapper were removed. Development-only dependency/frontier/ingress/min-cut/ownership audit CLIs were also removed after the validated causal dependency and ownership-boundary logic was promoted into `src/coopinfer/frontend/layer_graph.py`.
