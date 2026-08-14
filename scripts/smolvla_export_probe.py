@@ -33,8 +33,8 @@ def _default_output(repo_root: Path, mode: str, vlm_layers: int, expert_layers: 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Random-init SmolVLA torch.export probe. No pretrained checkpoint is loaded. "
-            "The preferred mode captures prefix computation plus one inference denoise step."
+            "Stage-1 SmolVLA torch.export adapter using random-init weights and local metadata. "
+            "It captures Fine ModelIR only; Layer Graph Analysis is a separate Stage-2 command."
         )
     )
     parser.add_argument(
@@ -54,11 +54,21 @@ def main() -> None:
         default="inference_one_step",
         help=(
             "inference_one_step: prefix KV build + one cached AE denoise pass; "
-            "joint_forward: one training-style prefix+suffix pass without cache, useful as a fallback."
+            "joint_forward: one training-style prefix+suffix pass without cache."
         ),
     )
-    parser.add_argument("--vlm-layers", type=int, default=16)
-    parser.add_argument("--expert-layers", type=int, default=16)
+    parser.add_argument(
+        "--vlm-layers",
+        type=int,
+        default=None,
+        help="Optional debug truncation. Omit to use the native LeRobot SmolVLAConfig value.",
+    )
+    parser.add_argument(
+        "--expert-layers",
+        type=int,
+        default=None,
+        help="Optional debug truncation. Omit to use the native LeRobot SmolVLAConfig value.",
+    )
     parser.add_argument("--num-images", type=int, default=3)
     parser.add_argument("--image-size", type=int, default=512)
     parser.add_argument("--lang-len", type=int, default=48)
@@ -69,20 +79,24 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
 
-    if args.vlm_layers < 1 or args.expert_layers < 1:
-        raise ValueError("--vlm-layers and --expert-layers must be positive")
-    if args.vlm_layers % args.expert_layers != 0:
+    if args.vlm_layers is not None and args.vlm_layers < 1:
+        raise ValueError("--vlm-layers must be positive when provided")
+    if args.expert_layers is not None and args.expert_layers < 1:
+        raise ValueError("--expert-layers must be positive when provided")
+    if (
+        args.vlm_layers is not None
+        and args.expert_layers is not None
+        and args.vlm_layers % args.expert_layers != 0
+    ):
         raise ValueError(
-            "SmolVLA requires VLM layer count to be divisible by expert layer count "
-            f"when --expert-layers is explicit: {args.vlm_layers} % {args.expert_layers} != 0"
+            "SmolVLA requires explicit VLM layer count to be divisible by explicit expert layer count: "
+            f"{args.vlm_layers} % {args.expert_layers} != 0"
         )
     if args.num_images < 1:
         raise ValueError("--num-images must be >= 1")
     if not args.metadata_dir.exists():
         raise FileNotFoundError(f"metadata directory not found: {args.metadata_dir}")
 
-    # Make this probe deterministic and offline. The metadata path is local and
-    # load_vlm_weights=False, so no pretrained checkpoint is requested.
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -94,43 +108,46 @@ def main() -> None:
     import torch
     from torch import nn
 
-    from coopinfer.frontend import (
-        capture_model,
-        detect_layer_groups,
-        discover_layer_dependencies,
-        layer_dependency_summary,
-        write_model_ir_json,
-    )
+    from coopinfer.frontend import capture_model, write_model_ir_json
     from lerobot.policies.common.vla_utils import make_att_2d_masks
     from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
     from lerobot.policies.smolvla.modeling_smolvla import VLAFlowMatching
 
     torch.manual_seed(0)
 
-    config = SmolVLAConfig(
-        device="cpu",
-        vlm_model_name=str(args.metadata_dir.resolve()),
-        load_vlm_weights=False,
-        num_vlm_layers=args.vlm_layers,
-        num_expert_layers=args.expert_layers,
-        chunk_size=args.chunk_size,
-        n_action_steps=args.chunk_size,
-        tokenizer_max_length=args.lang_len,
-        max_state_dim=args.state_dim,
-        max_action_dim=args.action_dim,
-        resize_imgs_with_padding=(args.image_size, args.image_size),
-        use_cache=True,
-        compile_model=False,
-    )
+    config_kwargs = {
+        "device": "cpu",
+        "vlm_model_name": str(args.metadata_dir.resolve()),
+        "load_vlm_weights": False,
+        "chunk_size": args.chunk_size,
+        "n_action_steps": args.chunk_size,
+        "tokenizer_max_length": args.lang_len,
+        "max_state_dim": args.state_dim,
+        "max_action_dim": args.action_dim,
+        "resize_imgs_with_padding": (args.image_size, args.image_size),
+        "use_cache": True,
+        "compile_model": False,
+    }
+    if args.vlm_layers is not None:
+        config_kwargs["num_vlm_layers"] = args.vlm_layers
+    if args.expert_layers is not None:
+        config_kwargs["num_expert_layers"] = args.expert_layers
+    config = SmolVLAConfig(**config_kwargs)
 
-    print("===== SmolVLA random-init construction =====")
+    print("===== Stage 1: SmolVLA torch.export =====")
     print(f"torch={torch.__version__}")
     print(f"lerobot_root={args.lerobot_root.resolve()}")
     print(f"metadata_dir={args.metadata_dir.resolve()}")
     print("pretrained_weights=False")
     print(f"mode={args.mode}")
-    print(f"requested_vlm_layers={args.vlm_layers}")
-    print(f"requested_expert_layers={args.expert_layers}")
+    print(
+        "requested_vlm_layers="
+        + ("native" if args.vlm_layers is None else str(args.vlm_layers))
+    )
+    print(
+        "requested_expert_layers="
+        + ("native" if args.expert_layers is None else str(args.expert_layers))
+    )
 
     core = VLAFlowMatching(config)
     core.eval()
@@ -245,7 +262,6 @@ def main() -> None:
             timestep,
         )
 
-    print("===== torch.export capture =====")
     model_ir = capture_model(wrapper, args=export_args, strict=False)
     model_ir.metadata.update(
         {
@@ -273,37 +289,10 @@ def main() -> None:
     )
     write_model_ir_json(model_ir, output)
 
-    grouping = detect_layer_groups(model_ir)
-    dependencies = discover_layer_dependencies(model_ir, grouping)
-    summary = layer_dependency_summary(dependencies)
-
-    layer_groups = [group for group in grouping.groups.values() if group.kind == "layer"]
     print(f"fine_nodes={len(model_ir.nodes)}")
     print(f"fine_edges={len(model_ir.edges)}")
-    print(f"detected_layer_stacks={len(grouping.stack_layers)}")
-    for index, (root, layers) in enumerate(grouping.stack_layers.items()):
-        print(f"  stack[{index}] root={root} layers={list(layers)} count={len(layers)}")
-    print(f"detected_layer_nodes={len(layer_groups)}")
-    print(f"layer_frontier_dependencies={summary['layer_frontier_dependencies']}")
-    print(f"cross_stack_dependencies={summary['cross_stack_dependencies']}")
-    print(f"same_index_cross_stack_dependencies={summary['same_index_cross_stack_dependencies']}")
-
-    cross = [dependency for dependency in dependencies if dependency.cross_stack]
-    if cross:
-        print("cross_stack_edges:")
-        for dependency in cross:
-            print(
-                "  "
-                f"{dependency.source_layer} -> {dependency.target_layer} "
-                f"glue_hops={dependency.glue_hops} "
-                f"{dependency.source_stack} -> {dependency.target_stack}"
-            )
-    else:
-        print("cross_stack_edges: none")
-
     print(f"model_ir={output}")
-    print("genz=not_run")
-    print("solver=not_run")
+    print("next_stage=python scripts/model_ir_layer_analysis.py <model_ir> --precision bf16")
 
 
 if __name__ == "__main__":
