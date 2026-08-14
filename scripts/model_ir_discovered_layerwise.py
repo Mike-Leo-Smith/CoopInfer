@@ -91,8 +91,8 @@ def main() -> None:
     )
     dependencies = discover_layer_dependencies(model_ir, grouping)
 
-    # This intermediate object is used only as a cost table. Its old quotient
-    # edges/aux-region topology are NOT passed to the solver.
+    # Cost table only: deliberately do NOT build the old aux-region quotient
+    # topology here. The discovered-layer pipeline owns its own DAG topology.
     costed_groups = annotate_layer_genz_costs(
         model_ir,
         grouping,
@@ -100,6 +100,7 @@ def main() -> None:
         precision=args.precision,
         compute_efficiency=args.compute_efficiency,
         memory_efficiency=args.memory_efficiency,
+        cost_only=True,
     )
 
     layer_ir = build_discovered_layer_scheduling_ir(
@@ -145,17 +146,6 @@ def main() -> None:
         )
         for resource in ("device", "host")
     }
-    full_group_totals = {
-        resource: sum(
-            float(node.costs_ms.get(resource, 0.0))
-            for node in costed_groups.nodes.values()
-        )
-        for resource in ("device", "host")
-    }
-    excluded = {
-        resource: full_group_totals[resource] - layer_only_totals[resource]
-        for resource in ("device", "host")
-    }
 
     cross = [dependency for dependency in dependencies if dependency.cross_stack]
     same_index = [
@@ -186,14 +176,9 @@ def main() -> None:
     print("solver_graph_dag=True")
     print("dependency_edges_written_into_solver_graph=True")
     print("old_aux_region_quotient_graph_used_by_solver=False")
-    print(
-        f"layer_cost_total_device_ms={layer_only_totals['device']:.6f} "
-        f"excluded_nonlayer_ms={excluded['device']:.6f}"
-    )
-    print(
-        f"layer_cost_total_host_ms={layer_only_totals['host']:.6f} "
-        f"excluded_nonlayer_ms={excluded['host']:.6f}"
-    )
+    print("old_aux_region_quotient_graph_used_by_costing=False")
+    print(f"layer_cost_total_device_ms={layer_only_totals['device']:.6f}")
+    print(f"layer_cost_total_host_ms={layer_only_totals['host']:.6f}")
     print(f"network={args.bandwidth_mb_s} MB/s + {args.latency_ms} ms/transfer")
 
     print("cross_stack_edges:")
