@@ -106,7 +106,31 @@ Stage 3 uses the same `LayerGraphIR` boundary semantics validated in Stage 2.
 
 ## Stage 4 - CoopInfer Solver
 
-The solver consumes the costed SchedulingIR / CoopInfer JSON and searches placement and execution schedules. Solver policy is intentionally separated from model parsing and cost construction, so the same frontend can be evaluated with different search methods.
+The solver consumes the `*_coopinfer.json` produced by Stage 3 and searches placement and execution schedules. Solver policy is intentionally separated from model parsing and cost construction, so the same frontend can be evaluated with different search methods.
+
+Canonical CLI:
+
+```powershell
+python .\scripts\coopinfer_solve.py `
+  <fine_model_ir_stem>_coopinfer.json `
+  --algorithm "Random Search" `
+  --heuristic-iterations 3000
+```
+
+The network configuration stored by Stage 3 is used by default; `--bandwidth-mb-s` and `--latency-ms` can override it for sensitivity studies.
+
+## Canonical scripts
+
+The production VLA path is now centered on these scripts:
+
+```text
+Stage 1  model_ir_export.py / pi05_export_probe.py / smolvla_export_probe.py
+Stage 2  model_ir_layer_analysis.py
+Stage 3  model_ir_build_scheduling.py
+Stage 4  coopinfer_solve.py
+```
+
+Placement/network sweep scripts remain useful experiment helpers. The old dependency, ingress, min-cut, frontier-payload, ownership-audit, and legacy layerwise CLIs have been removed after their validated logic was promoted into the library.
 
 ## Regression tests
 
