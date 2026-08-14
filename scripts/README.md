@@ -7,7 +7,7 @@ Use these entry points for the current production/research path:
 ```text
 1. torch.export
    model_ir_export.py
-   pi05_export_probe.py
+   pi05_export.py
    smolvla_export_probe.py
 
 2. Layer Graph Analysis
@@ -24,7 +24,7 @@ The detailed workflow and validation commands are documented in `docs/vla_pipeli
 
 ### Model Stage-1 adapters
 
-`pi05_export_probe.py` is now the single pi0.5 Stage-1 adapter. Despite the historical filename, it no longer exposes the old `qkv`, `prefix`, or `prefix_ae` debug modes. It captures the complete model tensor-input path used for structural scheduling analysis:
+`pi05_export.py` is the single pi0.5 Stage-1 adapter. The old `qkv`, `prefix`, and `prefix_ae` debug modes and their dedicated helper have been removed. It captures the complete model tensor-input path used for structural scheduling analysis:
 
 ```text
 images + language/token inputs
@@ -50,4 +50,4 @@ The remaining scripts are not additional required pipeline stages. They are reta
 - `profile_pi05_vla_perf.py`: VLA-Perf/pi0.5 profiling experiments;
 - `generic_frontend_smoke.py`: small generic frontend smoke test.
 
-The old pi0.5 `qkv` / `prefix` / `prefix_ae` probe implementation, its dedicated frontend helper, and the pi0.5-specific Full-Graph solve wrapper were removed. Development-only dependency/frontier/ingress/min-cut/ownership audit CLIs were also removed after the validated causal dependency and ownership-boundary logic was promoted into `src/coopinfer/frontend/layer_graph.py`.
+The old pi0.5 `qkv` / `prefix` / `prefix_ae` probe entrypoint, its dedicated frontend helper, and the pi0.5-specific Full-Graph solve wrapper were removed. Development-only dependency/frontier/ingress/min-cut/ownership audit CLIs were also removed after the validated causal dependency and ownership-boundary logic was promoted into `src/coopinfer/frontend/layer_graph.py`.
