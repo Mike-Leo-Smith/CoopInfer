@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Mapping, Sequence, Tuple
 
 from .ir import (
     ModelIR,
@@ -105,8 +105,7 @@ def _build_scheduling_ir(
     model_ir: ModelIR,
     grouping: LayerGrouping,
     dependencies: Sequence[LayerDependency],
-    payloads: Dict[Tuple[str, str], LayerBoundaryPayload]
-    | Sequence[Tuple[Tuple[str, str], LayerBoundaryPayload]],
+    payloads: Mapping[Tuple[str, str], LayerBoundaryPayload],
     costed_group_ir: SchedulingIR,
     *,
     precision: str,
