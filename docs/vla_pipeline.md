@@ -45,11 +45,11 @@ PyTorch / Hugging Face model
 
 Model-specific wrappers are allowed only to construct the real inference path and example inputs. The generic frontend receives the resulting Fine ModelIR; it is not given stack roles, layer counts, KV annotations, or split points.
 
-The canonical model adapters are `pi05_export_probe.py` and `smolvla_export_probe.py`.
+The canonical model adapters are `pi05_export.py` and `smolvla_export_probe.py`.
 
 ### pi0.5 Stage-1 scope
 
-The pi0.5 adapter now has one production/research scope only. The old `qkv`, `prefix`, and `prefix_ae` debug modes have been removed.
+The pi0.5 adapter has one production/research scope only. The old `qkv`, `prefix`, and `prefix_ae` debug modes have been removed.
 
 ```text
 model tensor inputs
@@ -75,12 +75,14 @@ Fine ModelIR
 
 The adapter uses native `PI05Config` by default. A local `--config-path` may be supplied to instantiate the same architecture configuration as a checkpoint without loading checkpoint weights. `--num-images` and `--lang-len` are workload inputs, not architecture annotations; when `--lang-len` is omitted the native tokenizer maximum length is used.
 
+Stock pi0.5 puts normalized robot state into the text prompt before tokenization; the optional proprioceptive-memory variant instead passes continuous state history into the backbone. Stage 1 begins at model tensor inputs, so prompt construction/tokenization and image normalization/resizing in the policy processor are outside the exported neural DAG.
+
 One denoise step is captured structurally. `num_inference_steps` and `captured_denoise_steps=1` are recorded in ModelIR metadata so repeated execution can be modeled separately rather than statically cloning the same Expert layer stack in the Fine DAG.
 
 Canonical pi0.5 Stage-1 command:
 
 ```powershell
-python .\scripts\pi05_export_probe.py `
+python .\scripts\pi05_export.py `
   --lerobot-root D:\Project\lerobot-main `
   --num-images 3 `
   --output .\results\pi05_full_pipeline\pi05_fine_ir.json
@@ -165,7 +167,7 @@ The network configuration stored by Stage 3 is used by default; `--bandwidth-mb-
 ## Canonical scripts
 
 ```text
-Stage 1  model_ir_export.py / pi05_export_probe.py / smolvla_export_probe.py
+Stage 1  model_ir_export.py / pi05_export.py / smolvla_export_probe.py
 Stage 2  model_ir_layer_analysis.py
 Stage 3  model_ir_build_scheduling.py
 Stage 4  coopinfer_solve.py
