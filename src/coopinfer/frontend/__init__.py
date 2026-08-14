@@ -4,8 +4,10 @@ from .coarsening import CoarseningPolicy, DependencyAwarePolicy
 from .coopinfer_export import to_coopinfer_payload
 from .dependency import DependencyAnalysisConfig, analyze_dependencies
 from .discovered_layer_schedule import (
+    LayerFrontierPayload,
     build_discovered_layer_scheduling_ir,
     build_layer_graph_scheduling_ir,
+    discover_layer_frontier_payloads,
 )
 from .full_graph import (
     annotate_synthetic_costs,
@@ -52,6 +54,7 @@ __all__ = [
     "IRNode",
     "LayerBoundaryPayload",
     "LayerDependency",
+    "LayerFrontierPayload",
     "LayerGraphIR",
     "LayerGraphValidation",
     "LayerGroup",
@@ -72,6 +75,7 @@ __all__ = [
     "detect_layer_groups",
     "discover_layer_boundary_payloads",
     "discover_layer_dependencies",
+    "discover_layer_frontier_payloads",
     "identity_scheduling_ir",
     "layer_dependency_summary",
     "layer_graph_to_dict",
