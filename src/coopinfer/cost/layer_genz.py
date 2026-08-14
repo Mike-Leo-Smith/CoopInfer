@@ -4,7 +4,14 @@ from dataclasses import dataclass, field
 from math import prod
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
-from coopinfer.frontend.ir import IRNode, ModelIR, SchedulingIR, TensorEdge
+from coopinfer.frontend.ir import (
+    IRNode,
+    ModelIR,
+    PLACEMENT_FREE,
+    SchedulingIR,
+    SchedulingNode,
+    TensorEdge,
+)
 from coopinfer.frontend.layerwise import LayerGrouping, build_layer_scheduling_ir
 
 from .genz import infer_node_work
@@ -136,8 +143,15 @@ def annotate_layer_genz_costs(
     compute_efficiency: float = 1.0,
     memory_efficiency: float = 1.0,
     system_factory: Optional[SystemFactory] = None,
+    cost_only: bool = False,
 ) -> SchedulingIR:
-    """Create a layer SchedulingIR and cost each group once on GenZ systems.
+    """Cost each detected group once with GenZ.
+
+    By default this preserves the original layerwise quotient-graph behavior.
+    With ``cost_only=True`` it returns a topology-free SchedulingIR containing
+    only group nodes and their GenZ costs. That mode is intentionally used by the
+    discovered-layer pipeline so cost estimation cannot inherit cycles from an
+    auxiliary-region quotient graph.
 
     This is deliberately not ``sum(fine_latency)``. The layer workload first
     aggregates arithmetic work and reconstructs layer-external HBM traffic, then
@@ -228,6 +242,60 @@ def annotate_layer_genz_costs(
             "resource_cost_details": resource_meta,
         }
 
+    common_metadata = {
+        "cost_source": "genz-layer-external-roofline",
+        "cost_mode": "layer-workload-roofline",
+        "cost_precision": precision,
+        "cost_hardware": {
+            str(resource): str(hardware) for resource, hardware in targets.items()
+        },
+        "cost_efficiency": {
+            "compute": float(compute_efficiency),
+            "memory": float(memory_efficiency),
+        },
+        "communication_edge_precision": precision,
+    }
+
+    if cost_only:
+        nodes: Dict[str, SchedulingNode] = {}
+        for group_id, group in grouping.groups.items():
+            fixed = {
+                model_ir.nodes[member].placement
+                for member in group.members
+                if model_ir.nodes[member].placement != PLACEMENT_FREE
+            }
+            if len(fixed) > 1:
+                raise ValueError(
+                    f"Layer group {group_id} contains conflicting placements: {fixed}"
+                )
+            placement = next(iter(fixed)) if fixed else PLACEMENT_FREE
+            nodes[group_id] = SchedulingNode(
+                id=group_id,
+                members=tuple(group.members),
+                name=group.display_name,
+                costs_ms=dict(costs[group_id]),
+                placement=placement,
+                metadata={
+                    "abstraction": "layer-cost-table-v1",
+                    "group_kind": group.kind,
+                    "stack_root": group.stack_root,
+                    "layer_index": group.layer_index,
+                    **metadata[group_id],
+                },
+            )
+        result = SchedulingIR(
+            nodes=nodes,
+            edges=(),
+            metadata={
+                **common_metadata,
+                "abstraction": "layer-cost-table-v1",
+                "cost_only": True,
+                "topology_included": False,
+            },
+        )
+        result.validate()
+        return result
+
     # Keep the source Fine ModelIR immutable. A precision-adjusted clone is used
     # only to express layer-boundary communication sizes in the target precision.
     adjusted_ir = _precision_adjusted_model_ir(model_ir, precision=precision)
@@ -237,21 +305,7 @@ def annotate_layer_genz_costs(
         group_costs=costs,
         group_metadata=metadata,
     )
-    result.metadata.update(
-        {
-            "cost_source": "genz-layer-external-roofline",
-            "cost_mode": "layer-workload-roofline",
-            "cost_precision": precision,
-            "cost_hardware": {
-                str(resource): str(hardware) for resource, hardware in targets.items()
-            },
-            "cost_efficiency": {
-                "compute": float(compute_efficiency),
-                "memory": float(memory_efficiency),
-            },
-            "communication_edge_precision": precision,
-        }
-    )
+    result.metadata.update(common_metadata)
     return result
 
 
