@@ -57,16 +57,26 @@ def main() -> None:
     latency = env.latency if args.latency_ms is None else args.latency_ms
     solver_threads = env.solver_threads if args.solver_threads is None else args.solver_threads
 
-    common = {
+    evaluation_common = {
         "bandwidth": bandwidth,
         "latency": latency,
         "weight_avg_latency": env.weight_avg_latency,
         "weight_max_latency": env.weight_max_latency,
         "weight_device_utilization": env.weight_device_utilization,
+        "batch_transfers": env.batch_transfers,
+        "pipeline_unroll": env.pipeline_unroll,
     }
 
-    all_device = evaluate(state.graph, _assignment(state.graph, 0), **common)
-    all_host = evaluate(state.graph, _assignment(state.graph, 1), **common)
+    all_device = evaluate(
+        state.graph,
+        _assignment(state.graph, 0),
+        **evaluation_common,
+    )
+    all_host = evaluate(
+        state.graph,
+        _assignment(state.graph, 1),
+        **evaluation_common,
+    )
 
     print("===== Stage 4: CoopInfer Solver =====")
     print(f"input={args.input}")
@@ -78,13 +88,21 @@ def main() -> None:
 
     result = solve(
         state.graph,
+        bandwidth=bandwidth,
+        latency=latency,
+        weight_avg_latency=env.weight_avg_latency,
+        weight_max_latency=env.weight_max_latency,
+        weight_device_utilization=env.weight_device_utilization,
         algorithm=args.algorithm,
         heuristic_iterations=args.heuristic_iterations,
         seed=args.seed,
+        latency_limit=env.latency_limit,
+        batch_transfers=env.batch_transfers,
+        pipeline_unroll=env.pipeline_unroll,
+        max_frame_latency_limit=env.max_frame_latency_limit,
         solver_threads=solver_threads,
         anneal_initial_temp=env.anneal_initial_temp,
         anneal_final_temp=env.anneal_final_temp,
-        **common,
     )
 
     device_nodes = sum(1 for value in result.assignment.values() if value == 0)
