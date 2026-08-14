@@ -6,9 +6,8 @@ from coopinfer.frontend import (
     SchedulingIR,
     SchedulingNode,
     TensorEdge,
-    build_discovered_layer_scheduling_ir,
-    detect_layer_groups,
-    discover_layer_dependencies,
+    analyze_layer_graph,
+    build_layer_graph_scheduling_ir,
 )
 
 
@@ -36,7 +35,7 @@ def _op(node_id: str, path: str) -> IRNode:
     )
 
 
-def test_discovered_layer_graph_writes_frontier_dependencies_and_stays_dag():
+def test_layer_graph_builds_costed_scheduling_ir_and_stays_dag():
     nodes = [
         IRNode("input", "input", kind="input"),
         _op("a0", "model.backbone.layers.0.attn"),
@@ -59,33 +58,29 @@ def test_discovered_layer_graph_writes_frontier_dependencies_and_stays_dag():
         TensorEdge("b1", "output", 32, "y"),
     ]
     ir = ModelIR.from_parts(nodes, edges)
-    grouping = detect_layer_groups(ir)
-    dependencies = discover_layer_dependencies(ir, grouping)
+    layer_graph = analyze_layer_graph(ir, precision="bf16")
 
-    layer_groups = [group for group in grouping.groups.values() if group.kind == "layer"]
     cost_nodes = {
-        group.id: SchedulingNode(
-            id=group.id,
-            members=group.members,
-            name=group.display_name,
+        group_id: SchedulingNode(
+            id=group_id,
+            members=layer_graph.grouping.groups[group_id].members,
+            name=layer_graph.grouping.groups[group_id].display_name,
             costs_ms={"device": 1.0, "host": 0.5},
         )
-        for group in layer_groups
+        for group_id in layer_graph.layer_ids
     }
     costed = SchedulingIR(nodes=cost_nodes, edges=())
 
-    schedule = build_discovered_layer_scheduling_ir(
-        ir,
-        grouping,
-        dependencies,
-        costed,
-        precision="bf16",
-    )
+    schedule = build_layer_graph_scheduling_ir(layer_graph, costed)
 
     assert len(schedule.nodes) == 5  # 4 real layers + explicit synthetic source
     layer_edges = [edge for edge in schedule.edges if not edge.source.startswith("__")]
     assert len(layer_edges) == 4
 
+    layer_groups = [
+        layer_graph.grouping.groups[group_id]
+        for group_id in layer_graph.layer_ids
+    ]
     by_name = {group.display_name: group.id for group in layer_groups}
     cross0 = next(
         edge
@@ -93,10 +88,9 @@ def test_discovered_layer_graph_writes_frontier_dependencies_and_stays_dag():
         if edge.source == by_name["model.backbone.layers[0]"]
         and edge.target == by_name["model.expert.layers[0]"]
     )
-    # Two distinct source-layer payloads (K and V), each 16 B at bf16.
     assert cross0.size_bytes == 32.0
     assert len(cross0.tensor_ids) == 2
-
-    # The builder itself raises if a cycle exists; reaching here proves the
-    # layer-frontier solver graph passed its internal DAG check.
-    assert schedule.metadata["layer_frontier_edges"] == 4
+    assert schedule.metadata["layer_dependency_edges"] == 4
+    assert schedule.metadata["payload_rule"] == (
+        "Fine tensor edges crossing causal layer ownership boundaries"
+    )
