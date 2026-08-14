@@ -4,9 +4,8 @@ from .coarsening import CoarseningPolicy, DependencyAwarePolicy
 from .coopinfer_export import to_coopinfer_payload
 from .dependency import DependencyAnalysisConfig, analyze_dependencies
 from .discovered_layer_schedule import (
-    LayerFrontierPayload,
     build_discovered_layer_scheduling_ir,
-    discover_layer_frontier_payloads,
+    build_layer_graph_scheduling_ir,
 )
 from .full_graph import (
     annotate_synthetic_costs,
@@ -29,6 +28,14 @@ from .layer_dependencies import (
     discover_layer_dependencies,
     layer_dependency_summary,
 )
+from .layer_graph import (
+    LayerBoundaryPayload,
+    LayerGraphIR,
+    LayerGraphValidation,
+    analyze_layer_graph,
+    discover_layer_boundary_payloads,
+    layer_graph_to_dict,
+)
 from .layerwise import (
     LayerGroup,
     LayerGrouping,
@@ -43,8 +50,10 @@ __all__ = [
     "DependencyAwarePolicy",
     "DependencyAnalysisConfig",
     "IRNode",
+    "LayerBoundaryPayload",
     "LayerDependency",
-    "LayerFrontierPayload",
+    "LayerGraphIR",
+    "LayerGraphValidation",
     "LayerGroup",
     "LayerGrouping",
     "ModelIR",
@@ -53,16 +62,19 @@ __all__ = [
     "SchedulingNode",
     "TensorEdge",
     "analyze_dependencies",
+    "analyze_layer_graph",
     "annotate_synthetic_costs",
     "build_discovered_layer_scheduling_ir",
+    "build_layer_graph_scheduling_ir",
     "build_layer_scheduling_ir",
     "capture_exported_program",
     "capture_model",
     "detect_layer_groups",
+    "discover_layer_boundary_payloads",
     "discover_layer_dependencies",
-    "discover_layer_frontier_payloads",
     "identity_scheduling_ir",
     "layer_dependency_summary",
+    "layer_graph_to_dict",
     "layer_mapping_dict",
     "load_model_ir_json",
     "model_ir_from_dict",
