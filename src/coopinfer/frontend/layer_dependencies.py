@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .ir import ModelIR
 from .layerwise import LayerGrouping
@@ -46,8 +46,8 @@ class LayerDependency:
             "path_groups": list(self.path_groups),
             "path_fine_nodes": list(self.path_fine_nodes),
             "derivation": (
-                "shortest real Fine ModelIR directed path from source layer to the "
-                "next layer frontier, traversing non-layer fine nodes only"
+                "causal-frontier propagation over the real Fine ModelIR DAG; at joins, "
+                "earlier layer frontiers dominated by later required frontiers are pruned"
             ),
         }
 
@@ -56,78 +56,135 @@ def discover_layer_dependencies(
     model_ir: ModelIR,
     grouping: LayerGrouping,
 ) -> Tuple[LayerDependency, ...]:
-    """Recover layer-frontier dependencies without inventing model-specific edges.
+    """Recover immediate causal layer dependencies without model-specific rules.
 
-    Exported graphs often place glue operations (cat/clone/reshape/cast/etc.)
-    between repeated transformer layers, so requiring a direct layer->layer Fine
-    edge misses real dependencies. This routine searches the original Fine DAG.
+    Exported graphs often place residual adds, clones, casts, cache plumbing, and
+    other glue operations outside repeated layer module paths. A plain reachability
+    search can therefore create transitive false dependencies such as L0->L2 when
+    the actual causal chain is L0->L1->L2.
 
-    Semantics:
-    - Every reported result has an explicit real Fine-node directed path.
-    - The search may traverse nodes in the source layer and non-layer nodes.
-    - The search stops as soon as it reaches any *other* detected layer group;
-      therefore no dependency is inferred through an intermediate layer.
-    - The SchedulingIR is not modified. This is a dependency-discovery overlay,
-      so auxiliary compute/communication remains explicit for exact evaluation.
+    This routine propagates the *latest causal layer frontiers* through the Fine DAG:
+
+    - Fine nodes are processed in topological order.
+    - Values produced inside a detected layer are owned by that layer frontier.
+    - Non-layer/glue nodes inherit the frontiers required by their inputs.
+    - At joins, a frontier is removed when another candidate frontier is already
+      known to depend on it. This keeps the latest required frontier and prevents
+      residual ancestry from leaking into fictitious long-range layer edges.
+    - Entering a different detected layer records dependencies from the current
+      maximal frontiers to that layer, then resets the produced value to the new
+      layer frontier.
+
+    No layer count, stack role, adjacency assumption, KV rule, or model family is
+    encoded. Every reported dependency still has an explicit witness path in the
+    original Fine ModelIR DAG.
     """
 
     model_ir.validate()
-
-    fine_adj: Dict[str, List[str]] = defaultdict(list)
-    for edge in model_ir.edges:
-        fine_adj[edge.source].append(edge.target)
 
     layer_ids = {
         group_id
         for group_id, group in grouping.groups.items()
         if group.kind == "layer"
     }
+    if not layer_ids:
+        return ()
 
+    order, predecessors = _topological_order(model_ir)
+
+    # For each fine node, map every latest causal layer frontier to one shortest
+    # witness path from a member of that layer to this fine node.
+    frontiers: Dict[str, Dict[str, Tuple[str, ...]]] = {}
+
+    # Layer precedence discovered so far. This relation is used only to remove
+    # dominated frontiers at glue joins; it is derived from the Fine DAG itself.
+    layer_adj: Dict[str, set[str]] = defaultdict(set)
     recovered: Dict[Tuple[str, str], LayerDependency] = {}
 
-    for source_id in sorted(layer_ids):
-        source = grouping.groups[source_id]
-
-        # Multi-source BFS: every fine op inside the source layer is a legitimate
-        # producer. Starting from all members avoids imposing an artificial
-        # intra-layer ordering on dependency discovery.
-        queue = deque((member, (member,)) for member in source.members)
-        best_depth: Dict[str, int] = {member: 0 for member in source.members}
-
+    def reaches(source: str, target: str) -> bool:
+        if source == target:
+            return True
+        seen = {source}
+        queue = deque([source])
         while queue:
-            current, fine_path = queue.popleft()
+            current = queue.popleft()
+            for nxt in layer_adj.get(current, ()):
+                if nxt == target:
+                    return True
+                if nxt not in seen:
+                    seen.add(nxt)
+                    queue.append(nxt)
+        return False
 
-            for nxt in fine_adj.get(current, ()):
-                target_group_id = grouping.member_to_group[nxt]
+    def merge_candidate(
+        bucket: Dict[str, Tuple[str, ...]],
+        layer_id: str,
+        path: Tuple[str, ...],
+    ) -> None:
+        previous = bucket.get(layer_id)
+        if previous is None or len(path) < len(previous):
+            bucket[layer_id] = path
 
-                if target_group_id != source_id and target_group_id in layer_ids:
-                    target = grouping.groups[target_group_id]
-                    candidate_path = (*fine_path, nxt)
-                    group_path = _compress_group_path(candidate_path, grouping)
-                    key = (source_id, target_group_id)
-                    candidate = LayerDependency(
-                        source_group=source_id,
-                        target_group=target_group_id,
-                        path_groups=group_path,
-                        path_fine_nodes=candidate_path,
-                        source_stack=source.stack_root,
-                        target_stack=target.stack_root,
-                        source_layer=source.layer_index,
-                        target_layer=target.layer_index,
+    def prune_dominated(
+        candidates: Mapping[str, Tuple[str, ...]],
+    ) -> Dict[str, Tuple[str, ...]]:
+        keys = tuple(candidates)
+        result: Dict[str, Tuple[str, ...]] = {}
+        for source in keys:
+            dominated = any(
+                source != other and reaches(source, other)
+                for other in keys
+            )
+            if not dominated:
+                result[source] = candidates[source]
+        return result
+
+    for node_id in order:
+        candidates: Dict[str, Tuple[str, ...]] = {}
+        for pred in predecessors.get(node_id, ()):
+            for layer_id, path in frontiers.get(pred, {}).items():
+                merge_candidate(candidates, layer_id, (*path, node_id))
+
+        candidates = prune_dominated(candidates)
+        group_id = grouping.member_to_group[node_id]
+
+        if group_id in layer_ids:
+            target = grouping.groups[group_id]
+            for source_group_id, path in candidates.items():
+                if source_group_id == group_id:
+                    continue
+                source = grouping.groups[source_group_id]
+                key = (source_group_id, group_id)
+                group_path = _compress_group_path(path, grouping)
+                candidate = LayerDependency(
+                    source_group=source_group_id,
+                    target_group=group_id,
+                    path_groups=group_path,
+                    path_fine_nodes=path,
+                    source_stack=source.stack_root,
+                    target_stack=target.stack_root,
+                    source_layer=source.layer_index,
+                    target_layer=target.layer_index,
+                )
+                previous = recovered.get(key)
+                if previous is None or len(candidate.path_fine_nodes) < len(
+                    previous.path_fine_nodes
+                ):
+                    recovered[key] = candidate
+
+                if reaches(group_id, source_group_id):
+                    raise RuntimeError(
+                        "Layer causal-frontier propagation would create a cycle: "
+                        f"{source_group_id}->{group_id}"
                     )
-                    previous = recovered.get(key)
-                    if previous is None or len(candidate.path_fine_nodes) < len(
-                        previous.path_fine_nodes
-                    ):
-                        recovered[key] = candidate
-                    # Frontier semantics: do not traverse through another layer.
-                    continue
+                layer_adj[source_group_id].add(group_id)
 
-                next_depth = len(fine_path)
-                if best_depth.get(nxt, 1 << 30) <= next_depth:
-                    continue
-                best_depth[nxt] = next_depth
-                queue.append((nxt, (*fine_path, nxt)))
+            # Any fine value produced inside this layer is now owned by this layer
+            # frontier. Resetting here is what prevents old residual ancestry from
+            # producing transitive false layer dependencies.
+            frontiers[node_id] = {group_id: (node_id,)}
+        else:
+            frontiers[node_id] = candidates
 
     return tuple(
         recovered[key]
@@ -163,6 +220,37 @@ def layer_dependency_summary(
         "same_index_cross_stack_dependencies": len(same_index_cross),
         "dependencies": [dependency.to_dict() for dependency in dependencies],
     }
+
+
+def _topological_order(
+    model_ir: ModelIR,
+) -> Tuple[Tuple[str, ...], Dict[str, Tuple[str, ...]]]:
+    indegree = {node_id: 0 for node_id in model_ir.nodes}
+    adjacency: Dict[str, List[str]] = defaultdict(list)
+    predecessors_list: Dict[str, List[str]] = defaultdict(list)
+    for edge in model_ir.edges:
+        indegree[edge.target] += 1
+        adjacency[edge.source].append(edge.target)
+        predecessors_list[edge.target].append(edge.source)
+
+    queue = deque(sorted(node_id for node_id, degree in indegree.items() if degree == 0))
+    order: List[str] = []
+    while queue:
+        node_id = queue.popleft()
+        order.append(node_id)
+        for nxt in adjacency.get(node_id, ()):
+            indegree[nxt] -= 1
+            if indegree[nxt] == 0:
+                queue.append(nxt)
+
+    if len(order) != len(model_ir.nodes):
+        raise RuntimeError("Fine ModelIR is not a DAG")
+
+    predecessors = {
+        node_id: tuple(values)
+        for node_id, values in predecessors_list.items()
+    }
+    return tuple(order), predecessors
 
 
 def _compress_group_path(
