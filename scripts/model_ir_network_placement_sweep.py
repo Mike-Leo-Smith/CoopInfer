@@ -113,12 +113,12 @@ def main() -> None:
     summary_rows: List[Dict[str, Any]] = []
     detail_rows: List[Dict[str, Any]] = []
 
-    for latency_ms in latencies:
+    for network_latency_ms in latencies:
         for bandwidth_mb_s in bandwidths:
             environment = validate_environment(
                 Environment(
                     bandwidth=bandwidth_mb_s,
-                    latency=latency_ms,
+                    latency=network_latency_ms,
                     weight_avg_latency=base_environment.weight_avg_latency,
                     weight_max_latency=base_environment.weight_max_latency,
                     weight_device_utilization=base_environment.weight_device_utilization,
@@ -149,7 +149,7 @@ def main() -> None:
                 row["cross_device_edges"] = _cross_device_edge_count(graph, assignment)
                 detailed = {
                     "bandwidth_mb_s": float(bandwidth_mb_s),
-                    "latency_ms": float(latency_ms),
+                    "network_latency_ms": float(network_latency_ms),
                     **row,
                 }
                 rows_for_condition.append(detailed)
@@ -159,8 +159,6 @@ def main() -> None:
                 row for row in rows_for_condition if row["offload_layers"] == min_offload
             )
             if min_offload != 0:
-                # A nonzero --min-offload is supported for focused diagnostics, but the
-                # reported reference is then the first evaluated k rather than all-Host.
                 reference_label = f"k={min_offload}"
             else:
                 reference_label = "all-host-k0"
@@ -175,7 +173,7 @@ def main() -> None:
             summary_rows.append(
                 {
                     "bandwidth_mb_s": float(bandwidth_mb_s),
-                    "latency_ms": float(latency_ms),
+                    "network_latency_ms": float(network_latency_ms),
                     "reference": reference_label,
                     "baseline_latency_ms": float(baseline["latency_ms"]),
                     "best_offload_layers": int(best["offload_layers"]),
@@ -203,7 +201,7 @@ def main() -> None:
 
     summary_fields = [
         "bandwidth_mb_s",
-        "latency_ms",
+        "network_latency_ms",
         "reference",
         "baseline_latency_ms",
         "best_offload_layers",
@@ -217,31 +215,13 @@ def main() -> None:
         "best_transfer_count",
         "best_network_active_ms",
     ]
-    detail_fields = [
-        "bandwidth_mb_s",
-        "latency_ms",
-        "offload_layers",
-        "latency_ms",
-        "max_frame_latency_ms",
-        "device_utilization",
-        "host_utilization",
-        "network_utilization",
-        "cross_device_edges",
-        "transfer_count",
-        "transfer_size_sum_mb",
-        "network_active_ms",
-        "loss",
-        "device_layer_indices",
-    ]
 
-    # detail_rows has two latency concepts, so use an unambiguous column name in the
-    # serialized detailed table: network_latency_ms vs E2E latency_ms.
     normalized_detail_rows: List[Dict[str, Any]] = []
     for row in detail_rows:
         normalized_detail_rows.append(
             {
                 "bandwidth_mb_s": row["bandwidth_mb_s"],
-                "network_latency_ms": row["latency_ms"],
+                "network_latency_ms": row["network_latency_ms"],
                 "offload_layers": row["offload_layers"],
                 "e2e_latency_ms": row["latency_ms"],
                 "max_frame_latency_ms": row["max_frame_latency_ms"],
@@ -285,7 +265,7 @@ def main() -> None:
                 "target_name_contains": args.target_name_contains,
                 "target_layer_count": layer_count,
                 "bandwidths_mb_s": bandwidths,
-                "latencies_ms": latencies,
+                "network_latencies_ms": latencies,
                 "offload_range": [min_offload, max_offload],
                 "sweep_rule": (
                     "for each network condition, all graph nodes stay on Host except "
@@ -305,11 +285,11 @@ def main() -> None:
     print(f"target={args.target_name_contains}")
     print(f"target_layers={layer_count}")
     print(f"bandwidths_mb_s={bandwidths}")
-    print(f"latencies_ms={latencies}")
+    print(f"network_latencies_ms={latencies}")
     print(f"offload_range={min_offload}..{max_offload}")
     print()
     print(
-        " bandwidth | latency | best_k | best_e2e | gain_ms | speedup | net_util"
+        " bandwidth | net_lat | best_k | best_e2e | gain_ms | speedup | net_util"
     )
     print(
         "-----------+---------+--------+----------+---------+---------+---------"
@@ -317,7 +297,7 @@ def main() -> None:
     for row in summary_rows:
         print(
             f"{row['bandwidth_mb_s']:10.1f} | "
-            f"{row['latency_ms']:7.2f} | "
+            f"{row['network_latency_ms']:7.2f} | "
             f"{row['best_offload_layers']:6d} | "
             f"{row['best_latency_ms']:8.4f} | "
             f"{row['gain_ms']:7.4f} | "
