@@ -8,7 +8,7 @@ Use these entry points for the current production/research path:
 1. torch.export
    model_ir_export.py
    pi05_export.py
-   smolvla_export_probe.py
+   smolvla_export.py
 
 2. Layer Graph Analysis
    model_ir_layer_analysis.py
@@ -24,19 +24,19 @@ The detailed workflow and validation commands are documented in `docs/vla_pipeli
 
 ### Model Stage-1 adapters
 
-`pi05_export.py` is the single pi0.5 Stage-1 adapter. The old `qkv`, `prefix`, and `prefix_ae` debug modes and their dedicated helper have been removed. It captures the complete model tensor-input path used for structural scheduling analysis:
+`pi05_export.py` and `smolvla_export.py` are the single canonical Stage-1 adapters for the two current VLA models. Both capture the model tensor-input inference path through the visual/prefix frontend, prefix KV construction, and one Action Expert denoise execution, then emit Fine ModelIR only.
 
 ```text
-images + language/token inputs
-        -> vision frontend / multimodal projection
-        -> prefix VLM prefill + KV cache
+model tensor inputs
+        -> vision / prefix frontend
+        -> VLM prefix prefill + KV cache
         -> one Action Expert denoise step
         -> Fine ModelIR
 ```
 
-The number of denoise iterations is stored as workload metadata; Stage 1 captures one denoise execution rather than statically duplicating the same Expert layers N times.
+The repeated denoise count is stored as workload metadata; Stage 1 captures one denoise execution rather than statically duplicating the same Expert stack N times.
 
-`smolvla_export_probe.py` follows the same one-step structural scope.
+The old pi0.5 `qkv`, `prefix`, and `prefix_ae` probe modes and helper module have been removed. The old SmolVLA `joint_forward` / manual layer-truncation export entrypoint has also been removed from the canonical path.
 
 ## Experiment helpers / references
 
@@ -50,4 +50,4 @@ The remaining scripts are not additional required pipeline stages. They are reta
 - `profile_pi05_vla_perf.py`: VLA-Perf/pi0.5 profiling experiments;
 - `generic_frontend_smoke.py`: small generic frontend smoke test.
 
-The old pi0.5 `qkv` / `prefix` / `prefix_ae` probe entrypoint, its dedicated frontend helper, and the pi0.5-specific Full-Graph solve wrapper were removed. Development-only dependency/frontier/ingress/min-cut/ownership audit CLIs were also removed after the validated causal dependency and ownership-boundary logic was promoted into `src/coopinfer/frontend/layer_graph.py`.
+Development-only dependency/frontier/ingress/min-cut/ownership audit CLIs were removed after the validated causal dependency and ownership-boundary logic was promoted into `src/coopinfer/frontend/layer_graph.py`. The pi0.5-specific Full-Graph solve wrapper was also removed because Stage 4 is now shared through `coopinfer_solve.py`.
