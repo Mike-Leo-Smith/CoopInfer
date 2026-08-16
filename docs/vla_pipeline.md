@@ -43,9 +43,9 @@ PyTorch / Hugging Face model
 
 ## Stage 1 - torch.export
 
-Model-specific wrappers are allowed only to construct the real inference path and example inputs. The generic frontend receives the resulting Fine ModelIR; it is not given stack roles, layer counts, KV annotations, or split points.
+Model-specific wrappers are allowed only to construct the real inference path and example tensor inputs. The generic frontend receives the resulting Fine ModelIR; it is not given stack roles, layer counts, KV annotations, or split points.
 
-The canonical model adapters are `pi05_export.py` and `smolvla_export_probe.py`.
+The canonical model adapters are `pi05_export.py` and `smolvla_export.py`.
 
 ### pi0.5 Stage-1 scope
 
@@ -90,7 +90,17 @@ python .\scripts\pi05_export.py `
 
 ### SmolVLA Stage-1 scope
 
-SmolVLA uses the corresponding image/language/state prefix frontend, VLM prefix prefill, KV construction, and one cached Action Expert denoise step. Optional layer truncation flags are debug-only; omit them for formal structural export.
+SmolVLA now has the same single canonical one-step inference scope: native LeRobot SmolVLA architecture/configuration, image/language/state prefix frontend, VLM prefix prefill, KV construction, and one cached Action Expert denoise execution. The former `joint_forward` and manual layer-truncation export options were development aids and are not part of the canonical Stage-1 script.
+
+Canonical SmolVLA Stage-1 command:
+
+```powershell
+python .\scripts\smolvla_export.py `
+  --lerobot-root D:\Project\lerobot-main `
+  --metadata-dir D:\Project\models\SmolVLM2-500M-metadata `
+  --num-images 3 `
+  --output .\results\smolvla_full_pipeline\smolvla_fine_ir.json
+```
 
 ## Stage 2 - Layer Graph Analysis
 
@@ -167,13 +177,13 @@ The network configuration stored by Stage 3 is used by default; `--bandwidth-mb-
 ## Canonical scripts
 
 ```text
-Stage 1  model_ir_export.py / pi05_export.py / smolvla_export_probe.py
+Stage 1  model_ir_export.py / pi05_export.py / smolvla_export.py
 Stage 2  model_ir_layer_analysis.py
 Stage 3  model_ir_build_scheduling.py
 Stage 4  coopinfer_solve.py
 ```
 
-Placement/network sweep scripts remain experiment helpers. The old dependency, ingress, min-cut, frontier-payload, ownership-audit, legacy layerwise CLIs, old pi0.5 structural probes, and pi0.5-specific Full-Graph solver wrapper have been removed after their useful logic was either promoted into the library or superseded by the canonical four-stage path.
+Placement/network sweep scripts remain experiment helpers. The old dependency, ingress, min-cut, frontier-payload, ownership-audit, legacy layerwise CLIs, old model-specific structural probes, and pi0.5-specific Full-Graph solver wrapper have been removed after their useful logic was either promoted into the library or superseded by the canonical four-stage path.
 
 ## Regression tests
 
