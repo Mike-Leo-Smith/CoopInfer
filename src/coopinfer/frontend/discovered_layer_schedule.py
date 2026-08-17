@@ -23,6 +23,22 @@ from .layerwise import LayerGrouping
 # boundaries rather than source-origin frontier reachability.
 LayerFrontierPayload = LayerBoundaryPayload
 
+_PRECISION_BYTES = {
+    "fp32": 4.0,
+    "f32": 4.0,
+    "tf32": 4.0,
+    "bf16": 2.0,
+    "fp16": 2.0,
+    "fp8": 1.0,
+    "int8": 1.0,
+    "fp6": 0.75,
+    "fp4": 0.5,
+    "int4": 0.5,
+    "int2": 0.25,
+}
+
+_STEP_TOKEN = "::step"
+
 
 def discover_layer_frontier_payloads(
     model_ir: ModelIR,
@@ -50,7 +66,20 @@ def build_layer_graph_scheduling_ir(
     *,
     synthetic_source_id: str = "__layer_source__",
 ) -> SchedulingIR:
-    """Stage 3: convert a validated LayerGraphIR + hardware costs to SchedulingIR."""
+    """Stage 3: convert a validated LayerGraphIR + hardware costs to SchedulingIR.
+
+    If Stage 1 recorded an iterative denoising workload (``num_inference_steps``
+    greater than ``captured_denoise_steps``), the one-step structural LayerGraph
+    is materialized into the real execution DAG here. The iterative stack is
+    inferred structurally from same-index cross-stack dependencies; no model
+    family, Expert name, layer count, or fixed denoise-step count is used.
+
+    Static-to-iterative inputs (the prefix KV/cache path for current VLA models)
+    are materialized only for step 0. Later denoise steps reuse the already
+    resident cache. The iterative stack itself is repeated N times, and cloned
+    copies of the same base layer share one placement decision via the ``::step``
+    node-id convention consumed by the Stage-4 solver.
+    """
 
     if not layer_graph.validation.passed:
         raise ValueError(
@@ -58,7 +87,7 @@ def build_layer_graph_scheduling_ir(
             f"dag={layer_graph.validation.is_dag} "
             f"missing_payloads={len(layer_graph.validation.missing_payload_dependencies)}"
         )
-    return _build_scheduling_ir(
+    base = _build_scheduling_ir(
         layer_graph.model_ir,
         layer_graph.grouping,
         layer_graph.dependencies,
@@ -67,6 +96,7 @@ def build_layer_graph_scheduling_ir(
         precision=layer_graph.precision,
         synthetic_source_id=synthetic_source_id,
     )
+    return _materialize_iterative_execution(layer_graph, base)
 
 
 def build_discovered_layer_scheduling_ir(
@@ -81,7 +111,9 @@ def build_discovered_layer_scheduling_ir(
     """Compatibility wrapper for the pre-LayerGraphIR API.
 
     New code should call ``analyze_layer_graph`` followed by
-    ``build_layer_graph_scheduling_ir``.
+    ``build_layer_graph_scheduling_ir``. This compatibility path intentionally
+    does not infer iterative execution because it lacks the unified LayerGraphIR
+    context required for safe structural identification.
     """
 
     payloads, _ = discover_layer_boundary_payloads(
@@ -221,6 +253,204 @@ def _build_scheduling_ir(
     result.validate()
     _assert_dag(result)
     return result
+
+
+def _materialize_iterative_execution(
+    layer_graph: LayerGraphIR,
+    base: SchedulingIR,
+) -> SchedulingIR:
+    metadata = layer_graph.model_ir.metadata
+    total_steps = int(metadata.get("num_inference_steps", 1) or 1)
+    captured_steps = int(metadata.get("captured_denoise_steps", 1) or 1)
+    if total_steps <= captured_steps:
+        return base
+    if captured_steps != 1:
+        raise ValueError(
+            "Execution materialization currently requires captured_denoise_steps=1; "
+            f"got {captured_steps} for num_inference_steps={total_steps}."
+        )
+
+    iterative_root = _infer_iterative_stack_root(layer_graph)
+    iterative_layers = [
+        group_id
+        for group_id in layer_graph.layer_ids
+        if layer_graph.grouping.groups[group_id].stack_root == iterative_root
+    ]
+    iterative_layers.sort(
+        key=lambda group_id: int(
+            layer_graph.grouping.groups[group_id].layer_index
+            if layer_graph.grouping.groups[group_id].layer_index is not None
+            else -1
+        )
+    )
+    if not iterative_layers:
+        raise ValueError(f"Iterative stack {iterative_root!r} has no detected layer nodes")
+
+    iterative_set = set(iterative_layers)
+    loop_state_bytes = _infer_loop_state_bytes(layer_graph.model_ir, layer_graph.precision)
+
+    def step_id(base_id: str, step: int) -> str:
+        return f"{base_id}{_STEP_TOKEN}{step:03d}"
+
+    nodes: Dict[str, SchedulingNode] = {}
+    for node_id, node in base.nodes.items():
+        if node_id not in iterative_set:
+            nodes[node_id] = SchedulingNode(
+                id=node.id,
+                members=tuple(node.members),
+                name=node.name,
+                costs_ms=dict(node.costs_ms),
+                placement=node.placement,
+                metadata={**dict(node.metadata), "placement_group": node.id},
+            )
+            continue
+        for step in range(total_steps):
+            clone_id = step_id(node_id, step)
+            nodes[clone_id] = SchedulingNode(
+                id=clone_id,
+                members=tuple(node.members),
+                name=f"{node.name} [denoise {step}]",
+                costs_ms=dict(node.costs_ms),
+                placement=node.placement,
+                metadata={
+                    **dict(node.metadata),
+                    "base_layer_id": node_id,
+                    "denoise_step": step,
+                    "placement_group": node_id,
+                    "execution_role": "iterative_denoise_layer",
+                },
+            )
+
+    edges = []
+    static_to_iterative = 0
+    repeated_internal = 0
+    for edge in base.edges:
+        source_iter = edge.source in iterative_set
+        target_iter = edge.target in iterative_set
+        if not source_iter and not target_iter:
+            edges.append(edge)
+        elif not source_iter and target_iter:
+            # Prefix/context inputs are transferred exactly once. All later
+            # denoise executions reuse the same resident cache on the placement
+            # shared by all copies of this target layer.
+            edges.append(
+                SchedulingEdge(
+                    source=edge.source,
+                    target=step_id(edge.target, 0),
+                    size_bytes=edge.size_bytes,
+                    tensor_ids=edge.tensor_ids,
+                )
+            )
+            static_to_iterative += 1
+        elif source_iter and target_iter:
+            for step in range(total_steps):
+                edges.append(
+                    SchedulingEdge(
+                        source=step_id(edge.source, step),
+                        target=step_id(edge.target, step),
+                        size_bytes=edge.size_bytes,
+                        tensor_ids=tuple(f"{tensor}{_STEP_TOKEN}{step:03d}" for tensor in edge.tensor_ids),
+                    )
+                )
+            repeated_internal += 1
+        else:
+            # A downstream static consumer sees the final denoise result.
+            edges.append(
+                SchedulingEdge(
+                    source=step_id(edge.source, total_steps - 1),
+                    target=edge.target,
+                    size_bytes=edge.size_bytes,
+                    tensor_ids=edge.tensor_ids,
+                )
+            )
+
+    first_layer = iterative_layers[0]
+    last_layer = iterative_layers[-1]
+    for step in range(total_steps - 1):
+        edges.append(
+            SchedulingEdge(
+                source=step_id(last_layer, step),
+                target=step_id(first_layer, step + 1),
+                size_bytes=loop_state_bytes,
+                tensor_ids=(f"__denoise_state_{step:03d}",),
+            )
+        )
+
+    result = SchedulingIR(
+        nodes=nodes,
+        edges=tuple(edges),
+        metadata={
+            **dict(base.metadata),
+            "execution_semantics": "iterative_denoise_v1",
+            "num_inference_steps": total_steps,
+            "captured_denoise_steps": captured_steps,
+            "iterative_stack_root": iterative_root,
+            "iterative_layer_count": len(iterative_layers),
+            "static_to_iterative_edges_once": static_to_iterative,
+            "repeated_internal_edge_templates": repeated_internal,
+            "kv_reuse_across_denoise_steps": True,
+            "placement_shared_across_denoise_steps": True,
+            "loop_carried_state_bytes": loop_state_bytes,
+            "base_scheduling_nodes": len(base.nodes),
+            "base_scheduling_edges": len(base.edges),
+            "materialized_scheduling_nodes": len(nodes),
+            "materialized_scheduling_edges": len(edges),
+        },
+    )
+    result.validate()
+    _assert_dag(result)
+    return result
+
+
+def _infer_iterative_stack_root(layer_graph: LayerGraphIR) -> str:
+    counts: Dict[str, int] = defaultdict(int)
+    for dependency in layer_graph.same_index_cross_stack_dependencies:
+        target_group = layer_graph.grouping.groups.get(dependency.target_group)
+        if target_group is None or not target_group.stack_root:
+            continue
+        counts[target_group.stack_root] += 1
+
+    candidates = []
+    for root, count in counts.items():
+        layer_count = len(layer_graph.grouping.stack_layers.get(root, ()))
+        if layer_count >= 2 and count == layer_count:
+            candidates.append(root)
+    if len(candidates) != 1:
+        raise ValueError(
+            "Could not uniquely infer the iterative denoise stack from complete same-index "
+            "cross-stack dependencies; candidates=" + repr(sorted(candidates))
+        )
+    return candidates[0]
+
+
+def _infer_loop_state_bytes(model_ir: ModelIR, precision: str) -> float:
+    normalized = str(precision).strip().lower()
+    if normalized not in _PRECISION_BYTES:
+        raise ValueError(f"Unsupported communication precision {precision!r}")
+    chunk_size = int(model_ir.metadata.get("chunk_size", 0) or 0)
+    action_dim = int(model_ir.metadata.get("max_action_dim", 0) or 0)
+    candidates = []
+    if chunk_size > 0 and action_dim > 0:
+        for node in model_ir.nodes.values():
+            if node.kind != "input":
+                continue
+            for tensor in node.metadata.get("output_tensors", ()):
+                shape = tensor.get("shape", ())
+                if (
+                    isinstance(shape, (list, tuple))
+                    and len(shape) >= 2
+                    and shape[-2:] == [chunk_size, action_dim]
+                ):
+                    numel = tensor.get("numel")
+                    if isinstance(numel, int) and numel > 0:
+                        candidates.append(numel)
+    unique = sorted(set(candidates))
+    if len(unique) != 1:
+        raise ValueError(
+            "Could not uniquely infer loop-carried denoise state size from exported inputs; "
+            f"chunk_size={chunk_size} action_dim={action_dim} candidates={unique}"
+        )
+    return float(unique[0]) * _PRECISION_BYTES[normalized]
 
 
 def _assert_dag(scheduling_ir: SchedulingIR) -> None:
