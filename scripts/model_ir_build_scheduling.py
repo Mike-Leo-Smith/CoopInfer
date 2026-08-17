@@ -161,10 +161,13 @@ def main() -> None:
     print(f"execution_compute_total_host_ms={execution_totals['host']:.6f}")
     execution_semantics = scheduling_ir.metadata.get("execution_semantics", "single_pass")
     print(f"execution_semantics={execution_semantics}")
-    if execution_semantics == "iterative_denoise_v1":
+    if execution_semantics.startswith("iterative_denoise_"):
         print(f"num_inference_steps={scheduling_ir.metadata['num_inference_steps']}")
         print(f"iterative_layer_count={scheduling_ir.metadata['iterative_layer_count']}")
         print(f"kv_reuse_across_denoise_steps={scheduling_ir.metadata['kv_reuse_across_denoise_steps']}")
+        print(f"placement_shared_across_denoise_steps={scheduling_ir.metadata['placement_shared_across_denoise_steps']}")
+        if "persistent_cache_policy" in scheduling_ir.metadata:
+            print(f"persistent_cache_policy={scheduling_ir.metadata['persistent_cache_policy']}")
         print(f"static_to_iterative_edges_once={scheduling_ir.metadata['static_to_iterative_edges_once']}")
         print(f"loop_carried_state_bytes={scheduling_ir.metadata['loop_carried_state_bytes']:.0f}")
     print(f"network={args.bandwidth_mb_s} MB/s + {args.latency_ms} ms/transfer")
