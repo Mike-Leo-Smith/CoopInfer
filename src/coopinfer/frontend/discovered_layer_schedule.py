@@ -68,17 +68,21 @@ def build_layer_graph_scheduling_ir(
 ) -> SchedulingIR:
     """Stage 3: convert a validated LayerGraphIR + hardware costs to SchedulingIR.
 
-    If Stage 1 recorded an iterative denoising workload (``num_inference_steps``
-    greater than ``captured_denoise_steps``), the one-step structural LayerGraph
-    is materialized into the real execution DAG here. The iterative stack is
-    inferred structurally from same-index cross-stack dependencies; no model
-    family, Expert name, layer count, or fixed denoise-step count is used.
+    Stage 1 captures one denoise execution structurally and records the native
+    inference-step count in ModelIR metadata. Stage 3 materializes the repeated
+    execution here without cloning the Fine ModelIR.
 
-    Static-to-iterative inputs (the prefix KV/cache path for current VLA models)
-    are materialized only for step 0. Later denoise steps reuse the already
-    resident cache. The iterative stack itself is repeated N times, and cloned
-    copies of the same base layer share one placement decision via the ``::step``
-    node-id convention consumed by the Stage-4 solver.
+    The iterative stack is inferred from complete same-index cross-stack
+    dependencies. No model-family name, Expert string, fixed layer count, or
+    fixed denoise-step count is used.
+
+    Static-to-iterative inputs (prefix KV/cache for current VLA models) are
+    represented once, feeding denoise step 0. Stage 4 interprets these edges as
+    persistent cache inputs: the original producer retains its local copy, and
+    the payload is copied to another resource at most once when some denoise
+    step first needs that resource. Denoise-step placements therefore remain
+    independent search variables; step 0 can exploit VLM overlap without
+    forcing later steps onto the same device.
     """
 
     if not layer_graph.validation.passed:
@@ -241,7 +245,6 @@ def _build_scheduling_ir(
             "source_fine_edges": len(model_ir.edges),
             "detected_layer_nodes": len(layer_ids),
             "layer_dependency_edges": len(dep_pairs),
-            # Preserve the old key for downstream scripts that only read counts.
             "layer_frontier_edges": len(dep_pairs),
             "synthetic_source_edges": len(roots),
             "root_layers": list(roots),
@@ -301,7 +304,7 @@ def _materialize_iterative_execution(
                 name=node.name,
                 costs_ms=dict(node.costs_ms),
                 placement=node.placement,
-                metadata={**dict(node.metadata), "placement_group": node.id},
+                metadata={**dict(node.metadata), "execution_role": "static_once"},
             )
             continue
         for step in range(total_steps):
@@ -316,30 +319,43 @@ def _materialize_iterative_execution(
                     **dict(node.metadata),
                     "base_layer_id": node_id,
                     "denoise_step": step,
-                    "placement_group": node_id,
                     "execution_role": "iterative_denoise_layer",
+                    "placement_scope": "per_execution_step",
                 },
             )
 
     edges = []
     static_to_iterative = 0
     repeated_internal = 0
+    persistent_cache_edges = []
     for edge in base.edges:
         source_iter = edge.source in iterative_set
         target_iter = edge.target in iterative_set
         if not source_iter and not target_iter:
             edges.append(edge)
         elif not source_iter and target_iter:
-            # Prefix/context inputs are transferred exactly once. All later
-            # denoise executions reuse the same resident cache on the placement
-            # shared by all copies of this target layer.
+            step0_target = step_id(edge.target, 0)
+            # This edge expresses both the causal availability of the static
+            # context and its original payload. Stage 4 treats it as a
+            # persistent cache source. If later denoise steps use another
+            # resource, one additional copy can be prefetched to that resource;
+            # the cache is never charged once per denoise step.
             edges.append(
                 SchedulingEdge(
                     source=edge.source,
-                    target=step_id(edge.target, 0),
+                    target=step0_target,
                     size_bytes=edge.size_bytes,
                     tensor_ids=edge.tensor_ids,
                 )
+            )
+            persistent_cache_edges.append(
+                {
+                    "source": edge.source,
+                    "target_base": edge.target,
+                    "step0_target": step0_target,
+                    "size_bytes": float(edge.size_bytes),
+                    "tensor_ids": list(edge.tensor_ids),
+                }
             )
             static_to_iterative += 1
         elif source_iter and target_iter:
@@ -349,12 +365,14 @@ def _materialize_iterative_execution(
                         source=step_id(edge.source, step),
                         target=step_id(edge.target, step),
                         size_bytes=edge.size_bytes,
-                        tensor_ids=tuple(f"{tensor}{_STEP_TOKEN}{step:03d}" for tensor in edge.tensor_ids),
+                        tensor_ids=tuple(
+                            f"{tensor}{_STEP_TOKEN}{step:03d}"
+                            for tensor in edge.tensor_ids
+                        ),
                     )
                 )
             repeated_internal += 1
         else:
-            # A downstream static consumer sees the final denoise result.
             edges.append(
                 SchedulingEdge(
                     source=step_id(edge.source, total_steps - 1),
@@ -381,15 +399,17 @@ def _materialize_iterative_execution(
         edges=tuple(edges),
         metadata={
             **dict(base.metadata),
-            "execution_semantics": "iterative_denoise_v1",
+            "execution_semantics": "iterative_denoise_v2",
             "num_inference_steps": total_steps,
             "captured_denoise_steps": captured_steps,
             "iterative_stack_root": iterative_root,
             "iterative_layer_count": len(iterative_layers),
             "static_to_iterative_edges_once": static_to_iterative,
+            "persistent_cache_edges": persistent_cache_edges,
+            "persistent_cache_policy": "copy_once_per_resource_on_first_use",
             "repeated_internal_edge_templates": repeated_internal,
             "kv_reuse_across_denoise_steps": True,
-            "placement_shared_across_denoise_steps": True,
+            "placement_shared_across_denoise_steps": False,
             "loop_carried_state_bytes": loop_state_bytes,
             "base_scheduling_nodes": len(base.nodes),
             "base_scheduling_edges": len(base.edges),
@@ -439,7 +459,7 @@ def _infer_loop_state_bytes(model_ir: ModelIR, precision: str) -> float:
                 if (
                     isinstance(shape, (list, tuple))
                     and len(shape) >= 2
-                    and shape[-2:] == [chunk_size, action_dim]
+                    and list(shape[-2:]) == [chunk_size, action_dim]
                 ):
                     numel = tensor.get("numel")
                     if isinstance(numel, int) and numel > 0:
