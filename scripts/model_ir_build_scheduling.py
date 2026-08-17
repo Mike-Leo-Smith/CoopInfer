@@ -54,6 +54,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Stage 3: analyze the LayerGraph, estimate per-layer hardware costs with GenZ, "
+            "materialize iterative execution semantics when exported metadata requests it, "
             "attach network payloads, and build a costed SchedulingIR. The CoopInfer solver is not run."
         )
     )
@@ -129,10 +130,17 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    layer_only_totals = {
+    structural_totals = {
         resource: sum(
             float(costed_groups.nodes[group_id].costs_ms.get(resource, 0.0))
             for group_id in layer_graph.layer_ids
+        )
+        for resource in ("device", "host")
+    }
+    execution_totals = {
+        resource: sum(
+            float(node.costs_ms.get(resource, 0.0))
+            for node in scheduling_ir.nodes.values()
         )
         for resource in ("device", "host")
     }
@@ -147,8 +155,18 @@ def main() -> None:
     print(f"device={args.device}")
     print(f"host={args.host}")
     print(f"precision={args.precision}")
-    print(f"layer_cost_total_device_ms={layer_only_totals['device']:.6f}")
-    print(f"layer_cost_total_host_ms={layer_only_totals['host']:.6f}")
+    print(f"structural_layer_cost_total_device_ms={structural_totals['device']:.6f}")
+    print(f"structural_layer_cost_total_host_ms={structural_totals['host']:.6f}")
+    print(f"execution_compute_total_device_ms={execution_totals['device']:.6f}")
+    print(f"execution_compute_total_host_ms={execution_totals['host']:.6f}")
+    execution_semantics = scheduling_ir.metadata.get("execution_semantics", "single_pass")
+    print(f"execution_semantics={execution_semantics}")
+    if execution_semantics == "iterative_denoise_v1":
+        print(f"num_inference_steps={scheduling_ir.metadata['num_inference_steps']}")
+        print(f"iterative_layer_count={scheduling_ir.metadata['iterative_layer_count']}")
+        print(f"kv_reuse_across_denoise_steps={scheduling_ir.metadata['kv_reuse_across_denoise_steps']}")
+        print(f"static_to_iterative_edges_once={scheduling_ir.metadata['static_to_iterative_edges_once']}")
+        print(f"loop_carried_state_bytes={scheduling_ir.metadata['loop_carried_state_bytes']:.0f}")
     print(f"network={args.bandwidth_mb_s} MB/s + {args.latency_ms} ms/transfer")
     print(f"scheduling_ir={scheduling_output}")
     print(f"coopinfer={coopinfer_output}")
