@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import networkx as nx
+
 from coopinfer.frontend import (
     IRNode,
     ModelIR,
@@ -9,6 +11,7 @@ from coopinfer.frontend import (
     analyze_layer_graph,
     build_layer_graph_scheduling_ir,
 )
+from coopinfer.solver import _cache_aware_graph, _persistent_cache_templates
 
 
 def _row(shape=(1, 8)):
@@ -77,7 +80,7 @@ def test_layer_graph_builds_costed_scheduling_ir_and_stays_dag():
 
     schedule = build_layer_graph_scheduling_ir(layer_graph, _costed(layer_graph))
 
-    assert len(schedule.nodes) == 5  # 4 real layers + explicit synthetic source
+    assert len(schedule.nodes) == 5
     layer_edges = [edge for edge in schedule.edges if not edge.source.startswith("__")]
     assert len(layer_edges) == 4
 
@@ -141,11 +144,16 @@ def test_iterative_denoise_repeats_expert_but_reuses_static_kv_once():
     layer_graph = analyze_layer_graph(ir, precision="bf16")
     schedule = build_layer_graph_scheduling_ir(layer_graph, _costed(layer_graph))
 
-    assert schedule.metadata["execution_semantics"] == "iterative_denoise_v1"
+    assert schedule.metadata["execution_semantics"] == "iterative_denoise_v2"
     assert schedule.metadata["num_inference_steps"] == 3
     assert schedule.metadata["iterative_layer_count"] == 2
     assert schedule.metadata["kv_reuse_across_denoise_steps"] is True
+    assert schedule.metadata["placement_shared_across_denoise_steps"] is False
+    assert schedule.metadata["persistent_cache_policy"] == (
+        "copy_once_per_resource_on_first_use"
+    )
     assert schedule.metadata["static_to_iterative_edges_once"] == 2
+    assert len(schedule.metadata["persistent_cache_edges"]) == 2
     assert schedule.metadata["loop_carried_state_bytes"] == 16.0
 
     # 2 static backbone layers + 2 expert layers x3 + synthetic source.
@@ -162,8 +170,9 @@ def test_iterative_denoise_repeats_expert_but_reuses_static_kv_once():
     assert all(f"{expert0}::step{step:03d}" in schedule.nodes for step in range(3))
     assert all(f"{expert1}::step{step:03d}" in schedule.nodes for step in range(3))
 
-    # Prefix/KV dependencies exist only for denoise step 0, so they cannot be
-    # charged again in later steps.
+    # Static/KV dependencies are structurally emitted only for step 0. The
+    # solver may add one prefetch edge if a later step first uses another
+    # resource, but never one edge per repeated denoise step.
     cross_edges = [
         edge
         for edge in schedule.edges
@@ -172,7 +181,6 @@ def test_iterative_denoise_repeats_expert_but_reuses_static_kv_once():
     assert len(cross_edges) == 2
     assert all(edge.target.endswith("::step000") for edge in cross_edges)
 
-    # Expert hidden-state communication is repeated per denoise execution.
     internal_edges = [
         edge
         for edge in schedule.edges
@@ -181,7 +189,54 @@ def test_iterative_denoise_repeats_expert_but_reuses_static_kv_once():
     ]
     assert len(internal_edges) == 3
 
-    # The loop-carried action state links complete denoise passes sequentially.
-    loop_edges = [edge for edge in schedule.edges if edge.tensor_ids and edge.tensor_ids[0].startswith("__denoise_state_")]
+    loop_edges = [
+        edge
+        for edge in schedule.edges
+        if edge.tensor_ids and edge.tensor_ids[0].startswith("__denoise_state_")
+    ]
     assert len(loop_edges) == 2
     assert all(edge.size_bytes == 16.0 for edge in loop_edges)
+
+
+def test_persistent_cache_is_copied_only_on_first_use_of_other_resource():
+    graph = nx.DiGraph()
+    graph.add_node("vlm0", c_dev=1.0, c_host=1.0, placement="free", x=1)
+    for step in range(3):
+        graph.add_node(
+            f"ae0::step{step:03d}",
+            c_dev=1.0,
+            c_host=1.0,
+            placement="free",
+            x=1,
+        )
+    graph.add_edge("vlm0", "ae0::step000", size=1.0)
+    graph.add_edge("ae0::step000", "ae0::step001", size=0.01)
+    graph.add_edge("ae0::step001", "ae0::step002", size=0.01)
+
+    templates = _persistent_cache_templates(graph)
+    assert templates == [("vlm0", "ae0", "ae0::step000", 1.0)]
+
+    # VLM Host, step0 Device, later Host: the Device copy is already created by
+    # the original step0 edge; Host keeps its original copy. No second KV edge.
+    warmup_device = {
+        "vlm0": 1,
+        "ae0::step000": 0,
+        "ae0::step001": 1,
+        "ae0::step002": 1,
+    }
+    effective = _cache_aware_graph(graph, warmup_device, templates)
+    assert not effective.has_edge("vlm0", "ae0::step001")
+    assert not effective.has_edge("vlm0", "ae0::step002")
+
+    # VLM Host and step0 Host, but step1 first moves to Device. One prefetch is
+    # added to step1 and is reused if step2 remains/returns Device later.
+    later_device = {
+        "vlm0": 1,
+        "ae0::step000": 1,
+        "ae0::step001": 0,
+        "ae0::step002": 0,
+    }
+    effective = _cache_aware_graph(graph, later_device, templates)
+    assert effective.has_edge("vlm0", "ae0::step001")
+    assert effective.edges["vlm0", "ae0::step001"]["size"] == 1.0
+    assert not effective.has_edge("vlm0", "ae0::step002")
