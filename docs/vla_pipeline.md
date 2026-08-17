@@ -169,8 +169,19 @@ Canonical CLI:
 python .\scripts\coopinfer_solve.py `
   <fine_model_ir_stem>_coopinfer.json `
   --algorithm "Random Search" `
-  --heuristic-iterations 3000
+  --heuristic-iterations 3000 `
+  --output <fine_model_ir_stem>_solve_result.json
 ```
+
+When `--output` is provided, Stage 4 writes a self-contained solve-result JSON containing:
+
+- solver algorithm, iteration count, and seed;
+- network/environment parameters;
+- all-Device and all-Host baselines;
+- best latency/utilization summary;
+- complete node assignment;
+- per-node placement and Device/Host compute costs;
+- detailed schedule metrics, including start/finish times and transfer records.
 
 The network configuration stored by Stage 3 is used by default; `--bandwidth-mb-s` and `--latency-ms` can override it for sensitivity studies.
 
