@@ -192,6 +192,9 @@ def main() -> None:
             "max_action_dim": action_dim,
             "num_inference_steps": int(config.num_steps),
             "captured_denoise_steps": 1,
+            "persistent_context_kind": "per_layer_prefix_kv",
+            "kv_reuse_across_denoise_steps": True,
+            "wave_kv_first_step": True,
             "vlm_layers": int(core.vlm_with_expert.num_vlm_layers),
             "expert_layers": int(core.vlm_with_expert.num_expert_layers),
         }

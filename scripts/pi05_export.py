@@ -55,7 +55,7 @@ def main() -> None:
     parser.add_argument(
         "--lerobot-root",
         type=Path,
-        default=Path(r"D:\Project\lerobot-main"),
+        default=Path(__file__).resolve().parents[2] / "lerobot-main",
     )
     parser.add_argument(
         "--config-path",
@@ -89,7 +89,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("results/pi05_full_pipeline/pi05_fine_ir.json"),
+        default=Path("examples/models/pi05/pi05_fine_ir.json"),
     )
     args = parser.parse_args()
 
@@ -256,6 +256,9 @@ def main() -> None:
             "max_action_dim": int(config.max_action_dim),
             "num_inference_steps": int(config.num_inference_steps),
             "captured_denoise_steps": 1,
+            "persistent_context_kind": "per_layer_prefix_kv",
+            "kv_reuse_across_denoise_steps": True,
+            "wave_kv_first_step": True,
             "use_visual_memory": bool(config.use_visual_memory),
             "use_proprioceptive_memory": bool(config.use_proprioceptive_memory),
             "paligemma_variant": str(config.paligemma_variant),
