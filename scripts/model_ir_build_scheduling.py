@@ -68,6 +68,15 @@ def main() -> None:
     parser.add_argument("--min-repeated-layers", type=int, default=2)
     parser.add_argument("--bandwidth-mb-s", type=float, default=1250.0)
     parser.add_argument("--latency-ms", type=float, default=0.2)
+    parser.add_argument(
+        "--max-action-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Override Π0-FAST total action-token budget. The prefill emits the first "
+            "token, so Stage 3 materializes max_action_tokens - 1 cached decode steps."
+        ),
+    )
     parser.add_argument("--scheduling-output", type=Path, default=None)
     parser.add_argument("--coopinfer-output", type=Path, default=None)
     args = parser.parse_args()
@@ -84,6 +93,25 @@ def main() -> None:
     )
 
     model_ir = load_model_ir_json(args.input)
+    if args.max_action_tokens is not None:
+        if model_ir.metadata.get("iterative_execution_kind") != "autoregressive_decode":
+            raise ValueError("--max-action-tokens is only valid for autoregressive decode models")
+        if args.max_action_tokens < 2:
+            raise ValueError("--max-action-tokens must be at least 2")
+        native_max = int(
+            model_ir.metadata.get(
+                "native_max_action_tokens", model_ir.metadata.get("max_action_tokens", 0)
+            )
+            or 0
+        )
+        if native_max and args.max_action_tokens > native_max:
+            raise ValueError(
+                f"--max-action-tokens={args.max_action_tokens} exceeds model limit {native_max}"
+            )
+        model_ir.metadata["native_max_action_tokens"] = native_max or args.max_action_tokens
+        model_ir.metadata["max_action_tokens"] = int(args.max_action_tokens)
+        model_ir.metadata["num_decode_steps"] = int(args.max_action_tokens - 1)
+        model_ir.metadata["token_budget_override"] = True
     layer_graph = analyze_layer_graph(
         model_ir,
         precision=args.precision,
@@ -155,6 +183,8 @@ def main() -> None:
     print(f"device={args.device}")
     print(f"host={args.host}")
     print(f"precision={args.precision}")
+    if args.max_action_tokens is not None:
+        print(f"max_action_tokens_override={args.max_action_tokens}")
     print(f"structural_layer_cost_total_device_ms={structural_totals['device']:.6f}")
     print(f"structural_layer_cost_total_host_ms={structural_totals['host']:.6f}")
     print(f"execution_compute_total_device_ms={execution_totals['device']:.6f}")
@@ -164,12 +194,25 @@ def main() -> None:
     if execution_semantics.startswith("iterative_denoise_"):
         print(f"num_inference_steps={scheduling_ir.metadata['num_inference_steps']}")
         print(f"iterative_layer_count={scheduling_ir.metadata['iterative_layer_count']}")
+        print(
+            "static_conditioning_reuse_across_steps="
+            f"{scheduling_ir.metadata['static_conditioning_reuse_across_steps']}"
+        )
         print(f"kv_reuse_across_denoise_steps={scheduling_ir.metadata['kv_reuse_across_denoise_steps']}")
         print(f"placement_shared_across_denoise_steps={scheduling_ir.metadata['placement_shared_across_denoise_steps']}")
         if "persistent_cache_policy" in scheduling_ir.metadata:
             print(f"persistent_cache_policy={scheduling_ir.metadata['persistent_cache_policy']}")
         print(f"static_to_iterative_edges_once={scheduling_ir.metadata['static_to_iterative_edges_once']}")
         print(f"loop_carried_state_bytes={scheduling_ir.metadata['loop_carried_state_bytes']:.0f}")
+    elif execution_semantics.startswith("autoregressive_decode_"):
+        print(f"num_decode_steps={scheduling_ir.metadata['num_decode_steps']}")
+        print(f"iterative_layer_count={scheduling_ir.metadata['iterative_layer_count']}")
+        print(
+            "kv_reuse_across_decode_steps="
+            f"{scheduling_ir.metadata['kv_reuse_across_decode_steps']}"
+        )
+        print(f"dynamic_decode_cache_edges={scheduling_ir.metadata['dynamic_decode_cache_edges']}")
+        print(f"loop_carried_token_bytes={scheduling_ir.metadata['loop_carried_state_bytes']:.0f}")
     print(f"network={args.bandwidth_mb_s} MB/s + {args.latency_ms} ms/transfer")
     print(f"scheduling_ir={scheduling_output}")
     print(f"coopinfer={coopinfer_output}")

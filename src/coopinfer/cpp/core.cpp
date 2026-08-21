@@ -354,7 +354,7 @@ std::vector<ScheduleTask> build_schedule_tasks(
         for (const auto& edge : graph.edges) {
             int source_op = frame * n + edge.source;
             int target_op = frame * n + edge.target;
-            if (assignment[edge.source] == assignment[edge.target]) {
+            if (assignment[edge.source] == assignment[edge.target] || edge.size <= 0.0) {
                 add_task_dependency(tasks, source_op, target_op);
             }
         }
@@ -377,7 +377,7 @@ std::vector<ScheduleTask> build_schedule_tasks(
             std::vector<std::pair<int, int>> outgoing_cross;
             double total_size = 0.0;
             for (const auto& edge : graph.outgoing[node]) {
-                if (assignment[edge.target] == assignment[node]) {
+                if (assignment[edge.target] == assignment[node] || edge.size <= 0.0) {
                     continue;
                 }
                 int target_op = frame * n + edge.target;
@@ -422,7 +422,7 @@ std::vector<ScheduleTask> build_schedule_tasks(
                 add_transfer(std::move(outgoing_cross), total_size, true);
             } else {
                 for (const auto& edge : graph.outgoing[node]) {
-                    if (assignment[edge.target] == assignment[node]) {
+                    if (assignment[edge.target] == assignment[node] || edge.size <= 0.0) {
                         continue;
                     }
                     int target_op = frame * n + edge.target;
@@ -1075,7 +1075,7 @@ std::vector<ScheduleTask> build_packed_schedule_tasks(
 
     for (int frame = 0; frame < unroll; ++frame) {
         for (const auto& edge : graph.edges) {
-            if (assignment[edge.source] != assignment[edge.target]) {
+            if (assignment[edge.source] != assignment[edge.target] && edge.size > 0.0) {
                 continue;
             }
             int source_task = task_for_op(frame * n + edge.source);
@@ -1107,7 +1107,7 @@ std::vector<ScheduleTask> build_packed_schedule_tasks(
             std::vector<std::pair<int, int>> outgoing_cross_tasks;
             double total_size = 0.0;
             for (const auto& edge : graph.outgoing[node]) {
-                if (assignment[edge.target] == assignment[node]) {
+                if (assignment[edge.target] == assignment[node] || edge.size <= 0.0) {
                     continue;
                 }
                 int target_op = frame * n + edge.target;
@@ -1164,7 +1164,7 @@ std::vector<ScheduleTask> build_packed_schedule_tasks(
                 );
             } else {
                 for (const auto& edge : graph.outgoing[node]) {
-                    if (assignment[edge.target] == assignment[node]) {
+                    if (assignment[edge.target] == assignment[node] || edge.size <= 0.0) {
                         continue;
                     }
                     int target_op = frame * n + edge.target;
@@ -1867,6 +1867,11 @@ Metrics schedule_unpacked(
     Metrics best;
     const bool binary_variants[] = {false, true};
     for (bool defer_blocked_transfers : binary_variants) {
+        bool large_source_graph =
+            static_cast<long long>(graph.ids.size()) * unroll > 4096;
+        if (large_source_graph && defer_blocked_transfers) {
+            continue;
+        }
         auto tasks = build_schedule_tasks(
             graph,
             assignment,
@@ -1877,9 +1882,25 @@ Metrics schedule_unpacked(
             unroll
         );
         auto ranks = task_ranks(tasks);
+        // Large autoregressive DAGs are usually long dependency chains. The
+        // 4-wide lookahead and multiple priority rules copy/scan the complete
+        // ready state at every operation. For a materialized autoregressive
+        // chain, FIFO is deterministic and preserves all graph, resource and
+        // cross-frame constraints; packed/tiled candidates are still compared
+        // later by schedule().
+        bool large_task_graph = tasks.size() > 4096U;
         for (bool right_shift_slack : binary_variants) {
+            if (large_task_graph && right_shift_slack) {
+                continue;
+            }
             for (ScheduleRule rule : rules) {
+                if (large_task_graph && rule != ScheduleRule::FifoReady) {
+                    continue;
+                }
                 for (bool use_lookahead : binary_variants) {
+                    if (large_task_graph && use_lookahead) {
+                        continue;
+                    }
                     Metrics candidate = use_lookahead
                                             ? simulate_schedule_with_lookahead(
                                                   graph,
@@ -1944,6 +1965,11 @@ Metrics schedule_packed(
     Metrics best;
     const bool binary_variants[] = {false, true};
     for (bool defer_blocked_transfers : binary_variants) {
+        bool large_source_graph =
+            static_cast<long long>(graph.ids.size()) * unroll > 4096;
+        if (large_source_graph && defer_blocked_transfers) {
+            continue;
+        }
         auto tasks = build_packed_schedule_tasks(
             graph,
             assignment,
@@ -1955,9 +1981,19 @@ Metrics schedule_packed(
             unroll
         );
         auto ranks = task_ranks(tasks);
+        bool large_task_graph = tasks.size() > 4096U;
         for (bool right_shift_slack : binary_variants) {
+            if (large_task_graph && right_shift_slack) {
+                continue;
+            }
             for (ScheduleRule rule : rules) {
+                if (large_task_graph && rule != ScheduleRule::FifoReady) {
+                    continue;
+                }
                 for (bool use_lookahead : binary_variants) {
+                    if (large_task_graph && use_lookahead) {
+                        continue;
+                    }
                     Metrics candidate = use_lookahead
                                             ? simulate_schedule_with_lookahead(
                                                   graph,
@@ -2073,19 +2109,29 @@ Metrics schedule(
         );
     };
 
-    keep_valid_candidate(
-        schedule_unpacked(
-            graph,
-            assignment,
-            bandwidth,
-            latency,
-            weights,
-            scales,
-            batch_transfers,
-            unroll,
-            limits
-        )
-    );
+    // The unpacked beam/greedy candidates copy and rank the complete ready
+    // state many times. For very large autoregressive graphs this duplicates
+    // the already-available packed-stage candidate and becomes quadratic in
+    // tens of thousands of expanded operations. Keep the exact per-node graph
+    // and metrics, but schedule it through packed stages plus the valid tiled
+    // single-frame fallback once a combined packed plan is available.
+    constexpr long long max_unpacked_expanded_ops = 8192;
+    long long expanded_ops = static_cast<long long>(graph.ids.size()) * unroll;
+    if (!has_packed || expanded_ops <= max_unpacked_expanded_ops) {
+        keep_valid_candidate(
+            schedule_unpacked(
+                graph,
+                assignment,
+                bandwidth,
+                latency,
+                weights,
+                scales,
+                batch_transfers,
+                unroll,
+                limits
+            )
+        );
+    }
     if (has_packed) {
         keep_valid_candidate(std::move(packed));
     }

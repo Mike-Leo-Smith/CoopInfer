@@ -263,14 +263,24 @@ def _materialize_iterative_execution(
     base: SchedulingIR,
 ) -> SchedulingIR:
     metadata = layer_graph.model_ir.metadata
-    total_steps = int(metadata.get("num_inference_steps", 1) or 1)
-    captured_steps = int(metadata.get("captured_denoise_steps", 1) or 1)
+    iteration_kind = str(metadata.get("iterative_execution_kind", "denoise"))
+    autoregressive = iteration_kind == "autoregressive_decode"
+    if autoregressive:
+        total_steps = int(metadata.get("num_decode_steps", 1) or 1)
+        captured_steps = int(metadata.get("captured_decode_steps", 1) or 1)
+        step_label = "decode"
+        execution_role = "iterative_decode_layer"
+    else:
+        total_steps = int(metadata.get("num_inference_steps", 1) or 1)
+        captured_steps = int(metadata.get("captured_denoise_steps", 1) or 1)
+        step_label = "denoise"
+        execution_role = "iterative_denoise_layer"
     if total_steps <= captured_steps:
         return base
     if captured_steps != 1:
         raise ValueError(
-            "Execution materialization currently requires captured_denoise_steps=1; "
-            f"got {captured_steps} for num_inference_steps={total_steps}."
+            f"Execution materialization currently requires captured_{step_label}_steps=1; "
+            f"got {captured_steps} for total {step_label} steps={total_steps}."
         )
 
     iterative_root = _infer_iterative_stack_root(layer_graph)
@@ -312,14 +322,14 @@ def _materialize_iterative_execution(
             nodes[clone_id] = SchedulingNode(
                 id=clone_id,
                 members=tuple(node.members),
-                name=f"{node.name} [denoise {step}]",
+                name=f"{node.name} [{step_label} {step}]",
                 costs_ms=dict(node.costs_ms),
                 placement=node.placement,
                 metadata={
                     **dict(node.metadata),
                     "base_layer_id": node_id,
-                    "denoise_step": step,
-                    "execution_role": "iterative_denoise_layer",
+                    f"{step_label}_step": step,
+                    "execution_role": execution_role,
                     "placement_scope": "per_execution_step",
                 },
             )
@@ -328,6 +338,13 @@ def _materialize_iterative_execution(
     static_to_iterative = 0
     repeated_internal = 0
     persistent_cache_edges = []
+    static_cache_bytes: Dict[str, float] = {}
+    static_tensor_bytes = {
+        str(key): float(value)
+        for key, value in dict(metadata.get("static_conditioning_tensor_bytes", {})).items()
+    }
+    charged_static_tensors: set[tuple[str, tuple[str, ...]]] = set()
+    unique_static_tensors: set[tuple[str, tuple[str, ...]]] = set()
     for edge in base.edges:
         source_iter = edge.source in iterative_set
         target_iter = edge.target in iterative_set
@@ -335,6 +352,24 @@ def _materialize_iterative_execution(
             edges.append(edge)
         elif not source_iter and target_iter:
             step0_target = step_id(edge.target, 0)
+            tensor_key = tuple(str(value) for value in edge.tensor_ids)
+            cache_key = (edge.source, tensor_key or (f"__target__:{edge.target}",))
+            effective_size = float(edge.size_bytes)
+            for tensor_id in tensor_key:
+                # Exported tensor identities commonly use ``node:tensor``
+                # while model-specific metadata uses the stable FX tensor
+                # name. Accept both forms so the override survives IR stages.
+                candidates = (tensor_id, *tensor_id.split(":"))
+                match = next(
+                    (candidate for candidate in candidates if candidate in static_tensor_bytes),
+                    None,
+                )
+                if match is not None:
+                    effective_size = static_tensor_bytes[match]
+                    break
+            charge_here = cache_key not in charged_static_tensors
+            charged_static_tensors.add(cache_key)
+            unique_static_tensors.add(cache_key)
             # This edge expresses both the causal availability of the static
             # context and its original payload. Stage 4 treats it as a
             # persistent cache source. If later denoise steps use another
@@ -344,7 +379,7 @@ def _materialize_iterative_execution(
                 SchedulingEdge(
                     source=edge.source,
                     target=step0_target,
-                    size_bytes=edge.size_bytes,
+                    size_bytes=effective_size if charge_here else 0.0,
                     tensor_ids=edge.tensor_ids,
                 )
             )
@@ -353,9 +388,13 @@ def _materialize_iterative_execution(
                     "source": edge.source,
                     "target_base": edge.target,
                     "step0_target": step0_target,
-                    "size_bytes": float(edge.size_bytes),
+                    "size_bytes": effective_size,
+                    "charged_on_this_edge": charge_here,
                     "tensor_ids": list(edge.tensor_ids),
                 }
+            )
+            static_cache_bytes[edge.target] = max(
+                static_cache_bytes.get(edge.target, 0.0), effective_size
             )
             static_to_iterative += 1
         elif source_iter and target_iter:
@@ -384,32 +423,82 @@ def _materialize_iterative_execution(
 
     first_layer = iterative_layers[0]
     last_layer = iterative_layers[-1]
+    dynamic_cache_edges = 0
+    kv_increment = float(metadata.get("decode_kv_increment_bytes_per_layer", 0.0) or 0.0)
+    if autoregressive:
+        # A cached autoregressive layer carries its updated K/V state to the
+        # same layer in the next token step. If placement changes, the edge
+        # charges the full cache accumulated so far, not merely one token.
+        for step in range(total_steps - 1):
+            for layer_id in iterative_layers:
+                cache_bytes = static_cache_bytes.get(layer_id, 0.0) + kv_increment * (step + 1)
+                edges.append(
+                    SchedulingEdge(
+                        source=step_id(layer_id, step),
+                        target=step_id(layer_id, step + 1),
+                        size_bytes=cache_bytes,
+                        tensor_ids=(f"__decode_kv_{layer_id}_{step:03d}",),
+                    )
+                )
+                dynamic_cache_edges += 1
     for step in range(total_steps - 1):
         edges.append(
             SchedulingEdge(
                 source=step_id(last_layer, step),
                 target=step_id(first_layer, step + 1),
                 size_bytes=loop_state_bytes,
-                tensor_ids=(f"__denoise_state_{step:03d}",),
+                tensor_ids=(f"__{step_label}_state_{step:03d}",),
             )
         )
+
+    token_budget_metadata = {}
+    if autoregressive:
+        for key in (
+            "native_max_action_tokens",
+            "max_action_tokens",
+            "token_budget_override",
+        ):
+            if key in metadata:
+                token_budget_metadata[key] = metadata[key]
 
     result = SchedulingIR(
         nodes=nodes,
         edges=tuple(edges),
         metadata={
             **dict(base.metadata),
-            "execution_semantics": "iterative_denoise_v2",
-            "num_inference_steps": total_steps,
-            "captured_denoise_steps": captured_steps,
+            **token_budget_metadata,
+            "execution_semantics": (
+                "autoregressive_decode_v1" if autoregressive else "iterative_denoise_v2"
+            ),
+            ("num_decode_steps" if autoregressive else "num_inference_steps"): total_steps,
+            ("captured_decode_steps" if autoregressive else "captured_denoise_steps"): captured_steps,
             "iterative_stack_root": iterative_root,
             "iterative_layer_count": len(iterative_layers),
             "static_to_iterative_edges_once": static_to_iterative,
+            "static_conditioning_dependencies": static_to_iterative,
+            "static_conditioning_unique_tensors": len(unique_static_tensors),
+            "static_conditioning_reuse_across_steps": not autoregressive,
+            "persistent_context_kind": str(
+                metadata.get(
+                    "persistent_context_kind",
+                    "prefix_kv" if autoregressive else "static_conditioning",
+                )
+            ),
             "persistent_cache_edges": persistent_cache_edges,
             "persistent_cache_policy": "copy_once_per_resource_on_first_use",
             "repeated_internal_edge_templates": repeated_internal,
-            "kv_reuse_across_denoise_steps": True,
-            "placement_shared_across_denoise_steps": False,
+            "kv_reuse_across_decode_steps": autoregressive,
+            "kv_reuse_across_denoise_steps": (
+                False
+                if autoregressive
+                else bool(metadata.get("kv_reuse_across_denoise_steps", False))
+            ),
+            (
+                "placement_shared_across_decode_steps"
+                if autoregressive
+                else "placement_shared_across_denoise_steps"
+            ): False,
+            "dynamic_decode_cache_edges": dynamic_cache_edges,
             "loop_carried_state_bytes": loop_state_bytes,
             "base_scheduling_nodes": len(base.nodes),
             "base_scheduling_edges": len(base.edges),
@@ -423,6 +512,17 @@ def _materialize_iterative_execution(
 
 
 def _infer_iterative_stack_root(layer_graph: LayerGraphIR) -> str:
+    explicit_root = str(
+        layer_graph.model_ir.metadata.get("iterative_stack_root_hint", "")
+    ).strip()
+    if explicit_root:
+        if explicit_root not in layer_graph.grouping.stack_layers:
+            raise ValueError(
+                "iterative_stack_root_hint does not match a detected layer stack: "
+                f"{explicit_root!r}"
+            )
+        return explicit_root
+
     counts: Dict[str, int] = defaultdict(int)
     for dependency in layer_graph.same_index_cross_stack_dependencies:
         target_group = layer_graph.grouping.groups.get(dependency.target_group)
@@ -444,6 +544,11 @@ def _infer_iterative_stack_root(layer_graph: LayerGraphIR) -> str:
 
 
 def _infer_loop_state_bytes(model_ir: ModelIR, precision: str) -> float:
+    if model_ir.metadata.get("iterative_execution_kind") == "autoregressive_decode":
+        token_bytes = float(model_ir.metadata.get("decode_token_bytes", 0.0) or 0.0)
+        if token_bytes <= 0:
+            raise ValueError("autoregressive decode requires positive decode_token_bytes metadata")
+        return token_bytes
     normalized = str(precision).strip().lower()
     if normalized not in _PRECISION_BYTES:
         raise ValueError(f"Unsupported communication precision {precision!r}")

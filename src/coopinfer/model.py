@@ -201,6 +201,7 @@ def graph_from_records(
                 _required(edge, "size", f"Edge {source}->{target}"),
                 f"Edge {source}->{target} size",
             ),
+            tensor_ids=tuple(str(value) for value in edge.get("tensor_ids", ())),
         )
     return graph
 
@@ -260,7 +261,11 @@ def records_from_graph(graph: nx.DiGraph) -> Tuple[List[Dict[str, Any]], List[Di
 
     edges = []
     for source, target, attrs in graph.edges(data=True):
-        edges.append({"source": source, "target": target, "size": float(attrs["size"])})
+        row = {"source": source, "target": target, "size": float(attrs["size"])}
+        tensor_ids = tuple(str(value) for value in attrs.get("tensor_ids", ()))
+        if tensor_ids:
+            row["tensor_ids"] = list(tensor_ids)
+        edges.append(row)
     return nodes, edges
 
 

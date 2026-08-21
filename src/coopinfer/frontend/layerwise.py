@@ -306,19 +306,28 @@ def layer_mapping_dict(grouping: LayerGrouping) -> Dict[str, object]:
 
 def _layer_token(module_path: str) -> Optional[Tuple[str, int]]:
     text = _normalize_module_path(module_path)
-    matches = list(_LAYER_TOKEN_RE.finditer(text))
-    if not matches:
-        return None
+    parts = [part for part in text.split(".") if part]
+    matches: list[Tuple[str, int]] = []
+    for position in range(len(parts) - 1):
+        collection = parts[position].lower()
+        index = parts[position + 1]
+        is_layer_collection = collection in {"layer", "layers", "block", "blocks", "h"}
+        is_composite_collection = collection.endswith(
+            ("_layer", "_layers", "_block", "_blocks")
+        )
+        if index.isdigit() and (is_layer_collection or is_composite_collection):
+            matches.append((".".join(parts[: position + 1]), int(index)))
     # Use the deepest repeated container when nested stacks are visible.
-    match = matches[-1]
-    prefix = match.group("prefix").rstrip("._")
-    collection = match.group("collection").lower()
-    root = f"{prefix}.{collection}" if prefix else collection
-    return root, int(match.group("index"))
+    return matches[-1] if matches else None
 
 
 def _normalize_module_path(path: str) -> str:
     text = str(path)
+    # torch.export may expose a ModuleList slice in the call-site path, e.g.
+    # ``language_model.layers.slice(None, 18, None).7.self_attn``. The slice is
+    # a traversal artifact; the following integer is still the real layer
+    # index and should be normalized to ``layers.7``.
+    text = re.sub(r"\.slice\([^)]*\)(?=\.)", "", text)
     for token in ("[", "]", "'", '"'):
         text = text.replace(token, ".")
     text = re.sub(r"\.+", ".", text)

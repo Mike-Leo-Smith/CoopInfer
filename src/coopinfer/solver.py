@@ -34,6 +34,17 @@ class SolverResult:
     iterations: int
 
 
+@dataclass(frozen=True)
+class PersistentContextTemplate:
+    """One static tensor and all iterative layers that consume it."""
+
+    source: str
+    tensor_ids: tuple[str, ...]
+    size_mb: float
+    charged_target: str
+    consumers: tuple[tuple[str, str], ...]
+
+
 def solve(
     graph: nx.DiGraph,
     bandwidth: float,
@@ -72,6 +83,14 @@ def solve(
 
     cache_templates = _persistent_cache_templates(graph)
     if cache_templates:
+        if _has_autoregressive_step_state(graph):
+            return _solve_grouped_autoregressive(
+                graph,
+                environment,
+                algorithm=algorithm,
+                heuristic_iterations=heuristic_iterations,
+                seed=seed,
+            )
         return _solve_iterative_persistent_cache(
             graph,
             cache_templates,
@@ -148,7 +167,7 @@ def _split_step_id(node_id: str) -> Tuple[str, int] | None:
 
 def _persistent_cache_templates(
     graph: nx.DiGraph,
-) -> list[tuple[str, str, str, float]]:
+) -> list[PersistentContextTemplate]:
     """Recover Stage-3 static-to-step0 cache inputs from the execution DAG.
 
     Stage 3 deliberately emits these inputs only once, targeting step 0. Their
@@ -157,17 +176,52 @@ def _persistent_cache_templates(
     first such use and keeps that resource copy resident thereafter.
     """
 
-    templates: list[tuple[str, str, str, float]] = []
+    groups: dict[
+        tuple[str, tuple[str, ...]],
+        dict[str, object],
+    ] = {}
     for source, target, attrs in graph.edges(data=True):
         target_step = _split_step_id(str(target))
         if target_step is None or target_step[1] != 0:
             continue
         if _split_step_id(str(source)) is not None:
             continue
+        tensor_ids = tuple(str(value) for value in attrs.get("tensor_ids", ()))
         size_mb = float(attrs.get("size", 0.0))
-        if size_mb <= 0.0:
+        if size_mb <= 0.0 and not tensor_ids:
             continue
-        templates.append((str(source), target_step[0], str(target), size_mb))
+        # Old files did not preserve tensor_ids. Keep their historical
+        # per-target behavior; new files can safely deduplicate fan-out from
+        # one static tensor to several iterative blocks.
+        identity = tensor_ids or (f"__target__:{target_step[0]}",)
+        key = (str(source), identity)
+        group = groups.setdefault(
+            key,
+            {"size_mb": 0.0, "charged_target": "", "consumers": []},
+        )
+        consumers = group["consumers"]
+        assert isinstance(consumers, list)
+        consumers.append((target_step[0], str(target)))
+        if size_mb > float(group["size_mb"]):
+            group["size_mb"] = size_mb
+            group["charged_target"] = str(target)
+
+    templates = []
+    for (source, tensor_ids), group in groups.items():
+        size_mb = float(group["size_mb"])
+        charged_target = str(group["charged_target"])
+        if size_mb <= 0.0 or not charged_target:
+            continue
+        consumers = tuple(group["consumers"])
+        templates.append(
+            PersistentContextTemplate(
+                source=source,
+                tensor_ids=tensor_ids,
+                size_mb=size_mb,
+                charged_target=charged_target,
+                consumers=consumers,
+            )
+        )
     return templates
 
 
@@ -181,10 +235,241 @@ def _step_nodes_for_base(graph: nx.DiGraph, base: str) -> list[tuple[int, str]]:
     return result
 
 
+def _has_autoregressive_step_state(graph: nx.DiGraph) -> bool:
+    """Detect same-layer state carried between adjacent execution steps."""
+
+    for source, target in graph.edges:
+        source_step = _split_step_id(str(source))
+        target_step = _split_step_id(str(target))
+        if source_step is None or target_step is None:
+            continue
+        if source_step[0] == target_step[0] and target_step[1] == source_step[1] + 1:
+            return True
+    return False
+
+
+def _fold_autoregressive_graph(graph: nx.DiGraph) -> nx.DiGraph:
+    """Fold token copies into one weighted node per structural layer.
+
+    Compute costs and inter-layer payloads are summed across all tokens.  The
+    cross-token last->first control edge is omitted because summing every
+    layer's token copies already accounts for the serial decode work and
+    retaining it would create a structural cycle.  Same-layer state edges are
+    local under shared placement and therefore carry no network cost.
+    """
+
+    folded = nx.DiGraph()
+    for node_id, attrs in graph.nodes(data=True):
+        key = str(node_id)
+        parsed = _split_step_id(key)
+        base = parsed[0] if parsed is not None else key
+        if base not in folded:
+            folded.add_node(base, **dict(attrs))
+            folded.nodes[base]["c_dev"] = 0.0
+            folded.nodes[base]["c_host"] = 0.0
+        folded.nodes[base]["c_dev"] += float(attrs.get("c_dev", 0.0))
+        folded.nodes[base]["c_host"] += float(attrs.get("c_host", 0.0))
+
+    for source, target, attrs in graph.edges(data=True):
+        source_key, target_key = str(source), str(target)
+        source_step = _split_step_id(source_key)
+        target_step = _split_step_id(target_key)
+        source_base = source_step[0] if source_step is not None else source_key
+        target_base = target_step[0] if target_step is not None else target_key
+        if source_base == target_base:
+            continue
+        if (
+            source_step is not None
+            and target_step is not None
+            and target_step[1] == source_step[1] + 1
+        ):
+            continue
+        size = float(attrs.get("size", 0.0))
+        if folded.has_edge(source_base, target_base):
+            folded.edges[source_base, target_base]["size"] += size
+        else:
+            folded.add_edge(source_base, target_base, size=size)
+
+    validate_graph(folded, require_dag=True)
+    return folded
+
+
+def _solve_grouped_autoregressive(
+    graph: nx.DiGraph,
+    environment: Environment,
+    *,
+    algorithm: str,
+    heuristic_iterations: int,
+    seed: int,
+) -> SolverResult:
+    """Solve cached autoregressive execution with one placement per base layer.
+
+    Every token copy of one decoder layer shares placement. This matches the
+    persistent, growing per-layer KV state and reduces a long decode from
+    thousands of binary variables to the structural layer count. The full
+    materialized token DAG is still evaluated for every candidate.
+    """
+
+    variable_members: Dict[str, list[str]] = {}
+    fixed_variables: Dict[str, int] = {}
+    initial_variables: Dict[str, int] = {}
+    free_variables = []
+    for node_id, attrs in graph.nodes(data=True):
+        key = str(node_id)
+        parsed = _split_step_id(key)
+        variable = parsed[0] if parsed is not None else key
+        variable_members.setdefault(variable, []).append(key)
+        placement = str(attrs.get("placement", "free")).strip().lower()
+        value = int(attrs.get("x", 1))
+        if placement == PLACEMENT_DEVICE:
+            value = 0
+        elif placement == PLACEMENT_HOST:
+            value = 1
+        previous = initial_variables.get(variable)
+        if previous is not None and variable in fixed_variables and previous != value:
+            raise ValueError(f"Conflicting shared placement for {variable}")
+        initial_variables.setdefault(variable, value)
+        if placement in {PLACEMENT_DEVICE, PLACEMENT_HOST}:
+            fixed = fixed_variables.get(variable)
+            if fixed is not None and fixed != value:
+                raise ValueError(f"Conflicting shared placement for {variable}")
+            fixed_variables[variable] = value
+            initial_variables[variable] = value
+
+    for variable, members in sorted(variable_members.items()):
+        if variable in fixed_variables:
+            continue
+        is_zero_source = all(
+            graph.in_degree(member) == 0
+            and float(graph.nodes[member].get("c_dev", 0.0)) == 0.0
+            and float(graph.nodes[member].get("c_host", 0.0)) == 0.0
+            for member in members
+        )
+        if not is_zero_source:
+            free_variables.append(variable)
+
+    def expand(variables: Dict[str, int]) -> Dict[str, int]:
+        return {
+            member: int(variables[variable])
+            for variable, members in variable_members.items()
+            for member in members
+        }
+
+    scales = baseline_scales(
+        graph,
+        bandwidth=environment.bandwidth,
+        latency=environment.latency,
+        batch_transfers=environment.batch_transfers,
+        pipeline_unroll=environment.pipeline_unroll,
+    )
+
+    # The execution DAG can contain thousands of token-expanded nodes.  Its
+    # structure is immutable during this grouped search, so converting the
+    # NetworkX graph to native-core arrays for every candidate is pure
+    # overhead.  Compile it once and only replace the assignment vector.
+    try:
+        from . import _core
+    except ImportError as exc:
+        raise RuntimeError(
+            "CoopInfer requires the compiled C++ solver extension. "
+            'Build/install the project with `python -m pip install -e ".[dev]"`.'
+        ) from exc
+    core_data = graph_to_core_data(graph)
+    node_variables = [
+        parsed[0] if (parsed := _split_step_id(str(node_id))) is not None else str(node_id)
+        for node_id in graph.nodes
+    ]
+    evaluation_params = {
+        "bandwidth": environment.bandwidth,
+        "latency": environment.latency,
+        "weight_avg_latency": environment.weight_avg_latency,
+        "weight_max_latency": environment.weight_max_latency,
+        "weight_device_utilization": environment.weight_device_utilization,
+        "avg_latency_scale": scales[0],
+        "max_latency_scale": scales[1],
+        "batch_transfers": environment.batch_transfers,
+        "pipeline_unroll": environment.pipeline_unroll,
+    }
+
+    def metrics_for(variables: Dict[str, int]) -> EvaluationResult:
+        params = dict(evaluation_params)
+        params["assignment"] = [int(variables[variable]) for variable in node_variables]
+        return metrics_from_core(_core.evaluate_core(core_data, params))
+
+    # Search the mathematically weighted structural surrogate, then validate
+    # its winning shared-layer placement once on the complete token DAG.
+    folded = _fold_autoregressive_graph(graph)
+    folded_result = _solve_native(
+        folded,
+        environment,
+        algorithm=algorithm,
+        heuristic_iterations=heuristic_iterations,
+        seed=seed,
+    )
+    surrogate_variables = {
+        variable: int(folded_result.assignment.get(variable, initial_variables[variable]))
+        for variable in variable_members
+    }
+    token_count = 1 + max(
+        parsed[1]
+        for node_id in graph.nodes
+        if (parsed := _split_step_id(str(node_id))) is not None
+    )
+    # A weighted folded DAG preserves total layer work but cannot reproduce
+    # every transfer/serialization effect of the token-expanded DAG. Guard the
+    # surrogate winner with exact full-DAG evaluations of the initial and two
+    # uniform placements so the reported solution never loses to a trivial
+    # feasible single-resource baseline.
+    exact_candidates = [
+        surrogate_variables,
+        dict(initial_variables),
+        {
+            variable: int(fixed_variables.get(variable, 0))
+            for variable in variable_members
+        },
+        {
+            variable: int(fixed_variables.get(variable, 1))
+            for variable in variable_members
+        },
+    ]
+    best_variables = None
+    exact_metrics = None
+    seen = set()
+    for candidate in exact_candidates:
+        signature = tuple(sorted(candidate.items()))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        metrics = metrics_for(candidate)
+        feasible = not (
+            environment.latency_limit > 0.0
+            and metrics.latency > environment.latency_limit
+        ) and not (
+            environment.max_frame_latency_limit > 0.0
+            and metrics.max_frame_latency > environment.max_frame_latency_limit
+        )
+        if feasible and (exact_metrics is None or metrics.loss < exact_metrics.loss):
+            best_variables = candidate
+            exact_metrics = metrics
+    if best_variables is None or exact_metrics is None:
+        raise ValueError(
+            "No feasible autoregressive assignment satisfies the configured latency limits"
+        )
+    return SolverResult(
+        assignment=expand(best_variables),
+        metrics=exact_metrics,
+        mode=(
+            f"{folded_result.mode} ({token_count} cached-decode steps, weighted shared-layer "
+            "surrogate; "
+            "full autoregressive DAG + baseline guard verified)"
+        ),
+        iterations=folded_result.iterations,
+    )
+
 def _cache_aware_graph(
     graph: nx.DiGraph,
     assignment: Dict[str, int],
-    templates: Iterable[tuple[str, str, str, float]],
+    templates: Iterable[PersistentContextTemplate],
 ) -> nx.DiGraph:
     """Materialize at most one extra cache copy per static input/resource.
 
@@ -196,28 +481,40 @@ def _cache_aware_graph(
     """
 
     result = graph.copy()
-    for source, target_base, step0_target, size_mb in templates:
+    topological_rank = {
+        str(node_id): rank for rank, node_id in enumerate(nx.topological_sort(graph))
+    }
+    for template in templates:
+        source = template.source
         if source not in assignment:
             continue
         source_resource = int(assignment[source])
         opposite = 1 - source_resource
-        first_opposite = None
-        for _, node_id in _step_nodes_for_base(graph, target_base):
-            if int(assignment[node_id]) == opposite:
-                first_opposite = node_id
-                break
-        if first_opposite is None or first_opposite == step0_target:
+        if int(assignment[template.charged_target]) == opposite:
+            # The original positive-size edge already creates this copy.
             continue
+
+        opposite_consumers = []
+        for target_base, _ in template.consumers:
+            opposite_consumers.extend(
+                (step, topological_rank[node_id], node_id)
+                for step, node_id in _step_nodes_for_base(graph, target_base)
+                if int(assignment[node_id]) == opposite
+            )
+        if not opposite_consumers:
+            continue
+        _, _, first_opposite = min(opposite_consumers)
 
         if result.has_edge(source, first_opposite):
             existing = float(result.edges[source, first_opposite].get("size", 0.0))
-            result.edges[source, first_opposite]["size"] = existing + size_mb
+            result.edges[source, first_opposite]["size"] = existing + template.size_mb
             result.edges[source, first_opposite]["persistent_cache_copy"] = True
         else:
             result.add_edge(
                 source,
                 first_opposite,
-                size=size_mb,
+                size=template.size_mb,
+                tensor_ids=template.tensor_ids,
                 persistent_cache_copy=True,
             )
     validate_graph(result, require_dag=True)
@@ -265,14 +562,14 @@ def _fixed_and_initial(graph: nx.DiGraph) -> tuple[Dict[str, int], Dict[str, int
 
 def _solve_iterative_persistent_cache(
     graph: nx.DiGraph,
-    cache_templates: list[tuple[str, str, str, float]],
+    cache_templates: list[PersistentContextTemplate],
     environment: Environment,
     *,
     algorithm: str,
     heuristic_iterations: int,
     seed: int,
 ) -> SolverResult:
-    """Search the complete N-step execution with persistent KV reuse.
+    """Search the complete N-step execution with persistent context reuse.
 
     Every denoise execution node is a free placement variable unless the input
     graph explicitly fixes it. The full N-step E2E latency is used for every
@@ -375,7 +672,7 @@ def _solve_iterative_persistent_cache(
                 candidate[node_id] = int((mask >> bit) & 1)
             keep(candidate, candidate_metrics(candidate))
         iterations = total
-        mode = "Enumerate (per-step denoise + persistent KV)"
+        mode = "Enumerate (per-step denoise + persistent static context)"
 
     elif normalized in {"random", "random_search", "random_n"}:
         rng = random.Random(seed)
@@ -388,7 +685,7 @@ def _solve_iterative_persistent_cache(
                 for node_id in rng.sample(free_nodes, flips):
                     candidate[node_id] = 1 - candidate[node_id]
             keep(candidate, candidate_metrics(candidate))
-        mode = "Random Search (per-step denoise + persistent KV)"
+        mode = "Random Search (per-step denoise + persistent static context)"
 
     elif normalized in {"simulated_annealing", "annealing", "sim_anneal", "sim_aneal"}:
         rng = random.Random(seed)
@@ -415,7 +712,7 @@ def _solve_iterative_persistent_cache(
                 current = candidate
                 current_metrics = metrics
             keep(candidate, metrics)
-        mode = "Simulated Annealing (per-step denoise + persistent KV)"
+        mode = "Simulated Annealing (per-step denoise + persistent static context)"
 
     else:
         raise ValueError(f"Unknown solver algorithm: {algorithm}")

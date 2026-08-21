@@ -55,6 +55,7 @@ def to_coopinfer_payload(
             "source": edge.source,
             "target": edge.target,
             "size": float(edge.size_bytes) / _BYTES_PER_MB,
+            "tensor_ids": list(edge.tensor_ids),
         }
         for edge in scheduling_ir.edges
     ]

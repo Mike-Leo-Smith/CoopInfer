@@ -66,6 +66,32 @@ def test_infer_schedule_keeps_legacy_tuple_shape():
     assert len(transfers) == 1
 
 
+def test_zero_size_cross_resource_edge_is_control_dependency_not_transfer():
+    graph = graph_from_records(
+        [
+            {"id": "input", "c_dev": 0.0, "c_host": 0.0, "fixed_dev": False},
+            {"id": "producer", "c_dev": 3.0, "c_host": 3.0, "fixed_dev": False},
+            {"id": "consumer", "c_dev": 2.0, "c_host": 2.0, "fixed_dev": False},
+        ],
+        [
+            {"source": "input", "target": "producer", "size": 0.0},
+            {"source": "producer", "target": "consumer", "size": 0.0},
+        ],
+    )
+
+    latency, starts, finishes, transfers = infer_schedule(
+        graph,
+        {"input": 1, "producer": 1, "consumer": 0},
+        bandwidth=10.0,
+        latency=5.0,
+    )
+
+    assert finishes["producer"] == 3.0
+    assert starts["consumer"] == 3.0
+    assert latency == 5.0
+    assert transfers == ()
+
+
 def test_edge_transfer_ms_rejects_invalid_size():
     for value in [-1.0, math.inf, math.nan]:
         try:
@@ -355,8 +381,9 @@ def test_evaluate_reports_max_frame_latency_for_unrolled_pipeline():
 
     assert result.latency == 50.0
     assert result.max_frame_latency == 50.0
-    assert result.transfer_records[1].start == 50.0
-    assert result.transfer_records[2].start == 100.0
+    assert result.transfer_records == ()
+    assert result.start_times["slow_out[f1]"] == 50.0
+    assert result.start_times["slow_out[f2]"] == 100.0
     assert result.avg_latency_loss >= 0.0
     assert result.max_frame_latency_loss >= 0.0
     assert result.device_utilization_loss >= 0.0

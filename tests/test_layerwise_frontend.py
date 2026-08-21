@@ -67,6 +67,53 @@ def test_layer_detection_is_complete_and_separates_repeated_stacks():
     assert any(g.kind == "aux_region" and "bridge" in g.members for g in grouping.groups.values())
 
 
+def test_layer_detection_normalizes_exported_modulelist_slice_paths():
+    ir = ModelIR.from_parts(
+        [
+            IRNode("input", "input", kind="input"),
+            _op("p0", "prefill.model.layers.slice(None, 2, None).0.attn"),
+            _op("p1", "prefill.model.layers.slice(None, 2, None).1.attn"),
+            _op("d0", "decode.model.layers.slice(None, 2, None).0.attn"),
+            _op("d1", "decode.model.layers.slice(None, 2, None).1.attn"),
+            IRNode("output", "output", kind="output"),
+        ],
+        [
+            TensorEdge("input", "p0", 32, "x"),
+            TensorEdge("p0", "p1", 32, "prefill"),
+            TensorEdge("p0", "d0", 32, "kv0"),
+            TensorEdge("p1", "d1", 32, "kv1"),
+            TensorEdge("d0", "d1", 32, "decode"),
+            TensorEdge("d1", "output", 32, "y"),
+        ],
+    )
+    grouping = detect_layer_groups(ir)
+
+    assert grouping.stack_layers == {
+        "decode.model.layers": (0, 1),
+        "prefill.model.layers": (0, 1),
+    }
+
+
+def test_layer_detection_preserves_composite_transformer_blocks_container():
+    ir = ModelIR.from_parts(
+        [
+            IRNode("input", "input", kind="input"),
+            _op("a0", "core.action_head.model.transformer_blocks.0.attn"),
+            _op("a1", "core.action_head.model.transformer_blocks.1.attn"),
+            IRNode("output", "output", kind="output"),
+        ],
+        [
+            TensorEdge("input", "a0", 32, "x"),
+            TensorEdge("a0", "a1", 32, "hidden"),
+            TensorEdge("a1", "output", 32, "y"),
+        ],
+    )
+    grouping = detect_layer_groups(ir)
+    assert grouping.stack_layers == {
+        "core.action_head.model.transformer_blocks": (0, 1)
+    }
+
+
 def test_layer_work_does_not_recharge_internal_activation_hbm():
     input_node = IRNode("input", "input", kind="input")
     first = _op("first", "model.layers.0.first")
