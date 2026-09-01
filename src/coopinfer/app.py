@@ -90,7 +90,7 @@ class MainWindow(QMainWindow):
                 "C_host (ms)",
                 "Source Period (ms)",
                 "Source Phase (ms)",
-                "Fixed on Dev",
+                "Placement",
             ]
         )
         node_header = self.nodes_table.horizontalHeader()
@@ -394,7 +394,12 @@ class MainWindow(QMainWindow):
                     float(node["c_host"]),
                     float(node.get("source_period_ms", 0.0)),
                     float(node.get("source_phase_ms", 0.0)),
-                    bool(node.get("fixed_dev", False)),
+                    str(
+                        node.get(
+                            "placement",
+                            "device" if node.get("fixed_dev", False) else "free",
+                        )
+                    ),
                 )
 
             self.edges_table.setRowCount(0)
@@ -434,7 +439,7 @@ class MainWindow(QMainWindow):
         c_host: float = 2.0,
         source_period_ms: float = 0.0,
         source_phase_ms: float = 0.0,
-        fixed_dev: bool = False,
+        placement: str = "free",
     ) -> None:
         row = self.nodes_table.rowCount()
         self.nodes_table.insertRow(row)
@@ -445,10 +450,14 @@ class MainWindow(QMainWindow):
         self.nodes_table.setItem(row, 3, QTableWidgetItem(f"{c_host:g}"))
         self.nodes_table.setItem(row, 4, QTableWidgetItem(f"{source_period_ms:g}"))
         self.nodes_table.setItem(row, 5, QTableWidgetItem(f"{source_phase_ms:g}"))
-        fixed_item = QTableWidgetItem()
-        fixed_item.setFlags(fixed_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-        fixed_item.setCheckState(Qt.CheckState.Checked if fixed_dev else Qt.CheckState.Unchecked)
-        self.nodes_table.setItem(row, 6, fixed_item)
+        placement_combo = QComboBox()
+        placement_combo.addItems(["Free", "Device", "Host"])
+        placement_labels = {"free": "Free", "device": "Device", "host": "Host"}
+        placement_combo.setCurrentText(
+            placement_labels.get(placement.strip().lower(), "Free")
+        )
+        placement_combo.currentTextChanged.connect(self._preview_from_tables)
+        self.nodes_table.setCellWidget(row, 6, placement_combo)
         self._preview_from_tables()
 
     def _add_edge_row(
@@ -517,7 +526,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid topology", "Graph contains a cycle; DAG required.")
             return
         free_nodes = [
-            node for node, attrs in graph.nodes(data=True) if not attrs.get("fixed_dev", False)
+            node
+            for node, attrs in graph.nodes(data=True)
+            if str(
+                attrs.get(
+                    "placement",
+                    "device" if attrs.get("fixed_dev", False) else "free",
+                )
+            ).strip().lower() == "free"
         ]
         if self.algorithm_combo.currentText() == "Enumerate" and len(free_nodes) > 20:
             QMessageBox.warning(
@@ -602,8 +618,11 @@ class MainWindow(QMainWindow):
                     "source_phase_ms": self._cell_float(
                         self.nodes_table, row, 5, "Source Phase (ms)"
                     ),
-                    "fixed_dev": self.nodes_table.item(row, 6).checkState()
-                    == Qt.CheckState.Checked,
+                    "placement": (
+                        self.nodes_table.cellWidget(row, 6).currentText().strip().lower()
+                        if isinstance(self.nodes_table.cellWidget(row, 6), QComboBox)
+                        else "free"
+                    ),
                 }
             )
 
@@ -659,8 +678,16 @@ class MainWindow(QMainWindow):
 
     def _preserve_known_assignments(self, graph: nx.DiGraph) -> None:
         for node, attrs in graph.nodes(data=True):
-            if attrs.get("fixed_dev", False):
+            placement = str(
+                attrs.get(
+                    "placement",
+                    "device" if attrs.get("fixed_dev", False) else "free",
+                )
+            ).strip().lower()
+            if placement == "device":
                 attrs["x"] = 0
+            elif placement == "host":
+                attrs["x"] = 1
             elif self.solver_result is not None and node in self.solver_result.assignment:
                 attrs["x"] = int(self.solver_result.assignment[node])
             elif node in self.graph and "x" in self.graph.nodes[node]:
@@ -714,7 +741,10 @@ class MainWindow(QMainWindow):
                 "c_host": attrs.get("c_host", 0.0),
                 "source_period_ms": attrs.get("source_period_ms", 0.0),
                 "source_phase_ms": attrs.get("source_phase_ms", 0.0),
-                "fixed_dev": attrs.get("fixed_dev", False),
+                "placement": attrs.get(
+                    "placement",
+                    "device" if attrs.get("fixed_dev", False) else "free",
+                ),
             }
             for node, attrs in graph.nodes(data=True)
         ]
@@ -848,7 +878,13 @@ class MainWindow(QMainWindow):
                 fill = "#f8fafc"
             place = "Dev" if x_value == 0 else "Host"
             compute = float(attrs["c_dev"]) if x_value == 0 else float(attrs["c_host"])
-            stroke_width = 4 if attrs.get("fixed_dev", False) else 1.5
+            placement = str(
+                attrs.get(
+                    "placement",
+                    "device" if attrs.get("fixed_dev", False) else "free",
+                )
+            ).strip().lower()
+            stroke_width = 4 if placement != "free" else 1.5
             if solved:
                 stroke_width = 4
             dash = ' stroke-dasharray="6 4"' if solved and is_source else ""

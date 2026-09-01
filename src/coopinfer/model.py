@@ -10,6 +10,11 @@ import networkx as nx
 
 
 SCHEMA_VERSION = "1.0"
+SUPPORTED_SCHEMA_VERSIONS = {"1.0", "1.1"}
+PLACEMENT_FREE = "free"
+PLACEMENT_DEVICE = "device"
+PLACEMENT_HOST = "host"
+PLACEMENT_VALUES = {PLACEMENT_FREE, PLACEMENT_DEVICE, PLACEMENT_HOST}
 DEFAULT_WEIGHT_AVG_LATENCY = 0.7
 DEFAULT_WEIGHT_MAX_LATENCY = 0.3
 DEFAULT_WEIGHT_DEVICE_UTILIZATION = 0.3
@@ -49,8 +54,7 @@ def environment_from_mapping(data: Mapping[str, Any]) -> Environment:
         weight_avg_latency = data.get("weight_avg_latency", DEFAULT_WEIGHT_AVG_LATENCY)
         weight_max_latency = data.get("weight_max_latency", DEFAULT_WEIGHT_MAX_LATENCY)
         weight_device_utilization = data.get(
-            "weight_device_utilization",
-            DEFAULT_WEIGHT_DEVICE_UTILIZATION,
+            "weight_device_utilization", DEFAULT_WEIGHT_DEVICE_UTILIZATION
         )
     elif "weight_latency" in data:
         legacy_weight = min(
@@ -87,12 +91,10 @@ def validate_environment(environment: Environment) -> Environment:
     bandwidth = _positive_float(environment.bandwidth, "Environment bandwidth")
     latency = _non_negative_float(environment.latency, "Environment latency")
     weight_avg_latency = _unit_float(
-        environment.weight_avg_latency,
-        "Environment weight_avg_latency",
+        environment.weight_avg_latency, "Environment weight_avg_latency"
     )
     weight_max_latency = _unit_float(
-        environment.weight_max_latency,
-        "Environment weight_max_latency",
+        environment.weight_max_latency, "Environment weight_max_latency"
     )
     weight_device_utilization = _unit_float(
         environment.weight_device_utilization,
@@ -110,12 +112,10 @@ def validate_environment(environment: Environment) -> Environment:
     if solver_threads < 0:
         raise ValueError("Environment solver_threads must be non-negative.")
     anneal_initial_temp = _positive_float(
-        environment.anneal_initial_temp,
-        "Environment anneal_initial_temp",
+        environment.anneal_initial_temp, "Environment anneal_initial_temp"
     )
     anneal_final_temp = _positive_float(
-        environment.anneal_final_temp,
-        "Environment anneal_final_temp",
+        environment.anneal_final_temp, "Environment anneal_final_temp"
     )
 
     return Environment(
@@ -134,6 +134,25 @@ def validate_environment(environment: Environment) -> Environment:
     )
 
 
+def placement_from_record(node: Mapping[str, Any], label: str) -> str:
+    if "placement" in node:
+        placement = _placement(node["placement"], f"{label} placement")
+        if _bool(node.get("fixed_dev", False), f"{label} fixed_dev") and placement != PLACEMENT_DEVICE:
+            raise ValueError(
+                f"{label} has conflicting placement={placement!r} and fixed_dev=true."
+            )
+        return placement
+    return PLACEMENT_DEVICE if _bool(node.get("fixed_dev", False), f"{label} fixed_dev") else PLACEMENT_FREE
+
+
+def node_initial_assignment(placement: str, x_value: Any, label: str) -> int:
+    if placement == PLACEMENT_DEVICE:
+        return 0
+    if placement == PLACEMENT_HOST:
+        return 1
+    return _binary_int(x_value, f"{label} x")
+
+
 def graph_from_records(
     nodes: Iterable[Dict[str, Any]],
     edges: Iterable[Dict[str, Any]],
@@ -147,27 +166,25 @@ def graph_from_records(
         if node_id in seen:
             raise ValueError(f"Duplicate Node ID: {node_id}")
         seen.add(node_id)
-        fixed_dev = _bool(node.get("fixed_dev", False), f"Node {node_id} fixed_dev")
-        x_value = 0 if fixed_dev else _binary_int(node.get("x", 1), f"Node {node_id} x")
+        label = f"Node {node_id}"
+        placement = placement_from_record(node, label)
+        x_value = node_initial_assignment(placement, node.get("x", 1), label)
         graph.add_node(
             node_id,
             name=str(node.get("name", node_id)).strip() or node_id,
             c_dev=_non_negative_float(
-                _required(node, "c_dev", f"Node {node_id}"),
-                f"Node {node_id} c_dev",
+                _required(node, "c_dev", label), f"{label} c_dev"
             ),
             c_host=_non_negative_float(
-                _required(node, "c_host", f"Node {node_id}"),
-                f"Node {node_id} c_host",
+                _required(node, "c_host", label), f"{label} c_host"
             ),
-            fixed_dev=fixed_dev,
+            placement=placement,
+            fixed_dev=placement == PLACEMENT_DEVICE,
             source_period_ms=_non_negative_float(
-                node.get("source_period_ms", 0.0),
-                f"Node {node_id} source_period_ms",
+                node.get("source_period_ms", 0.0), f"{label} source_period_ms"
             ),
             source_phase_ms=_non_negative_float(
-                node.get("source_phase_ms", 0.0),
-                f"Node {node_id} source_phase_ms",
+                node.get("source_phase_ms", 0.0), f"{label} source_phase_ms"
             ),
             x=x_value,
         )
@@ -176,9 +193,7 @@ def graph_from_records(
         source = str(_required(edge, "source", f"Edge row {row}") or "").strip()
         target = str(_required(edge, "target", f"Edge row {row}") or "").strip()
         if source not in seen or target not in seen:
-            raise ValueError(
-                f"Edge row {row} references unknown nodes: {source} -> {target}"
-            )
+            raise ValueError(f"Edge row {row} references unknown nodes: {source} -> {target}")
         graph.add_edge(
             source,
             target,
@@ -197,9 +212,16 @@ def validate_graph(graph: nx.DiGraph, *, require_dag: bool = False) -> None:
         _non_negative_float(_required(attrs, "c_host", label), f"{label} c_host")
         _non_negative_float(attrs.get("source_period_ms", 0.0), f"{label} source_period_ms")
         _non_negative_float(attrs.get("source_phase_ms", 0.0), f"{label} source_phase_ms")
-        fixed_dev = _bool(attrs.get("fixed_dev", False), f"{label} fixed_dev")
-        if not fixed_dev:
-            _binary_int(attrs.get("x", 1), f"{label} x")
+        placement = _placement(
+            attrs.get(
+                "placement",
+                PLACEMENT_DEVICE if attrs.get("fixed_dev", False) else PLACEMENT_FREE,
+            ),
+            f"{label} placement",
+        )
+        expected = node_initial_assignment(placement, attrs.get("x", 1), label)
+        if placement != PLACEMENT_FREE and int(attrs.get("x", expected)) != expected:
+            raise ValueError(f"{label} x conflicts with fixed placement {placement!r}.")
 
     for source, target, attrs in graph.edges(data=True):
         _non_negative_float(
@@ -215,29 +237,30 @@ def records_from_graph(graph: nx.DiGraph) -> Tuple[List[Dict[str, Any]], List[Di
     validate_graph(graph)
     nodes = []
     for node_id, attrs in graph.nodes(data=True):
-        fixed_dev = _bool(attrs.get("fixed_dev", False), f"Node {node_id} fixed_dev")
+        placement = _placement(
+            attrs.get(
+                "placement",
+                PLACEMENT_DEVICE if attrs.get("fixed_dev", False) else PLACEMENT_FREE,
+            ),
+            f"Node {node_id} placement",
+        )
+        x_value = node_initial_assignment(placement, attrs.get("x", 1), f"Node {node_id}")
         nodes.append(
             {
                 "id": node_id,
                 "name": str(attrs.get("name", node_id)),
                 "c_dev": float(attrs["c_dev"]),
                 "c_host": float(attrs["c_host"]),
-                "fixed_dev": fixed_dev,
+                "placement": placement,
                 "source_period_ms": float(attrs.get("source_period_ms", 0.0)),
                 "source_phase_ms": float(attrs.get("source_phase_ms", 0.0)),
-                "x": 0 if fixed_dev else _binary_int(attrs.get("x", 1), f"Node {node_id} x"),
+                "x": x_value,
             }
         )
 
     edges = []
     for source, target, attrs in graph.edges(data=True):
-        edges.append(
-            {
-                "source": source,
-                "target": target,
-                "size": float(attrs["size"]),
-            }
-        )
+        edges.append({"source": source, "target": target, "size": float(attrs["size"])})
     return nodes, edges
 
 
@@ -245,7 +268,8 @@ def load_from_json(path: Union[str, Path]) -> ProjectState:
     with Path(path).open("r", encoding="utf-8") as file:
         data = json.load(file)
 
-    if data.get("version") != SCHEMA_VERSION:
+    version = str(data.get("version"))
+    if version not in SUPPORTED_SCHEMA_VERSIONS:
         raise ValueError(f"Unsupported schema version: {data.get('version')!r}")
 
     environment = environment_from_mapping(data.get("environment", {}))
@@ -284,6 +308,14 @@ def _required(record: Mapping[str, Any], key: str, label: str) -> Any:
     if key not in record:
         raise ValueError(f"{label} is missing required field {key!r}.")
     return record[key]
+
+
+def _placement(value: Any, label: str) -> str:
+    placement = str(value).strip().lower()
+    if placement not in PLACEMENT_VALUES:
+        allowed = ", ".join(sorted(PLACEMENT_VALUES))
+        raise ValueError(f"{label} must be one of: {allowed}.")
+    return placement
 
 
 def _non_negative_float(value: Any, label: str) -> float:

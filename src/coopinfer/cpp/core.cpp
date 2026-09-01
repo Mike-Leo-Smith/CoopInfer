@@ -2116,7 +2116,10 @@ ObjectiveScales baseline_scales(
     std::vector<int> mostly_host(n, 1);
     for (int i = 0; i < n; ++i) {
         if (graph.fixed_dev[i]) {
-            mostly_host[i] = 0;
+            // fixed_dev is the legacy wire name for the generic fixed-placement mask.
+            // x_initial carries the fixed resource: Device=0, Host=1.
+            all_device[i] = graph.x_initial[i];
+            mostly_host[i] = graph.x_initial[i];
         }
     }
     ObjectiveWeights weights{1.0, 1.0, 1.0, 0.0};
@@ -2319,10 +2322,8 @@ py::dict solve_core(const py::dict& data, const py::dict& params) {
         std::vector<int> free_nodes;
         std::vector<int> base_assignment(n, 1);
         for (int i = 0; i < n; ++i) {
-            if (graph.fixed_dev[i]) {
-                base_assignment[i] = 0;
-            } else {
-                base_assignment[i] = graph.x_initial[i];
+            base_assignment[i] = graph.x_initial[i];
+            if (!graph.fixed_dev[i]) {
                 free_nodes.push_back(i);
             }
         }
