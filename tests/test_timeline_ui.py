@@ -1,3 +1,10 @@
+import pytest
+
+pytest.importorskip(
+    "PyQt6.QtWebEngineWidgets",
+    reason="timeline UI tests require a loadable Qt WebEngine runtime",
+)
+
 from coopinfer.app import MainWindow, _timeline_short_node_label
 
 
