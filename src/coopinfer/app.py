@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import re
 import sys
 from typing import Dict, List, Optional, Tuple
 
@@ -23,6 +24,7 @@ from PyQt6.QtWidgets import (
     QSplitter,
     QComboBox,
     QSpinBox,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -40,6 +42,27 @@ from .model import (
     validate_environment,
 )
 from .solver import SolverResult, solve
+
+
+_TIMELINE_LAYER_ID = re.compile(
+    r"layer_s0*(?P<stack>\d+)_l0*(?P<layer>\d+)"
+    r"(?:::step0*(?P<step>\d+))?"
+    r"(?:\[f(?P<frame>\d+)\])?$"
+)
+
+
+def _timeline_short_node_label(node_id: object) -> str:
+    text = str(node_id)
+    match = _TIMELINE_LAYER_ID.search(text)
+    if match:
+        parts = [f"S{int(match.group('stack'))}", f"L{int(match.group('layer'))}"]
+        if match.group("step") is not None:
+            parts.append(f"D{int(match.group('step'))}")
+        if match.group("frame") is not None:
+            parts.append(f"F{int(match.group('frame'))}")
+        return "/".join(parts)
+    leaf = text.rsplit(".", 1)[-1]
+    return leaf if len(leaf) <= 18 else f"{leaf[:8]}…{leaf[-7:]}"
 
 
 class MainWindow(QMainWindow):
@@ -287,25 +310,43 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
 
-        graph_splitter = QSplitter(Qt.Orientation.Vertical)
+        view_controls = QHBoxLayout()
+        view_controls.addWidget(QLabel("看板布局"))
+        self.view_layout_combo = QComboBox()
+        self.view_layout_combo.addItems(["标签页", "三面板"])
+        view_controls.addWidget(self.view_layout_combo)
+        view_controls.addStretch(1)
+        layout.addLayout(view_controls)
 
-        config_graph_group = QGroupBox("配置拓扑 (Config DAG)")
-        config_graph_group.setMinimumHeight(150)
-        config_graph_layout = QVBoxLayout(config_graph_group)
         self.config_graph_view = QWebEngineView()
-        config_graph_layout.addWidget(self.config_graph_view)
-        graph_splitter.addWidget(config_graph_group)
-
-        solved_graph_group = QGroupBox("求解展开拓扑 (Solved Pipeline)")
-        solved_graph_group.setMinimumHeight(150)
-        solved_graph_layout = QVBoxLayout(solved_graph_group)
         self.solved_graph_view = QWebEngineView()
-        solved_graph_layout.addWidget(self.solved_graph_view)
-        graph_splitter.addWidget(solved_graph_group)
-        graph_splitter.setStretchFactor(0, 1)
-        graph_splitter.setStretchFactor(1, 1)
-        schedule_splitter = QSplitter(Qt.Orientation.Vertical)
-        schedule_splitter.addWidget(graph_splitter)
+        self.timeline_view = QWebEngineView()
+
+        self.view_tabs = QTabWidget()
+        self.view_tabs.setDocumentMode(True)
+        self.view_tabs.setMovable(True)
+        self.view_tabs.addTab(self.config_graph_view, "配置拓扑 (Config DAG)")
+        self.view_tabs.addTab(self.solved_graph_view, "求解展开拓扑 (Solved Pipeline)")
+        self.view_tabs.addTab(self.timeline_view, "时序图 (Solved Schedule)")
+
+        self.view_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.view_panel_layouts: List[QVBoxLayout] = []
+        for title in (
+            "配置拓扑 (Config DAG)",
+            "求解展开拓扑 (Solved Pipeline)",
+            "时序图 (Solved Schedule)",
+        ):
+            group = QGroupBox(title)
+            group.setMinimumHeight(150)
+            group_layout = QVBoxLayout(group)
+            group_layout.setContentsMargins(2, 2, 2, 2)
+            self.view_panel_layouts.append(group_layout)
+            self.view_splitter.addWidget(group)
+        self.view_splitter.setStretchFactor(0, 1)
+        self.view_splitter.setStretchFactor(1, 1)
+        self.view_splitter.setStretchFactor(2, 2)
+        self.view_splitter.hide()
+        self.view_layout_combo.currentTextChanged.connect(self._set_view_layout)
 
         metrics_group = QGroupBox("性能看板")
         metrics_group.setMinimumHeight(108)
@@ -326,18 +367,38 @@ class MainWindow(QMainWindow):
         metrics_layout.addWidget(self.mode_label, 1, 1)
         metrics_layout.addWidget(self.loss_terms_label, 2, 0, 1, 2)
 
-        timeline_group = QGroupBox("时序图 (Solved Schedule)")
-        timeline_group.setMinimumHeight(150)
-        timeline_layout = QVBoxLayout(timeline_group)
-        self.timeline_view = QWebEngineView()
-        timeline_layout.addWidget(self.timeline_view)
-        schedule_splitter.addWidget(timeline_group)
-        schedule_splitter.setStretchFactor(0, 5)
-        schedule_splitter.setStretchFactor(1, 4)
-        layout.addWidget(schedule_splitter, stretch=1)
+        layout.addWidget(self.view_tabs, stretch=1)
+        layout.addWidget(self.view_splitter, stretch=1)
         layout.addWidget(metrics_group, stretch=0)
         self._clear_timeline()
         return panel
+
+    def _set_view_layout(self, mode: str) -> None:
+        views = (self.config_graph_view, self.solved_graph_view, self.timeline_view)
+        titles = (
+            "配置拓扑 (Config DAG)",
+            "求解展开拓扑 (Solved Pipeline)",
+            "时序图 (Solved Schedule)",
+        )
+        if mode == "三面板":
+            while self.view_tabs.count():
+                self.view_tabs.removeTab(0)
+            for panel_layout, view in zip(self.view_panel_layouts, views):
+                panel_layout.addWidget(view)
+                # QTabWidget keeps non-current pages explicitly hidden after
+                # removeTab(). Reparenting alone does not clear that state.
+                view.show()
+            self.view_tabs.hide()
+            self.view_splitter.show()
+            return
+
+        for panel_layout, view in zip(self.view_panel_layouts, views):
+            panel_layout.removeWidget(view)
+        for view, title in zip(views, titles):
+            self.view_tabs.addTab(view, title)
+        self.view_tabs.setCurrentIndex(0)
+        self.view_splitter.hide()
+        self.view_tabs.show()
 
     def _seed_example(self) -> None:
         self._set_table_data(
@@ -1138,13 +1199,12 @@ class MainWindow(QMainWindow):
             fill = self._frame_color(self._frame_index(node))
             stroke = "#2563eb" if x_value == 0 else "#16a34a"
             node_name = esc(self.graph.nodes[base_node].get("name", base_node))
+            short_label = esc(_timeline_short_node_label(node))
             rows.append(
                 f'<g><title>{esc(node)} {node_name}: {start:.1f}-{finish:.1f} ms</title>'
                 f'<rect class="op" data-start="{start:.6f}" data-duration="{duration:.6f}" x="{x_pos:.1f}" y="{y_center - 16:.1f}" width="{bar_width:.1f}" '
                 f'height="32" rx="4" fill="{fill}" style="stroke:{stroke};stroke-width:2" />'
-                f'<text class="op-id op-id-dark" data-start="{start:.6f}" data-duration="{duration:.6f}" data-anchor="center" x="{x_pos + bar_width / 2:.1f}" y="{y_center + 5:.1f}">{esc(node)}</text>'
-                f'<text class="op-meta" data-start="{start:.6f}" data-anchor="start" x="{x_pos:.1f}" y="{y_center - 24:.1f}">{esc(node)} {node_name} '
-                f'{start:.1f}-{finish:.1f} ms</text></g>'
+                f'<text class="op-id op-id-dark timeline-label" data-start="{start:.6f}" data-duration="{duration:.6f}" data-anchor="center" x="{x_pos + bar_width / 2:.1f}" y="{y_center + 5:.1f}">{short_label}</text></g>'
             )
 
         for transfer_index, transfer in enumerate(metrics.transfer_records):
@@ -1163,19 +1223,19 @@ class MainWindow(QMainWindow):
                     f"Batch: {edge_text}; {transfer.size_mb:g} MB, "
                     f"{transfer_ms:.1f} ms"
                 )
-                label = f"batch {len(transfer.edges)} edges / {transfer.size_mb:g} MB"
+                label = f"x{len(transfer.edges)} / {transfer.size_mb:g} MB"
             else:
                 source, target = transfer.edges[0]
                 title = (
                     f"{source} -> {target}: {transfer.size_mb:g} MB, "
                     f"{transfer_ms:.1f} ms"
                 )
-                label = f"{source}->{target} {transfer.size_mb:g} MB"
+                label = f"{transfer.size_mb:g} MB"
             rows.append(
                 f'<g><title>{esc(title)}</title>'
                 f'<rect class="transfer" data-start="{start:.6f}" data-duration="{transfer_ms:.6f}" x="{x_pos:.1f}" y="{y_center - 10:.1f}" width="{bar_width:.1f}" '
                 f'height="20" rx="3" style="fill:{fill};stroke:{fill}" />'
-                f'<text class="transfer-label" data-start="{start:.6f}" data-duration="{transfer_ms:.6f}" data-anchor="center" x="{x_pos + bar_width / 2:.1f}" y="{y_center + 4:.1f}">'
+                f'<text class="transfer-label timeline-label" data-start="{start:.6f}" data-duration="{transfer_ms:.6f}" data-anchor="center" x="{x_pos + bar_width / 2:.1f}" y="{y_center + 4:.1f}">'
                 f'{esc(label)}</text>'
             )
             for source, target in transfer.edges:
@@ -1223,13 +1283,21 @@ class MainWindow(QMainWindow):
         timeline_total_ms: float = 0.0,
     ) -> str:
         if scale_axis == "timeline":
+            timeline_setup = f"""
+  const viewport = document.getElementById('viewport');
+  const basePxPerMs = {timeline_px_per_ms};
+  const leftPad = {timeline_left_pad};
+  const rightPad = {timeline_right_pad};
+  const totalMs = {timeline_total_ms};
+  const pxPerMsInput = document.getElementById('pxPerMs');
+  const zoomOut = document.getElementById('zoomOut');
+  const zoomReset = document.getElementById('zoomReset');
+  const zoomIn = document.getElementById('zoomIn');
+  const zoomFit = document.getElementById('zoomFit');
+"""
             scale_script = f"""
-    const leftPad = {timeline_left_pad};
-    const basePxPerMs = {timeline_px_per_ms};
-    const rightPad = {timeline_right_pad};
-    const totalMs = {timeline_total_ms};
     const pxPerMs = basePxPerMs * factor;
-    const scaledWidth = Math.max({width}, leftPad + totalMs * pxPerMs + rightPad);
+    const scaledWidth = Math.max(viewport.clientWidth, leftPad + totalMs * pxPerMs + rightPad);
     content.style.transform = 'none';
     content.style.width = scaledWidth + 'px';
     content.style.height = {height} + 'px';
@@ -1265,8 +1333,54 @@ class MainWindow(QMainWindow):
         el.setAttribute('x', x);
       }}
     }});
+    pxPerMsInput.value = pxPerMs.toFixed(2);
+    updateTimelineLabels();
 """
+            timeline_controls = """
+    <button id="zoomOut" type="button" title="缩小">−</button>
+    <button id="zoomReset" type="button">100%</button>
+    <button id="zoomIn" type="button" title="放大">+</button>
+    <button id="zoomFit" type="button">适应窗口</button>
+    <label for="pxPerMs">px/ms</label>
+    <input id="pxPerMs" type="number" min="0.01" max="10000" step="0.1">"""
+            timeline_events = """
+  function setScalePercent(percent) {
+    const bounded = Math.max(Number(scale.min), Math.min(Number(scale.max), percent));
+    scale.value = String(bounded);
+    applyScale();
+  }
+  zoomOut.addEventListener('click', () => setScalePercent(Number(scale.value) / 1.25));
+  zoomReset.addEventListener('click', () => setScalePercent(100));
+  zoomIn.addEventListener('click', () => setScalePercent(Number(scale.value) * 1.25));
+  zoomFit.addEventListener('click', () => {
+    const available = Math.max(1, viewport.clientWidth - leftPad - rightPad);
+    const fitted = totalMs > 0 ? 100 * available / (totalMs * basePxPerMs) : 100;
+    setScalePercent(fitted);
+    viewport.scrollLeft = 0;
+  });
+  pxPerMsInput.addEventListener('change', () => {
+    const pxPerMs = Math.max(0.01, Number(pxPerMsInput.value) || basePxPerMs);
+    setScalePercent(100 * pxPerMs / basePxPerMs);
+  });
+  viewport.addEventListener('wheel', (event) => {
+    if (!event.ctrlKey) return;
+    event.preventDefault();
+    const rect = viewport.getBoundingClientRect();
+    const cursorX = event.clientX - rect.left;
+    const oldPxPerMs = basePxPerMs * Number(scale.value) / 100;
+    const cursorTime = Math.max(0, (viewport.scrollLeft + cursorX - leftPad) / oldPxPerMs);
+    const multiplier = event.deltaY < 0 ? 1.15 : 1 / 1.15;
+    setScalePercent(Number(scale.value) * multiplier);
+    const newPxPerMs = basePxPerMs * Number(scale.value) / 100;
+    viewport.scrollLeft = Math.max(0, leftPad + cursorTime * newPxPerMs - cursorX);
+  }, { passive: false });
+"""
+            scale_max = 2000
         else:
+            timeline_setup = ""
+            timeline_controls = ""
+            timeline_events = ""
+            scale_max = 500
             scale_transform = (
                 "'scale(' + factor + ')'" if scale_axis == "xy" else "'scaleX(' + factor + ')'"
             )
@@ -1276,6 +1390,13 @@ class MainWindow(QMainWindow):
     content.style.width = ({width} * factor) + 'px';
     content.style.height = {scaled_height} + 'px';
 """
+        label_controls = "" if scale_axis != "timeline" else """
+    <label for="labelMode">标签</label>
+    <select id="labelMode">
+      <option value="auto" selected>精简</option>
+      <option value="none">仅悬停</option>
+      <option value="all">全部</option>
+    </select>"""
         return f"""<!doctype html>
 <html>
 <head>
@@ -1285,6 +1406,8 @@ class MainWindow(QMainWindow):
   body {{ display: flex; flex-direction: column; background: #ffffff; color: #111827; }}
   .toolbar {{ flex: 0 0 auto; display: flex; align-items: center; gap: 10px; padding: 6px 10px; border-bottom: 1px solid #e5e7eb; background: #f9fafb; font-size: 12px; }}
   .toolbar input {{ width: 180px; }}
+  .toolbar button {{ min-width: 32px; padding: 2px 8px; }}
+  .toolbar #pxPerMs {{ width: 72px; }}
   #viewport {{ flex: 1 1 auto; overflow: auto; background: #ffffff; }}
   #content {{ transform-origin: top left; width: {width}px; height: {height}px; }}
   svg {{ display: block; width: {width}px; height: {height}px; }}
@@ -1305,7 +1428,6 @@ class MainWindow(QMainWindow):
   .op {{ stroke: #111827; stroke-width: 1; }}
   .op-id {{ fill: #ffffff; font-size: 11px; font-weight: 700; text-anchor: middle; pointer-events: none; }}
   .op-id-dark {{ fill: #111827; stroke: none; }}
-  .op-meta {{ fill: #111827; font-size: 10px; paint-order: stroke; stroke: #ffffff; stroke-width: 3px; stroke-linejoin: round; }}
   .transfer {{ fill: #f97316; stroke: #9a3412; stroke-width: 1; }}
   .transfer-label {{ fill: #111827; font-size: 10px; font-weight: 700; text-anchor: middle; pointer-events: none; }}
   .dep {{ stroke: #9a3412; stroke-width: 1; opacity: 0.75; }}
@@ -1316,8 +1438,10 @@ class MainWindow(QMainWindow):
   <div class="toolbar">
     <strong>{html.escape(title)}</strong>
     <label for="scale">Scale</label>
-    <input id="scale" type="range" min="5" max="500" step="5" value="100">
+    <input id="scale" type="range" min="5" max="{scale_max}" step="5" value="100">
     <span id="scaleText">100%</span>
+    {timeline_controls}
+    {label_controls}
     {extra_info}
   </div>
   <div id="viewport">
@@ -1329,12 +1453,28 @@ class MainWindow(QMainWindow):
   const scale = document.getElementById('scale');
   const scaleText = document.getElementById('scaleText');
   const content = document.getElementById('content');
+  const labelMode = document.getElementById('labelMode');
+{timeline_setup}
+  function updateTimelineLabels() {{
+    if (!labelMode) return;
+    document.querySelectorAll('.timeline-label').forEach((label) => {{
+      const rect = label.parentElement && label.parentElement.querySelector('rect');
+      if (!rect) return;
+      const barWidth = Number(rect.getAttribute('width') || 0);
+      const textWidth = Math.max(30, (label.textContent || '').trim().length * 6.5 + 12);
+      const visible = labelMode.value === 'all'
+        || (labelMode.value === 'auto' && barWidth >= textWidth);
+      label.style.display = visible ? '' : 'none';
+    }});
+  }}
   function applyScale() {{
     const factor = Number(scale.value) / 100;
     scaleText.textContent = scale.value + '%';
 {scale_script}
   }}
   scale.addEventListener('input', applyScale);
+  if (labelMode) labelMode.addEventListener('change', updateTimelineLabels);
+{timeline_events}
   applyScale();
 </script>
 </body>
